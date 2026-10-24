@@ -1374,6 +1374,61 @@ handover reads `null` again until the successor's first check. That check runs
 within seconds of the successor's warm mint, so a `null` that persists well
 past a handover points at the second or third cause, not at "not checked yet".
 
+## Hosts that bring their own login (Claude Desktop)
+
+Everything above assumes inference already follows cswap, and for the `claude`
+CLI it does: it reads the Keychain cswap swaps. **Claude Desktop's Code tab
+does not.** It spawns its bundled CLI with the app's own login in
+`CLAUDE_CODE_OAUTH_TOKEN`, and under a desktop entrypoint Claude Code ignores
+any settings `env` entry naming a variable the host set at spawn, so no
+configuration reaches it. Desktop bills the account the app is signed into,
+and after a rotation it is the one client left on "Weekly limit reached".
+
+Its traffic still comes through this proxy, and its User-Agent names the
+entrypoint (`claude-cli/<ver> (external, claude-desktop)`). So, opt-in, the
+proxy can re-bill it: list the entrypoints in `inference-follows` in the pin's
+directory, one per line.
+
+```bash
+echo claude-desktop > ~/.claude-swap-backup/pin-proxy/inference-follows   # on
+rm ~/.claude-swap-backup/pin-proxy/inference-follows                      # off
+```
+
+The file is re-read every 2 seconds, so it reaches a daemon that is already
+serving. `CSWAP_PIN_INFERENCE_FOLLOWS=claude-desktop` (comma-separated) wins
+over the file, like `CSWAP_PIN_DEBUG` over `trace-to`. It is off by default,
+and while it is off no request changes.
+
+What it does, for a listed entrypoint only:
+
+- `/v1/messages` gets the active account's bearer. `/v1/messages/count_tokens`
+  does not: the wall and access-grant conversions match `/v1/messages`
+  exactly, so a refusal on `count_tokens` could never be converted. Nothing
+  else moves: ownership routes keep the pin, and `/api/oauth/*`, usage and
+  profile calls keep the host's own login.
+- The active credential is read by a thread of its own, never by a request:
+  every 10 seconds while an entrypoint is listed, and at once after a switch
+  the wall or the access-grant check made. A request that finds no token yet,
+  an unreadable one, or one within a minute of expiry goes out as the host sent
+  it, and the proxy never refreshes one (refresh tokens are single-use; the CLI
+  keeps the Keychain copy fresh).
+- Session affinity (above) still applies, and an affinity entry wins. The
+  follow swap runs first, so affinity sees the followed bearer: a warm Desktop
+  session stays on the account its prompt cache is on after a switch, and a
+  session with no warm entry follows the move.
+- A followed request the account refuses with a 401 or 403 is resent on the
+  host's own bearer, the same fail-open the pinned routes use, and the token is
+  read again. A 404 is relayed as it came. A 403 that is the access-grant
+  refusal is not taken back: it becomes the 401 the wall and access-grant
+  conversions send.
+
+`/health` carries an `inference_follow` key (additive): `entrypoints`;
+`swapped`, the requests re-billed; `taken_back` by status code; `passthrough`
+by reason (`no-token`, `expiring`, `same-token`); `snapshot` (`age_s`,
+`failures`); and `since`, when this process started counting. Counts only, and
+nothing is written to a file. `daemon.log` records a refusal (at most one line
+per status code a minute).
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that

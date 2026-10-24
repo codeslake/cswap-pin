@@ -4188,6 +4188,211 @@ def _cache_aware_report(certdir) -> dict:
                 "failures": _affinity_snap["failures"]}}
 
 
+# INFERENCE FOLLOWS THE ACTIVE ACCOUNT, for a host that brings its own login.
+# OFF UNLESS A CLIENT ENTRYPOINT IS LISTED. For the `claude` CLI inference
+# already bills whatever cswap swapped onto disk: it reads the Keychain. Claude
+# Desktop's Code tab does not: it spawns its bundled CLI with the app's own
+# login in CLAUDE_CODE_OAUTH_TOKEN, and under a desktop entrypoint Claude Code
+# drops any settings `env` entry naming a variable the host set at spawn, so no
+# configuration reaches it. Its traffic still arrives here and its User-Agent
+# names the entrypoint, so this proxy can re-bill it: `/v1/messages` only (the
+# wall and grant arms of `_relay_response` match that path exactly, so a
+# refusal on another route could never be converted), never a pinned route.
+_INFERENCE_SWITCH_FILE = "inference-follows"
+_INFERENCE_CACHE: dict = {}
+_UA_ENTRYPOINT = re.compile(r"^\s*claude-cli/\S+\s+\(([^)]*)\)")
+# THE ACTIVE CREDENTIAL IS READ ON A THREAD OF ITS OWN (`_follow_kick`), never
+# a request's: a Keychain read has hung for days. It is reread at most this
+# often, by the trace tick or by a request that finds it older; a read that has
+# run the second figure is abandoned, at most `_FOLLOW_STUCK_MAX` of them out at
+# once. The token is never refreshed here (refresh tokens are single-use).
+_FOLLOW_REFRESH_S = 10.0
+_FOLLOW_STALE_S = 60.0
+_FOLLOW_STUCK_MAX = 3
+_follow_lock = threading.Lock()
+# the active account's access token and its `expiresAt` (ms) as the last read
+# left them, when that read started (`tried`: its identity; `at`: what the
+# landed one was judged by), whether one is running, how many abandoned ones
+# have still not returned, and the generation a clear bumps
+_follow_snap = {"token": None, "expires": None, "at": -math.inf,
+                "tried": -math.inf, "busy": False, "stuck": 0, "gen": 0,
+                "failures": 0}
+# `/health`'s counters: requests re-billed, refusals taken back by status code,
+# requests left alone by reason
+_follow_counts = {"swapped": 0, "taken_back": {}, "passthrough": {}}
+_follow_logged: dict[int, tuple] = {}
+_FOLLOW_SINCE = time.time()
+
+
+def inference_follow_entrypoints(certdir) -> "frozenset[str]":
+    """Client entrypoints whose inference is re-billed to the active account.
+
+    ``CSWAP_PIN_INFERENCE_FOLLOWS`` (comma-separated) wins; absent it,
+    ``<certdir>/inference-follows`` lists one entrypoint per line, re-read at
+    most every ``_TRACE_RECHECK_S`` so the switch reaches a daemon that is
+    already serving, exactly like ``trace-to``. Missing, empty or unreadable
+    is OFF: this must never be the thing that breaks a request.
+    """
+    env = os.environ.get("CSWAP_PIN_INFERENCE_FOLLOWS")
+    if env is not None:
+        return frozenset(e.strip() for e in env.split(",") if e.strip())
+    if certdir is None:
+        return frozenset()
+    key = str(certdir)
+    seen, value = _INFERENCE_CACHE.get(key, (0.0, frozenset()))
+    now = time.time()
+    if now - seen < _TRACE_RECHECK_S:
+        return value
+    try:
+        text = (Path(certdir) / _INFERENCE_SWITCH_FILE).read_text()
+        value = frozenset(
+            line.split("#", 1)[0].strip() for line in text.splitlines()) - {""}
+    except OSError:
+        value = frozenset()
+    _INFERENCE_CACHE[key] = (now, value)
+    return value
+
+
+def ua_entrypoint(ua: str) -> "str | None":
+    """The entrypoint a Claude Code User-Agent names, or None.
+
+    Claude Code sends ``claude-cli/<ver> (external, <entrypoint>[, ...])`` on
+    its API calls. The ``claude-code/<ver>`` form used on session routes
+    carries no entrypoint and never matches, which is fine: it never reaches
+    inference.
+    """
+    m = _UA_ENTRYPOINT.match(ua or "")
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split(",")]
+    return parts[1] if len(parts) > 1 and parts[1] else None
+
+
+def is_inference_follow_route(path: str, ua: str,
+                              entrypoints: "frozenset[str]") -> bool:
+    """Whether this request's bearer should become the active account's."""
+    return (path.split("?", 1)[0].rstrip("/") == "/v1/messages"
+            and ua_entrypoint(ua) in entrypoints)
+
+
+def _follow_reread(started: float, gen: int) -> None:
+    """Land the active credential in `_follow_snap`, on its own thread. It
+    lands only while it is still the current read (``started`` is the `tried`
+    stamp `_follow_kick` took, ``gen`` the generation then): one that began
+    before a clear, or was abandoned, is dropped. An unreadable credential
+    lands as no token."""
+    token, expires = _active_oauth_credential()
+    with _follow_lock:
+        snap = _follow_snap
+        if snap["tried"] == started and snap["gen"] == gen:
+            snap.update(token=token, expires=expires, at=started, busy=False)
+            snap["failures"] += token is None
+        else:
+            snap["stuck"] -= 1
+
+
+def _follow_kick() -> None:
+    """Start `_follow_reread` on a thread of its own when the last read began
+    `_FOLLOW_REFRESH_S` ago (or none has), one at a time. One that has run
+    `_FOLLOW_STALE_S` is abandoned and replaced, unless `_FOLLOW_STUCK_MAX`
+    are already out: then the snapshot is left as it is (no token, in the end)
+    until one returns."""
+    now = time.monotonic()
+    snap = _follow_snap
+    with _follow_lock:
+        due = snap["stuck"] < _FOLLOW_STUCK_MAX and now - snap["tried"] >= (
+            _FOLLOW_STALE_S if snap["busy"] else _FOLLOW_REFRESH_S)
+        if due:
+            snap["stuck"] += snap["busy"]  # a read still running is abandoned
+            snap.update(busy=True, tried=now)
+            gen = snap["gen"]
+    if due:
+        try:
+            _spawn_usage_header_recorder(lambda: _follow_reread(now, gen))
+        except Exception:  # noqa: BLE001
+            with _follow_lock:
+                snap["busy"] = False
+
+
+def _follow_clear(certdir) -> None:
+    """Forget the followed token and read the active one again at once. For
+    every caller whose switch may have moved the active account (the wall and
+    the grant arms of `_relay_response`) and for a refusal of the token: left
+    in place, the snapshot would send the client's retry back onto it. The read
+    in flight began before this and is dropped when it returns."""
+    snap = _follow_snap
+    with _follow_lock:
+        snap["stuck"] += snap["busy"]  # abandoned: its verdict will not land
+        snap.update(token=None, expires=None, at=-math.inf, tried=-math.inf,
+                    busy=False, gen=snap["gen"] + 1)
+    if inference_follow_entrypoints(certdir):
+        _follow_kick()
+
+
+def _follow_token(certdir, path: str, ua: str, headers) -> "str | None":
+    """The active account's bearer to send this request on, or None to leave it
+    as the host sent it. READS THE SNAPSHOT ONLY, never the credential: that is
+    `_follow_reread`'s, on its own thread. No snapshot, an unreadable
+    credential, one within the pin's minute of expiry, one the host already
+    holds, or a request with no bearer to replace: left alone (the fail-open
+    the rest of this module uses), and counted by reason for `/health`."""
+    if not is_inference_follow_route(
+            path, ua, inference_follow_entrypoints(certdir)):
+        return None
+    client = next((_bearer(v) for k, v in headers
+                   if k.lower() == "authorization"), "")
+    if not client:
+        return None
+    _follow_kick()
+    with _follow_lock:
+        token, expires = _follow_snap["token"], _follow_snap["expires"]
+        why = ("no-token" if not token else
+               "expiring" if expires is not None
+               and not _affinity_token_live(expires) else
+               "same-token" if token == client else None)
+        if why:
+            bucket = _follow_counts["passthrough"]
+            bucket[why] = bucket.get(why, 0) + 1
+        else:
+            _follow_counts["swapped"] += 1
+    return None if why else token
+
+
+def _follow_taken_back(certdir, code: int) -> None:
+    """The active account refused a followed request (401/403), which goes out
+    again as the host sent it. Its token is forgotten (a rotation may have
+    replaced it). One lifecycle line per code per `_BUSY_REPORT_COOLDOWN_S`,
+    folding the rest into "; N more"."""
+    with _follow_lock:
+        bucket = _follow_counts["taken_back"]
+        bucket[str(code)] = bucket.get(str(code), 0) + 1
+        more = _affinity_due(_follow_logged, code, time.monotonic())
+    _follow_clear(certdir)
+    if more is not None:
+        _log_lifecycle(
+            f"inference-follows: the active account answered {code} to a "
+            f"followed request, resent on the host's own bearer"
+            + (f"; {more} more" if more else ""))
+
+
+def _follow_report(certdir) -> dict:
+    """`/health`'s `inference_follow` key: the entrypoints listed, the requests
+    re-billed, the refusals taken back by status code, the requests left alone
+    by reason, and the snapshot's age and failed reads. Counts only."""
+    entrypoints = sorted(inference_follow_entrypoints(certdir))
+    now = time.monotonic()
+    with _follow_lock:
+        at = _follow_snap["at"]
+        return {"entrypoints": entrypoints,
+                "swapped": _follow_counts["swapped"],
+                "taken_back": dict(_follow_counts["taken_back"]),
+                "passthrough": dict(_follow_counts["passthrough"]),
+                "since": _iso_utc(_FOLLOW_SINCE),
+                "snapshot": {
+                    "age_s": None if at == -math.inf else round(now - at, 1),
+                    "failures": _follow_snap["failures"]}}
+
+
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
 # A peer watcher greps the daemon log for these; exported so it can assert at
 # runtime that the substrings it looks for are actually present HERE, in the
@@ -16898,8 +17103,9 @@ def _config_home_for_policy() -> Path:
     return require("paths").get_claude_config_home()
 
 
-def _active_oauth_token() -> "str | None":
-    """The access token of the account cswap currently has active.
+def _active_oauth_credential() -> "tuple[str | None, int | float | None]":
+    """(access token, `expiresAt` in ms) of the account cswap currently has
+    active; (None, None) when it cannot be read.
 
     THROUGH cswap's OWN READER, not the credentials FILE. On macOS the live
     credential lives in the Keychain and that path does not exist — so a file
@@ -16909,9 +17115,17 @@ def _active_oauth_token() -> "str | None":
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
         raw = json.loads(sw._read_credentials() or "{}")
-        return (raw.get("claudeAiOauth") or {}).get("accessToken") or None
+        cred = raw.get("claudeAiOauth") or {}
+        exp = cred.get("expiresAt")
+        return (cred.get("accessToken") or None,
+                exp if isinstance(exp, (int, float)) else None)
     except Exception:  # noqa: BLE001 — never take the daemon down
-        return None
+        return None, None
+
+
+def _active_oauth_token() -> "str | None":
+    """The access token of the account cswap currently has active."""
+    return _active_oauth_credential()[0]
 
 
 def _active_pin_account_label() -> "str | None":
@@ -17814,6 +18028,10 @@ class PinProxy:
                 self._affinity_refresh_tick()
             except Exception:  # noqa: BLE001 — never take this thread down
                 pass
+            try:
+                self._follow_refresh_tick()
+            except Exception:  # noqa: BLE001
+                pass
             self._trace_tick_stop.wait(0.5)
 
     def _carry_in_blind_reason(self) -> None:
@@ -17921,6 +18139,13 @@ class PinProxy:
                 now - at < cfg[0] for _, at in _affinity.values())
         if warm:  # a rebuild with no session to rule on is a read for nothing
             _affinity_kick(cfg[1], cfg[2])
+
+    def _follow_refresh_tick(self) -> None:
+        """Keep the follow snapshot ready with no request to ask for it, while
+        an entrypoint is listed: the request path never reads the credential,
+        so it must find one. `_follow_kick` holds the period."""
+        if not self._stop and inference_follow_entrypoints(self._certdir):
+            _follow_kick()
 
     def _warm_mint_cache(self) -> None:
         """Populate the mint cache ONCE, off the request path and off
@@ -21636,6 +21861,10 @@ class PinProxy:
              # ADDITIVE: the cache-aware session affinity, armed or not (see
              # `_cache_aware_report`); per slot, never per session.
              "cache_aware": _cache_aware_report(
+                 getattr(self, "_certdir", None)),
+             # ADDITIVE: inference follows the active account for a listed
+             # host (see `_follow_report`); counts only.
+             "inference_follow": _follow_report(
                  getattr(self, "_certdir", None))}
         )
         try:
@@ -22386,6 +22615,22 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
+        # INFERENCE FOLLOWS THE ACTIVE ACCOUNT (opt-in, see `_follow_token`), for
+        # a host that brought its own login; never a pinned route. FIRST, before
+        # affinity: the host's own bearer never changes across a cswap switch, so
+        # only the followed one lets a warm session bind (and an affinity entry
+        # still wins below). `x-organization-uuid` names the HOST's org, which
+        # beside another account's bearer is a 403 waiting to happen.
+        followed = False
+        followed_headers = original_headers
+        if not pinned:
+            follow_token = _follow_token(
+                getattr(self, "_certdir", None), path, ua, headers)
+            if follow_token:
+                followed = True
+                followed_headers = headers = [
+                    (k, v) for k, v in _swap_credential(headers, follow_token)
+                    if k.lower() != "x-organization-uuid"]
         # SESSION AFFINITY (off unless armed, see `session_affinity_config`): a
         # warm session may keep the account it was on, so this request goes out
         # with that slot's stored token. `original_headers` is the client's own
@@ -22486,7 +22731,8 @@ class PinProxy:
         try:
             keep = self._forward(method, path, headers, body, tls,
                                  swapped=swapped, bridge_hold=_bridge_hold,
-                                 affinity=inject[1] if inject else None)
+                                 affinity=inject[1] if inject else None,
+                                 follow=followed)
             if inject and isinstance(keep, _AuthRejected) and keep.code == 401:
                 # A 401 MAY BE A ROTATED TOKEN, not the account: one resend on
                 # the slot's token as the store holds it now, on both
@@ -22497,19 +22743,31 @@ class PinProxy:
                 if fresh:
                     self._drop_upstream()
                     keep = self._forward(
-                        method, path, _swap_credential(original_headers, fresh),
-                        body, tls, swapped=swapped, affinity=inject[1])
+                        method, path, _swap_credential(followed_headers, fresh),
+                        body, tls, swapped=swapped, affinity=inject[1],
+                        follow=followed)
             if inject and isinstance(keep, _AuthRejected):
                 # THE KEPT ACCOUNT REFUSED (401/403/429), and nothing has
                 # reached the client: its answer is not the client's. Resend
-                # as it arrived, so `_switch_off_walled_account`, `switch()`,
-                # the wall memos and the grant-403 paths never see a wall or
-                # a refusal that is not the live account's. The body is
-                # buffered whole (`_read_body`), so it replays.
+                # as it arrived (on the followed account's bearer, when the
+                # request was followed: the kept swap is the only one undone
+                # here), so `_switch_off_walled_account`, `switch()`, the wall
+                # memos and the grant-403 paths never see a wall or a refusal
+                # that is not the live account's. The body is buffered whole
+                # (`_read_body`), so it replays.
                 _affinity_take_back(inject[2], inject[1], keep.code, keep.reset)
                 self._drop_upstream()
+                keep = self._forward(method, path, followed_headers, body, tls,
+                                     follow=followed)
+            if followed and isinstance(keep, _AuthRejected):
+                # THE FOLLOWED ACCOUNT REFUSED (401/403; a 404 is relayed, it is
+                # no account's refusal). Resend as the host sent it. NEVER the
+                # pinned branch below: its refetch returns the PINNED account's
+                # token, which must not reach inference.
+                _follow_taken_back(getattr(self, "_certdir", None), keep.code)
+                self._drop_upstream()
                 keep = self._forward(method, path, original_headers, body, tls)
-            if isinstance(keep, _AuthRejected):
+            elif isinstance(keep, _AuthRejected):
                 # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
                 # 401/403/404 is terminal to the client — SSETransport treats
                 # those as permanent (M7y = new Set([401,403,404])), sets
@@ -22683,7 +22941,8 @@ class PinProxy:
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False,
                  bridge_hold: "tuple[str, threading.Event] | None" = None,
-                 affinity: "tuple[str, str] | None" = None
+                 affinity: "tuple[str, str] | None" = None,
+                 follow: bool = False
                  ) -> bool:
         """Relay one request upstream and stream the response back.
 
@@ -22869,7 +23128,7 @@ class PinProxy:
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
                 drop_request_id=swapped and _is_profile_route(path),
-                affinity=affinity,
+                affinity=affinity, follow=follow,
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
@@ -25846,6 +26105,7 @@ def _relay_response(
     on_hop_trouble=None,
     affinity: "tuple[str, str] | None" = None,
     drop_request_id: bool = False,
+    follow: bool = False,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -25858,6 +26118,12 @@ def _relay_response(
     (`_affinity_pick`): a 401/403/429 from that account is returned as
     `_AuthRejected` before a byte reaches the client, and an answer's usage
     headers are recorded to that slot rather than the live one.
+
+    ``follow`` marks a request re-billed to the active account
+    (`_follow_token`): its 401/403 is returned as `_AuthRejected` too, for the
+    caller to resend as the host sent it, but a 403 that is the access-grant
+    refusal is the 401 conversion's and is not taken back. Its 404 is relayed.
+    Not `reject_on_auth_error`, which is the pinned swap's and adds the 404.
 
     ``on_hop_trouble`` is called at the status line when `note_hop` stamped
     the upstream's own 5xx; the caller retires its kept upstream once the body
@@ -25936,10 +26202,39 @@ def _relay_response(
     # permanent; anything else is the origin's own answer and belongs to it.
     # A KEPT session's 404 is not a refusal of the account (see
     # `_affinity_relay_404`): it is relayed, and its 429 is taken back instead.
+    # A FOLLOWED request's is relayed too (T2670 measured a 404 is no account's
+    # refusal), and its 403 is taken back only once it is known not to be the
+    # access-grant refusal: the active account's grant 403 is what the 401
+    # conversion below is for, and a take-back would hide it from it. A kept
+    # request keeps today's order (its token is not the live account's).
     kept = bool(affinity) and not reject_on_auth_error
-    if (reject_on_auth_error or affinity) and any(
+    following = follow and not affinity
+    # True when the pin turns this answer into a 401 (a switch off the account)
+    _walled_401 = False
+    # AN ACCESS-GRANT 403 on a healthy bearer (2026-10-06: 11 relayed unchanged
+    # over 2m22s, every session drawing "Please run /login"). The
+    # same 401 conversion as the wall below, but nothing is stripped on a
+    # failure: `_wall_relay` stays False and the 403 goes out as it came. The
+    # capability is read BEFORE any body is, and the body is read only to
+    # match it, raw bytes kept in `rest` (see `_grant_refusal`).
+    _grant = False
+    if (status_line.startswith(b"HTTP/1.1 403")
+            and not (reject_on_auth_error or affinity)
+            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
+            and not _status_has_no_body(status_line, method)
+            and _switch_takes_refused()):
+        rest, _grant = _grant_refusal(up, lines, rest)
+        _token = _bearer(auth)
+        if _grant and _token:
+            _walled_401 = _switch_off_walled_account(
+                b"grant:"
+                + hashlib.sha256(_token.encode()).hexdigest()[:16].encode(),
+                b"", auth, session, kind="grant")
+            _follow_clear(certdir)
+    if (reject_on_auth_error or affinity or following) and not _walled_401 and any(
         status_line.startswith(b"HTTP/1.1 " + c)
         for c in ((b"401", b"403", b"429") if kept
+                  else (b"401", b"403") if following
                   else (b"401", b"403", b"404"))
     ):
         if _TRACE is not None:
@@ -25972,10 +26267,9 @@ def _relay_response(
     if note_hop and _note_hop_trouble(status_line) and on_hop_trouble:
         on_hop_trouble()
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
-    # above cannot see it (a session-affinity refusal it does, and returns
-    # above, so this only reads the client's own account's answer); 401 is a
-    # rebuild trigger, 429 is not.
-    _walled_401 = False
+    # above cannot see it (a session-affinity or followed refusal it does, and
+    # returns above, so this only reads the client's own account's answer); 401
+    # is a rebuild trigger, 429 is not.
     # True for a wall 429 the pin could not convert: the client still sees a
     # 429, but its rate-limit headers are stripped below so it backs off
     # instead of sleeping the wall's own reset window.
@@ -25993,6 +26287,8 @@ def _relay_response(
             b"",
         )
         _walled_401 = _switch_off_walled_account(reset, retry_after, auth, session)
+        if reset:  # an account-level wall: the switch may have moved the account
+            _follow_clear(certdir)
         _wall_relay = bool(reset) and not _walled_401
         try:
             _own_reset: float | None = float(reset)
@@ -26000,24 +26296,6 @@ def _relay_response(
             _own_reset = None
     else:
         _own_reset = None
-    # AN ACCESS-GRANT 403 on a healthy bearer (2026-10-06, lmd42: 11 relayed
-    # unchanged over 2m22s, every session drawing "Please run /login"). The
-    # same 401 conversion as the wall above, but nothing is stripped on a
-    # failure: `_wall_relay` stays False and the 403 goes out as it came. The
-    # capability is read BEFORE any body is, and the body is read only to
-    # match it, raw bytes kept in `rest` (see `_grant_refusal`).
-    _grant = False
-    if (status_line.startswith(b"HTTP/1.1 403")
-            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
-            and not _status_has_no_body(status_line, method)
-            and _switch_takes_refused()):
-        rest, _grant = _grant_refusal(up, lines, rest)
-        _token = _bearer(auth)
-        if _grant and _token:
-            _walled_401 = _switch_off_walled_account(
-                b"grant:"
-                + hashlib.sha256(_token.encode()).hexdigest()[:16].encode(),
-                b"", auth, session, kind="grant")
     # The fleet's own reset for an unconverted wall — read ONCE into a
     # local (a concurrent write of 0.0 between two reads of the module
     # global would relay `anthropic-ratelimit-unified-reset: 0`), then
@@ -26234,7 +26512,7 @@ def _relay_response(
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
                 on_hop_trouble=on_hop_trouble, affinity=affinity,
-                drop_request_id=drop_request_id,
+                drop_request_id=drop_request_id, follow=follow,
             )
         return _relay_response(
             up, client, cid,
@@ -26242,7 +26520,7 @@ def _relay_response(
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             on_hop_trouble=on_hop_trouble, affinity=affinity,
-            drop_request_id=drop_request_id,
+            drop_request_id=drop_request_id, follow=follow,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
