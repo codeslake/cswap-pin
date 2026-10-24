@@ -4205,7 +4205,8 @@ _UA_ENTRYPOINT = re.compile(r"^\s*claude-cli/\S+\s+\(([^)]*)\)")
 # a request's: a Keychain read has hung for days. It is reread at most this
 # often, by the trace tick or by a request that finds it older; a read that has
 # run the second figure is abandoned, at most `_FOLLOW_STUCK_MAX` of them out at
-# once. The token is never refreshed here (refresh tokens are single-use).
+# once, and a snapshot that old (no read has landed since) is no token. The
+# token is never refreshed here (refresh tokens are single-use).
 _FOLLOW_REFRESH_S = 10.0
 _FOLLOW_STALE_S = 60.0
 _FOLLOW_STUCK_MAX = 3
@@ -4268,13 +4269,6 @@ def ua_entrypoint(ua: str) -> "str | None":
     return parts[1] if len(parts) > 1 and parts[1] else None
 
 
-def is_inference_follow_route(path: str, ua: str,
-                              entrypoints: "frozenset[str]") -> bool:
-    """Whether this request's bearer should become the active account's."""
-    return (path.split("?", 1)[0].rstrip("/") == "/v1/messages"
-            and ua_entrypoint(ua) in entrypoints)
-
-
 def _follow_reread(started: float, gen: int) -> None:
     """Land the active credential in `_follow_snap`, on its own thread. It
     lands only while it is still the current read (``started`` is the `tried`
@@ -4284,26 +4278,32 @@ def _follow_reread(started: float, gen: int) -> None:
     token, expires = _active_oauth_credential()
     with _follow_lock:
         snap = _follow_snap
-        if snap["tried"] == started and snap["gen"] == gen:
-            snap.update(token=token, expires=expires, at=started, busy=False)
-            snap["failures"] += token is None
+        if snap["tried"] != started:
+            snap["stuck"] -= 1  # abandoned
         else:
-            snap["stuck"] -= 1
+            snap["busy"] = False
+            if snap["gen"] == gen:
+                snap.update(token=token, expires=expires, at=started)
+                snap["failures"] += token is None
 
 
 def _follow_kick() -> None:
     """Start `_follow_reread` on a thread of its own when the last read began
     `_FOLLOW_REFRESH_S` ago (or none has), one at a time. One that has run
     `_FOLLOW_STALE_S` is abandoned and replaced, unless `_FOLLOW_STUCK_MAX`
-    are already out: then the snapshot is left as it is (no token, in the end)
-    until one returns."""
+    are already out: that one is left running, and only the abandoning is held
+    back (`_affinity_kick`'s rule), so a read that has returned is followed by
+    the next at the usual period. A snapshot no read has landed in for
+    `_FOLLOW_STALE_S` is no token (`_follow_token`)."""
     now = time.monotonic()
     snap = _follow_snap
     with _follow_lock:
-        due = snap["stuck"] < _FOLLOW_STUCK_MAX and now - snap["tried"] >= (
-            _FOLLOW_STALE_S if snap["busy"] else _FOLLOW_REFRESH_S)
+        abandon = (snap["busy"] and now - snap["tried"] >= _FOLLOW_STALE_S
+                   and snap["stuck"] < _FOLLOW_STUCK_MAX)
+        due = abandon or (not snap["busy"]
+                          and now - snap["tried"] >= _FOLLOW_REFRESH_S)
         if due:
-            snap["stuck"] += snap["busy"]  # a read still running is abandoned
+            snap["stuck"] += abandon
             snap.update(busy=True, tried=now)
             gen = snap["gen"]
     if due:
@@ -4319,12 +4319,17 @@ def _follow_clear(certdir) -> None:
     every caller whose switch moved the active account (the wall and the grant
     arms of `_relay_response`, when they convert) and for a refusal of the
     token: left in place, the snapshot would send the client's retry back onto
-    it. The read in flight began before this and is dropped when it returns."""
+    it. The read in flight began before this and is dropped when it returns:
+    abandoned for a new one unless `_FOLLOW_STUCK_MAX` are out already, then
+    left running (`_follow_kick` starts none over it)."""
     snap = _follow_snap
     with _follow_lock:
-        snap["stuck"] += snap["busy"]  # abandoned: its verdict will not land
-        snap.update(token=None, expires=None, at=-math.inf, tried=-math.inf,
-                    busy=False, gen=snap["gen"] + 1)
+        abandon = snap["busy"] and snap["stuck"] < _FOLLOW_STUCK_MAX
+        snap["stuck"] += abandon
+        snap.update(token=None, expires=None, at=-math.inf,
+                    gen=snap["gen"] + 1)
+        if abandon or not snap["busy"]:
+            snap.update(tried=-math.inf, busy=False)
     if inference_follow_entrypoints(certdir):
         _follow_kick()
 
@@ -4332,21 +4337,31 @@ def _follow_clear(certdir) -> None:
 def _follow_token(certdir, path: str, ua: str, headers) -> "str | None":
     """The active account's bearer to send this request on, or None to leave it
     as the host sent it. READS THE SNAPSHOT ONLY, never the credential: that is
-    `_follow_reread`'s, on its own thread. No snapshot, an unreadable
-    credential, one within the pin's minute of expiry, one the host already
-    holds, or a request with no bearer to replace: left alone (the fail-open
-    the rest of this module uses), and counted by reason for `/health`."""
-    if not is_inference_follow_route(
-            path, ua, inference_follow_entrypoints(certdir)):
+    `_follow_reread`'s, on its own thread. No snapshot, one no read has landed
+    in for `_FOLLOW_STALE_S` (a reader that hangs), an unreadable credential,
+    one within the pin's minute of expiry, one the host already holds, or a
+    request with no bearer to replace (or a second credential unlike it):
+    left alone (the fail-open the rest of this module uses), and counted by
+    reason for `/health`."""
+    # the path first: a route that is not followed never reads the switch file
+    if (path.split("?", 1)[0].rstrip("/") != "/v1/messages"
+            or ua_entrypoint(ua) not in inference_follow_entrypoints(certdir)):
         return None
-    client = next((_bearer(v) for k, v in headers
-                   if k.lower() == "authorization"), "")
-    if not client:
+    client = key = ""
+    for k, v in headers:
+        kl = k.lower()
+        if kl == "authorization":
+            client = _bearer(v)
+        elif kl == "x-api-key":
+            key = v
+    if not client or key not in ("", client):  # `_affinity_pick`'s rule
         return None
     _follow_kick()
     with _follow_lock:
         token, expires = _follow_snap["token"], _follow_snap["expires"]
+        age = time.monotonic() - _follow_snap["at"]
         why = ("no-token" if not token else
+               "stale" if age > _FOLLOW_STALE_S else
                "expiring" if expires is not None
                and not _affinity_token_live(expires) else
                "same-token" if token == client else None)

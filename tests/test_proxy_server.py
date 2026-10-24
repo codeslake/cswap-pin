@@ -27234,8 +27234,16 @@ class TestInferenceFollows:
         assert ua_entrypoint("claude-swap/1.0") is None
         assert ua_entrypoint("") is None
 
-    def case_route_needs_inference_path_and_listed_entrypoint(self):
-        from cswap_pin.proxy import is_inference_follow_route as f
+    def case_route_needs_inference_path_and_listed_entrypoint(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+
+        def f(path, ua, on):
+            monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", ",".join(on))
+            return pp._follow_token(certdir, path, ua, headers) is not None
 
         on = frozenset({"claude-desktop"})
         assert f("/v1/messages?beta=true", _DESKTOP_UA, on)
@@ -27247,6 +27255,113 @@ class TestInferenceFollows:
         # The wall and grant arms match /v1/messages exactly, so a followed
         # count_tokens refusal could never be converted: it is not followed.
         assert not f("/v1/messages/count_tokens", _DESKTOP_UA, on)
+
+    def case_a_request_off_the_route_never_reads_the_switch_file(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        reads = []
+        monkeypatch.setattr(pp, "inference_follow_entrypoints",
+                            lambda c: reads.append(c) or frozenset())
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        for path in ("/v1/code/sessions", "/api/oauth/usage",
+                     "/v1/messages/count_tokens"):
+            assert pp._follow_token(certdir, path, _DESKTOP_UA, headers) is None
+        assert not reads, "a route that is not followed read the switch file"
+        pp._follow_token(certdir, "/v1/messages", _DESKTOP_UA, headers)
+        assert reads == [certdir]
+
+    def case_a_second_credential_is_left_as_the_client_sent_it(
+            self, certdir, monkeypatch):
+        """An `x-api-key` unlike the bearer is the client's own pair
+        (`_affinity_pick`'s rule): swapping the bearer alone would send two
+        credentials."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+
+        def f(*extra):
+            return pp._follow_token(
+                certdir, "/v1/messages", _DESKTOP_UA,
+                [("Authorization", "Bearer HOST-TOKEN"), *extra])
+
+        assert f(("x-api-key", "OTHER-KEY")) is None
+        assert f(("x-api-key", "HOST-TOKEN")) == "ACTIVE"  # moves with it
+        assert f() == "ACTIVE"
+
+    def case_a_snapshot_older_than_the_stale_bound_is_no_token(
+            self, certdir, monkeypatch):
+        """A reader that hangs leaves the last snapshot in place: it must not
+        keep billing the last account it read."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) == "ACTIVE"
+        pp._follow_snap["at"] -= pp._FOLLOW_STALE_S + 1  # `tried` is recent
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) is None
+        assert pp._follow_counts["passthrough"] == {"stale": 1}
+
+    def case_a_read_still_lands_after_three_abandoned_ones(
+            self, certdir, monkeypatch):
+        """The abandon limit holds back another abandonment only: once a read
+        has landed, the next one is due at the usual period though the three
+        hung ones have not returned (`_affinity_kick`'s rule)."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, seed=False)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for stuck in (1, 2, 3):
+            clock["t"] += pp._FOLLOW_STALE_S
+            pp._follow_kick()
+            assert snap["stuck"] == stuck and len(queued) == stuck + 1
+        clock["t"] += pp._FOLLOW_STALE_S
+        pp._follow_kick()
+        assert len(queued) == 4, "a fourth hung read was abandoned"
+        queued[3]()
+        assert snap["token"] == "ACTIVE" and not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        ctx.cell[0] = "NEXT"
+        pp._follow_kick()
+        assert len(queued) == 5, "no read was due after the three abandoned"
+        queued[4]()
+        assert snap["token"] == "NEXT"
+        for hung in queued[:3]:  # they return at last: each is dropped
+            hung()
+        assert snap["token"] == "NEXT" and snap["stuck"] == 0
+
+    def case_clears_over_hung_reads_start_no_more_than_the_limit(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, seed=False)
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "claude-desktop")
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for _ in range(10):  # a storm of clears while the reads hang
+            clock["t"] += 1
+            pp._follow_clear(None)
+        assert snap["stuck"] == pp._FOLLOW_STUCK_MAX
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 1, len(queued)
+        for fn in queued:  # all return: none lands, none is left busy
+            fn()
+        assert snap["token"] is None and snap["stuck"] == 0
+        assert not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        pp._follow_kick()
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 2
 
     def case_switch_file_env_and_comments(self, certdir, monkeypatch):
         from cswap_pin import proxy as pp

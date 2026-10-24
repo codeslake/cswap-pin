@@ -1410,9 +1410,11 @@ What it does, for a listed entrypoint only:
 - The active credential is read by a thread of its own, never by a request:
   every 10 seconds while an entrypoint is listed, and at once after a switch
   the wall or the access-grant check converted into a 401. A request that
-  finds no token yet, an unreadable one, or one within a minute of expiry goes
-  out as the host sent it, and the proxy never refreshes one (refresh tokens
-  are single-use; the CLI keeps the Keychain copy fresh).
+  finds no token yet, an unreadable one, one no read has landed in for a
+  minute (a reader that hangs), or one within a minute of expiry goes out as
+  the host sent it, and the proxy never refreshes one (refresh tokens are
+  single-use; the CLI keeps the Keychain copy fresh). A request that carries
+  an `x-api-key` unlike its bearer is the client's own pair and is left alone.
 - Session affinity (above) still applies, and an affinity entry wins. The
   follow swap runs first, so affinity sees the followed bearer: a warm Desktop
   session stays on the account its prompt cache is on after a switch, and a
@@ -1427,10 +1429,10 @@ What it does, for a listed entrypoint only:
 `/health` carries an `inference_follow` key (additive): `entrypoints`;
 `swapped`, the requests whose bearer became the active account's (a warm
 session's affinity entry may still send one on its kept slot); `taken_back` by
-status code; `passthrough` by reason (`no-token`, `expiring`, `same-token`);
-`snapshot` (`age_s`, `failures`); and `since`, when this process started
-counting. Counts only, and nothing is written to a file. `daemon.log` records
-a refusal (at most one line per status code a minute).
+status code; `passthrough` by reason (`no-token`, `stale`, `expiring`,
+`same-token`); `snapshot` (`age_s`, `failures`); and `since`, when this process
+started counting. Counts only, and nothing is written to a file. `daemon.log`
+records a refusal (at most one line per status code a minute).
 
 ## Falling through a dead hop
 
