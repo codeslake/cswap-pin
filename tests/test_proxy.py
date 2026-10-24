@@ -13674,8 +13674,9 @@ print("OK", port)
         successor takes the port it re-asks and SIGHUPs whoever still holds
         the descriptor, walking the stale ones off before it serves.
 
-        Every holder that is KILLED rather than released leaves its standby
-        behind — that is the row this covers, so they genuinely accumulate.
+        Every holder that EXITS WITHOUT RELEASING (stood down, or ended by a
+        signal) leaves its standby behind: that is the row this covers, so
+        they genuinely accumulate.
         Measured on host-a before any of this: three had piled up, one silent
         window armed them all, and 36301 ended with four acceptors.
 
@@ -35462,6 +35463,42 @@ else:
                 "successor")
         finally:
             serving.close()
+
+
+def test_a_stood_down_holders_standby_is_retired_and_named_for_the_stand_down(
+        monkeypatch):
+    """T2920, with real processes: the stale-code stand-down is a SIGHUP that
+    ends the holder with no handler, so its standby is left behind by design
+    (it covers the gap). The successor's holder retires it, and the lifecycle
+    line must say the holder was STOOD DOWN, not that it was "killed" as if
+    it had crashed. The trio is the T1936 one (its short tick makes the
+    orphaned daemon hand over at once); denial is irrelevant on Linux."""
+    from conftest import _pin_standby_pids
+    from cswap_pin import proxy as pp
+
+    harness = TestACallerOutsideTheLineageTakesTheSocketOver()
+    with harness._trio(monkeypatch, denied=True, tick_s=0.3) as t:
+        old = _pin_standby_pids(t.certdir)
+        assert len(old) == 1, f"premise: the holder placed one standby: {old}"
+        # What `_retire_stale_holder` sends, to the holder it is asked about.
+        os.kill(t.holder, pp._STAND_DOWN_SIGNAL)
+        harness._until("the stood-down holder never ended",
+                       lambda: not pp._pid_alive(t.holder), 15)
+        # THE FAULT APPEARED: the holder ran no release, so its standby stands.
+        assert pp._pid_alive(old[0]), (
+            "premise: the stand-down took the standby with it, so there is "
+            "nothing for the successor to retire")
+        log_file = t.certdir / "daemon.log"
+        line = harness._until(
+            "the successor never reported retiring the stray",
+            lambda: next((ln for ln in log_file.read_text().splitlines()
+                          if "standby(s) left behind" in ln), None), 40)
+        assert "retired 1 standby(s)" in line, line
+        assert "stood down" in line, (
+            f"the line does not name a stand-down as a cause: {line}")
+        assert "killed rather than released" not in log_file.read_text()
+        harness._until("the stray standby is still alive",
+                       lambda: not pp._pid_alive(old[0]), 15)
 
 
 class TestTheDaemonRaisesItsFdLimit:

@@ -663,6 +663,17 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
         time.sleep(0.2)
 
 
+def _pin_standby_pids(certdir) -> list[int]:
+    """Pids of the standbys for ``certdir`` (the LAST argv token), read only."""
+    import subprocess
+
+    out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                         capture_output=True, text=True, timeout=5).stdout
+    return [int(ln.split()[0]) for ln in out.splitlines()
+            if "cswap_pin.proxy" in ln and f" {_STANDBY_ARG} " in ln
+            and ln.rstrip().endswith(" " + str(certdir))]
+
+
 def _root_owner_alive(root, mark: str = ".lock") -> bool:
     """Whether ``root`` is CLAIMED by a session this sweep must not touch.
 

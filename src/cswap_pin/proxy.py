@@ -13479,7 +13479,8 @@ class PortHolder:
         if gone:
             _log_lifecycle(
                 f"retired {gone} standby(s) left behind on port {self.port} by "
-                f"holders that were killed rather than released"
+                f"holders that exited without releasing them (stood down for "
+                f"running old code, or ended by a signal)"
             )
 
     def _reap_standby(self) -> None:
@@ -14492,10 +14493,10 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         return
 
     # EXACTLY ONE STANDBY MAY ARM, and a lock is the only thing that can say
-    # so. Standbys accumulate legitimately: every holder that is KILLED rather
-    # than released leaves its own behind, by design — that is the row this
-    # covers. They all then watch the same port, so a single silent window arms
-    # ALL of them and each becomes a holder.
+    # so. Standbys accumulate legitimately: every holder that EXITS WITHOUT
+    # RELEASING (stood down, or ended by a signal) leaves its own behind, by
+    # design: that is the row this covers. They all then watch the same port,
+    # so a single silent window arms ALL of them and each becomes a holder.
     #
     # MEASURED ON THE LINUX HOST, not reasoned about: three armed within a minute of
     # each other and produced four acceptors on 36301, which is precisely the
@@ -16098,10 +16099,11 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     descriptor, still watches the port, and is precisely what arms on the next
     silent window. So the lock defers a pile-up rather than preventing one.
 
-    They accumulate for a reason that is not a bug: a holder KILLED rather
-    than released leaves its standby behind deliberately — that is the row
-    this whole design covers. Every such death adds one. Measured on host-a:
-    three had piled up, one ordinary daemon handover armed them all, and the
+    They accumulate for a reason that is not a bug: a holder that EXITS
+    WITHOUT RELEASING (stood down for running old code, which is a SIGHUP
+    with no handler, or ended by a signal) leaves its standby behind
+    deliberately: that is the row this whole design covers. Every such exit
+    adds one. Measured on host-a: three had piled up, one ordinary daemon handover armed them all, and the
     port ended with four acceptors.
 
     SIGHUP, because that is the standby's release signal and the only one it
@@ -16215,8 +16217,9 @@ def _claim_arm(certdir) -> "int | None":
     """Win the right to arm, or None if another standby already has it.
 
     THE ONLY THING THAT CAN SAY "ONLY ONE". Standbys accumulate legitimately —
-    every holder KILLED rather than released leaves its own behind, which is
-    the row this whole design covers — and they all watch the same port, so one
+    every holder that EXITS WITHOUT RELEASING (stood down, or ended by a
+    signal) leaves its own behind, which is the row this whole design covers,
+    and they all watch the same port, so one
     silent window arms ALL of them at once. Measured on host-a: three armed
     within a minute, each became a holder, four acceptors on 36301.
 
