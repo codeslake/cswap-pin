@@ -13674,8 +13674,9 @@ print("OK", port)
         successor takes the port it re-asks and SIGHUPs whoever still holds
         the descriptor, walking the stale ones off before it serves.
 
-        Every holder that is KILLED rather than released leaves its standby
-        behind — that is the row this covers, so they genuinely accumulate.
+        Every holder that EXITS WITHOUT RELEASING (stood down, or ended by a
+        signal) leaves its standby behind: that is the row this covers, so
+        they genuinely accumulate.
         Measured on host-a before any of this: three had piled up, one silent
         window armed them all, and 36301 ended with four acceptors.
 
