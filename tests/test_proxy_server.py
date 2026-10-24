@@ -12,6 +12,7 @@ import errno
 import http.client
 import io
 import json
+import math
 import types
 import pathlib
 import re
@@ -27128,3 +27129,570 @@ class TestHappyEyeballsDial:
         took = time.monotonic() - t0
         assert took < 2.0, f"the whole-dial budget was not kept: {took:.1f}s"
         assert not deads, "an address was never attempted"
+
+
+# ---------------------------------------------------------------------------
+# Inference follows the active account for a host that brings its own login
+# (Claude Desktop's Code tab). Opt-in via `<certdir>/inference-follows`.
+# ---------------------------------------------------------------------------
+
+_DESKTOP_UA = "claude-cli/2.1.281 (external, claude-desktop)"
+_CLI_UA = "claude-cli/2.1.281 (external, cli)"
+_FAR_MS = 4102444800000  # expiresAt, year 2100, ms
+_GRANT_403 = json.dumps({"type": "error", "error": {
+    "type": "permission_error",
+    "message": "Access to this model requires an access grant your request "
+               "does not have"}}).encode()
+_OTHER_403 = json.dumps({"type": "error", "error": {
+    "type": "permission_error",
+    "message": "Your organization does not have access to this resource"}}
+).encode()
+
+
+def _health_of(proxy) -> dict:
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+    conn.request("GET", "/health")
+    body = json.loads(conn.getresponse().read())
+    conn.close()
+    return body["inference_follow"]
+
+
+class TestInferenceFollows:
+    """A host that brings its own login (Claude Desktop) bills the account it
+    is signed into. Listed in `inference-follows`, its `/v1/messages` goes out
+    on cswap's active account instead, from a snapshot a thread of its own
+    reads, and a refusal is taken back onto the host's own bearer."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _seed(token, expires=_FAR_MS):
+        """The follow snapshot holds ``token``, read just now."""
+        from cswap_pin import proxy as pp
+
+        now = time.monotonic()
+        pp._follow_snap.update(token=token, expires=expires, at=now,
+                               tried=now, busy=False)
+
+    @classmethod
+    def _arm(cls, monkeypatch, certdir, token="ACTIVE", expires=_FAR_MS,
+             on=True, seed=True):
+        """Clean follow state, the switch on (or off), the snapshot holding
+        ``token`` (``seed``), and the credential reader a case moves through
+        ``ctx.cell``; ``ctx.reads`` counts its calls. Every read runs inline
+        unless a case swaps `_spawn_usage_header_recorder`."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        (certdir / "inference-follows").unlink(missing_ok=True)
+        if on:
+            (certdir / "inference-follows").write_text("claude-desktop\n")
+        pp._INFERENCE_CACHE.clear()
+        pp._follow_snap.update(token=None, expires=None, at=-math.inf,
+                               tried=-math.inf, busy=False, stuck=0, gen=0,
+                               failures=0)
+        pp._follow_counts.update(swapped=0, taken_back={}, passthrough={})
+        pp._follow_logged.clear()
+        ctx = types.SimpleNamespace(cell=[token, expires], reads=[])
+
+        def reader():
+            ctx.reads.append(1)
+            return tuple(ctx.cell)
+
+        monkeypatch.setattr(pp, "_active_oauth_credential", reader)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: fn())
+        monkeypatch.setattr(pp, "_note_usage_headers", lambda *a, **k: None)
+        if seed:
+            cls._seed(token, expires)
+        return ctx
+
+    @staticmethod
+    def _proxy(certdir, upstream):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir,
+                        pin_token_provider=lambda: "PIN-TOKEN",
+                        upstream=("127.0.0.1", upstream.port))
+
+    @staticmethod
+    def _ask(proxy, certdir, path="/v1/messages", bearer="HOST-TOKEN",
+             ua=_DESKTOP_UA, **kw):
+        return _request_through_proxy(proxy.port, certdir / "ca.pem", path,
+                                      bearer=bearer, ua=ua, **kw)
+
+    def case_ua_entrypoint_parses_claude_cli_only(self):
+        from cswap_pin.proxy import ua_entrypoint
+
+        assert ua_entrypoint(_DESKTOP_UA) == "claude-desktop"
+        assert ua_entrypoint(_CLI_UA) == "cli"
+        assert ua_entrypoint(
+            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.9)") == "sdk-ts"
+        # The session-route UA carries no entrypoint; nor does anything else.
+        assert ua_entrypoint("claude-code/2.1.281") is None
+        assert ua_entrypoint("claude-swap/1.0") is None
+        assert ua_entrypoint("") is None
+
+    def case_route_needs_inference_path_and_listed_entrypoint(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+
+        def f(path, ua, on):
+            monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", ",".join(on))
+            return pp._follow_token(certdir, path, ua, headers) is not None
+
+        on = frozenset({"claude-desktop"})
+        assert f("/v1/messages?beta=true", _DESKTOP_UA, on)
+        assert not f("/v1/messages", _CLI_UA, on)
+        assert not f("/v1/messages", _DESKTOP_UA, frozenset())
+        assert not f("/api/oauth/usage", _DESKTOP_UA, on)
+        assert not f("/v1/code/sessions", _DESKTOP_UA, on)
+        assert not f("/v1/messages/batches", _DESKTOP_UA, on)
+        # The wall and grant arms match /v1/messages exactly, so a followed
+        # count_tokens refusal could never be converted: it is not followed.
+        assert not f("/v1/messages/count_tokens", _DESKTOP_UA, on)
+
+    def case_a_request_off_the_route_never_reads_the_switch_file(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        reads = []
+        monkeypatch.setattr(pp, "inference_follow_entrypoints",
+                            lambda c: reads.append(c) or frozenset())
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        for path in ("/v1/code/sessions", "/api/oauth/usage",
+                     "/v1/messages/count_tokens"):
+            assert pp._follow_token(certdir, path, _DESKTOP_UA, headers) is None
+        assert not reads, "a route that is not followed read the switch file"
+        pp._follow_token(certdir, "/v1/messages", _DESKTOP_UA, headers)
+        assert reads == [certdir]
+
+    def case_a_second_credential_is_left_as_the_client_sent_it(
+            self, certdir, monkeypatch):
+        """An `x-api-key` unlike the bearer is the client's own pair
+        (`_affinity_pick`'s rule): swapping the bearer alone would send two
+        credentials."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+
+        def f(*extra):
+            return pp._follow_token(
+                certdir, "/v1/messages", _DESKTOP_UA,
+                [("Authorization", "Bearer HOST-TOKEN"), *extra])
+
+        assert f(("x-api-key", "OTHER-KEY")) is None
+        assert f(("x-api-key", "HOST-TOKEN")) == "ACTIVE"  # moves with it
+        assert f() == "ACTIVE"
+
+    def case_a_snapshot_older_than_the_stale_bound_is_no_token(
+            self, certdir, monkeypatch):
+        """A reader that hangs leaves the last snapshot in place: it must not
+        keep billing the last account it read."""
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        headers = [("Authorization", "Bearer HOST-TOKEN")]
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) == "ACTIVE"
+        pp._follow_snap["at"] -= pp._FOLLOW_STALE_S + 1  # `tried` is recent
+        assert pp._follow_token(
+            certdir, "/v1/messages", _DESKTOP_UA, headers) is None
+        assert pp._follow_counts["passthrough"] == {"stale": 1}
+
+    def case_a_read_still_lands_after_three_abandoned_ones(
+            self, certdir, monkeypatch):
+        """The abandon limit holds back another abandonment only: once a read
+        has landed, the next one is due at the usual period though the three
+        hung ones have not returned (`_affinity_kick`'s rule)."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, seed=False)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for stuck in (1, 2, 3):
+            clock["t"] += pp._FOLLOW_STALE_S
+            pp._follow_kick()
+            assert snap["stuck"] == stuck and len(queued) == stuck + 1
+        clock["t"] += pp._FOLLOW_STALE_S
+        pp._follow_kick()
+        assert len(queued) == 4, "a fourth hung read was abandoned"
+        queued[3]()
+        assert snap["token"] == "ACTIVE" and not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        ctx.cell[0] = "NEXT"
+        pp._follow_kick()
+        assert len(queued) == 5, "no read was due after the three abandoned"
+        queued[4]()
+        assert snap["token"] == "NEXT"
+        for hung in queued[:3]:  # they return at last: each is dropped
+            hung()
+        assert snap["token"] == "NEXT" and snap["stuck"] == 0
+
+    def case_clears_over_hung_reads_start_no_more_than_the_limit(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, seed=False)
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "claude-desktop")
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        snap = pp._follow_snap
+        pp._follow_kick()
+        for _ in range(10):  # a storm of clears while the reads hang
+            clock["t"] += 1
+            pp._follow_clear(None)
+        assert snap["stuck"] == pp._FOLLOW_STUCK_MAX
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 1, len(queued)
+        for fn in queued:  # all return: none lands, none is left busy
+            fn()
+        assert snap["token"] is None and snap["stuck"] == 0
+        assert not snap["busy"]
+        clock["t"] += pp._FOLLOW_REFRESH_S
+        pp._follow_kick()
+        assert len(queued) == pp._FOLLOW_STUCK_MAX + 2
+
+    def case_switch_file_env_and_comments(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+        (certdir / "inference-follows").write_text(
+            "# on 2026-09-27\nclaude-desktop  # the Code tab\n\n")
+        pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == {"claude-desktop"}
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "")
+        assert pp.inference_follow_entrypoints(certdir) == frozenset()
+
+    def case_desktop_inference_gets_active_bearer(self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir, "/v1/messages?beta=true") == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            # The CLI already reads the active account; it is left alone.
+            assert self._ask(proxy, certdir, bearer="CLI-TOKEN",
+                             ua=_CLI_UA) == 200
+            assert upstream.seen_auth == "Bearer CLI-TOKEN"
+            # Ownership routes keep the PIN, whoever asks.
+            assert self._ask(proxy, certdir, "/v1/code/sessions") == 200
+            assert upstream.seen_auth == "Bearer PIN-TOKEN"
+            health = _health_of(proxy)
+            assert health["swapped"] == 1, health
+            assert health["entrypoints"] == ["claude-desktop"], health
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_off_by_default_changes_no_request(self, certdir, monkeypatch):
+        ctx = self._arm(monkeypatch, certdir, on=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            proxy._follow_refresh_tick()
+            assert not ctx.reads, "a switch that is off read the credential"
+            health = _health_of(proxy)
+            assert health["entrypoints"] == [] and health["swapped"] == 0
+            assert health["passthrough"] == {}, health
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_refused_swap_is_resent_on_host_bearer(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer ACTIVE", "Bearer HOST-TOKEN"]
+            assert _health_of(proxy)["taken_back"] == {"403": 1}
+            assert pp._follow_snap["gen"] == 1, (
+                "a refused token was kept for the next request")
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_expiring_or_same_token_passes_through(self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir, expires=(time.time() + 10) * 1000)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer HOST-TOKEN"
+            self._seed("ACTIVE")
+            assert self._ask(proxy, certdir, bearer="ACTIVE") == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            health = _health_of(proxy)
+            assert health["swapped"] == 0, health
+            assert health["passthrough"] == {"expiring": 1, "same-token": 1}
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_request_thread_never_reads_the_active_credential(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, seed=False)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            # no snapshot yet: both go out on the host's bearer, and one read
+            # is queued for a thread of its own
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer HOST-TOKEN"] * 2
+            assert not ctx.reads, "the request thread read the credential"
+            assert len(queued) == 1, "a second read started while one ran"
+            assert _health_of(proxy)["passthrough"] == {"no-token": 2}
+            queued[0]()
+            assert len(ctx.reads) == 1
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.seen_auth == "Bearer ACTIVE"
+            assert len(ctx.reads) == 1
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_tick_reads_it_with_no_request(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, seed=False)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            proxy._follow_refresh_tick()
+            assert len(queued) == 1
+            queued[0]()
+            assert pp._follow_snap["token"] == "ACTIVE"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_unreadable_active_credential_passes_through(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token=None, seed=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer HOST-TOKEN"] * 2
+            assert pp._follow_snap["failures"] == 1 and ctx.reads
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_warm_desktop_session_keeps_its_slot_after_a_switch(
+            self, certdir, monkeypatch):
+        """Desktop's own bearer never changes across a cswap switch, so the
+        follow swap runs first and affinity rules on the followed bearer: the
+        session bound on slot 1's token stays there when the active account
+        moves to slot 2, and a new session follows the move."""
+        from cswap_pin import proxy as pp
+
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        self._arm(monkeypatch, certdir, token="tok-A")
+
+        def ask(session):
+            return _A._send(certdir, [dict(
+                bearer="HOST-TOKEN", ua=_DESKTOP_UA,
+                extra_headers={"x-claude-code-session-id": session})])[1]
+
+        assert ask("S") == ["Bearer tok-A"]
+        self._seed("tok-B")  # cswap moved to slot 2
+        assert ask("S") == ["Bearer tok-A"], "the warm session was moved"
+        assert ask("S2") == ["Bearer tok-B"], "a new session did not follow"
+
+    def case_a_double_refusal_walks_the_kept_then_the_followed_then_the_host(
+            self, certdir, monkeypatch):
+        """A kept AND followed request refused on both: each take-back undoes
+        only its own swap (A, then B, then the host's bearer), and the pinned
+        refetch, which returns the PINNED token, is never reached."""
+        from cswap_pin import proxy as pp
+
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        self._arm(monkeypatch, certdir, token="tok-B")
+        refetched = []
+        monkeypatch.setattr(pp.PinProxy, "_refetch_swap_token",
+                            lambda self, refused: refetched.append(refused))
+        _A._seed("S", "tok-A")
+        statuses, auths = _A._send(
+            certdir,
+            [dict(bearer="HOST-TOKEN", ua=_DESKTOP_UA,
+                  extra_headers={"x-claude-code-session-id": "S"})],
+            reject_bearer={"tok-A", "tok-B"})
+        assert auths == ["Bearer tok-A", "Bearer tok-B", "Bearer HOST-TOKEN"]
+        assert statuses == [200]
+        assert not refetched, "a followed refusal reached the pinned refetch"
+
+    def case_a_followed_404_is_relayed(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_status=404)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 404
+            assert upstream.auths_seen == ["Bearer ACTIVE"], (
+                "a 404 is not an account refusal: it was resent")
+            assert pp._follow_counts["taken_back"] == {}
+            assert pp._follow_snap["gen"] == 0
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_followed_grant_403_becomes_a_401_and_clears_the_snapshot(
+            self, certdir, monkeypatch):
+        """The grant check runs BEFORE the follow take-back: a grant-shaped
+        403 on the active account is the 401 conversion's (no resend on the
+        host's bearer), and the snapshot is cleared. A 403 that is not
+        grant-shaped is still taken back."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir)
+        queued, switched = [], []
+
+        def switch(reset, retry_after, auth="", session="", kind="wall"):
+            switched.append((auth, kind))
+            ctx.cell[0] = "NEXT"
+            return True
+
+        monkeypatch.setattr(pp, "_switch_off_walled_account", switch)
+        monkeypatch.setattr(pp, "_switch_takes_refused", lambda: True)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_body=_GRANT_403)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 401
+            assert upstream.auths_seen == ["Bearer ACTIVE"]
+            assert switched == [("Bearer ACTIVE", "grant")], switched
+            assert pp._follow_snap["token"] is None
+            assert pp._follow_snap["gen"] == 1 and len(queued) == 1
+            queued.pop()()
+            assert pp._follow_snap["token"] == "NEXT"
+        finally:
+            proxy.stop()
+            upstream.stop()
+        ctx.cell[0] = "ACTIVE"
+        self._seed("ACTIVE")
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_body=_OTHER_403)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer ACTIVE", "Bearer HOST-TOKEN"]
+            assert len(switched) == 1, "a 403 that is no grant switched"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_followed_429_wall_clears_the_snapshot(
+            self, certdir, monkeypatch):
+        """The wall moves the active account. A snapshot left holding the
+        walled token would send the retry back onto it."""
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token="WALLED")
+
+        def switch(reset, retry_after, auth="", session="", kind="wall"):
+            ctx.cell[0] = "NEXT"
+            return True
+
+        monkeypatch.setattr(pp, "_switch_off_walled_account", switch)
+        upstream = _FakeUpstream(
+            certdir, reject_bearer="WALLED", reject_status=429,
+            reject_headers=b"anthropic-ratelimit-unified-reset: 1788925200\r\n")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 401
+            assert self._ask(proxy, certdir) == 200
+            assert upstream.auths_seen == ["Bearer WALLED", "Bearer NEXT"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_read_started_before_a_clear_does_not_land(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        ctx = self._arm(monkeypatch, certdir, token="OLD", seed=False)
+        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "claude-desktop")
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        pp._follow_kick()
+        pp._follow_clear(None)  # the account moved while that read ran
+        assert len(queued) == 2, "the clear did not start a fresh read"
+        queued[0]()
+        assert pp._follow_snap["token"] is None, "a pre-clear read landed"
+        ctx.cell[0] = "NEW"
+        queued[1]()
+        assert pp._follow_snap["token"] == "NEW"
+        pp._follow_snap["tried"] = -math.inf
+        pp._follow_kick()
+        pp._follow_clear(None)
+        ctx.cell[0] = "FRESH"
+        queued[-1]()
+        ctx.cell[0] = "STALE"
+        queued[-2]()
+        assert pp._follow_snap["token"] == "FRESH", (
+            "a read that began before the clear landed after the fresh one")
+
+    def case_health_reports_the_counters_and_writes_no_stats_file(
+            self, certdir, monkeypatch):
+        self._arm(monkeypatch, certdir)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE")
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            assert self._ask(proxy, certdir) == 200
+            assert self._ask(proxy, certdir, bearer="CLI-TOKEN",
+                             ua=_CLI_UA) == 200
+            health = _health_of(proxy)
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert health["entrypoints"] == ["claude-desktop"]
+        assert health["swapped"] == 1 and health["taken_back"] == {"403": 1}
+        assert health["since"] and health["snapshot"]["failures"] == 0
+        assert isinstance(health["snapshot"]["age_s"], float)
+        assert not list(certdir.glob("inference-follows.*")), (
+            "a counter was written to a file")
