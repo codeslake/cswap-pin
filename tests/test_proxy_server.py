@@ -27133,7 +27133,7 @@ class TestHappyEyeballsDial:
 
 # ---------------------------------------------------------------------------
 # Inference follows the active account for a host that brings its own login
-# (Claude Desktop's Code tab). Opt-in via `<certdir>/inference-follows`.
+# (Claude Desktop's Code tab). Opt-in via cswap's `pin.desktopFollows`.
 # ---------------------------------------------------------------------------
 
 _DESKTOP_UA = "claude-cli/2.1.281 (external, claude-desktop)"
@@ -27159,12 +27159,18 @@ def _health_of(proxy) -> dict:
 
 class TestInferenceFollows:
     """A host that brings its own login (Claude Desktop) bills the account it
-    is signed into. Listed in `inference-follows`, its `/v1/messages` goes out
+    is signed into. With `pin.desktopFollows` on, its `/v1/messages` goes out
     on cswap's active account instead, from a snapshot a thread of its own
     reads, and a refusal is taken back onto the host's own bearer."""
 
     def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
+        run_cases(
+            self,
+            request,
+            tmp_path_factory,
+            # settings.json sits beside `pin-proxy/`: one per case, never shared
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))},
+        )
 
     @staticmethod
     def _seed(token, expires=_FAR_MS):
@@ -27185,9 +27191,8 @@ class TestInferenceFollows:
         from cswap_pin import proxy as pp
 
         monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
-        (certdir / "inference-follows").unlink(missing_ok=True)
-        if on:
-            (certdir / "inference-follows").write_text("claude-desktop\n")
+        (certdir.parent / "settings.json").write_text(
+            json.dumps({"pin": {"desktopFollows": on}}))
         pp._INFERENCE_CACHE.clear()
         pp._follow_snap.update(token=None, expires=None, at=-math.inf,
                                tried=-math.inf, busy=False, stuck=0, gen=0,
@@ -27256,7 +27261,7 @@ class TestInferenceFollows:
         # count_tokens refusal could never be converted: it is not followed.
         assert not f("/v1/messages/count_tokens", _DESKTOP_UA, on)
 
-    def case_a_request_off_the_route_never_reads_the_switch_file(
+    def case_a_request_off_the_route_never_reads_the_switch(
             self, certdir, monkeypatch):
         from cswap_pin import proxy as pp
 
@@ -27268,7 +27273,7 @@ class TestInferenceFollows:
         for path in ("/v1/code/sessions", "/api/oauth/usage",
                      "/v1/messages/count_tokens"):
             assert pp._follow_token(certdir, path, _DESKTOP_UA, headers) is None
-        assert not reads, "a route that is not followed read the switch file"
+        assert not reads, "a route that is not followed read the switch"
         pp._follow_token(certdir, "/v1/messages", _DESKTOP_UA, headers)
         assert reads == [certdir]
 
@@ -27363,18 +27368,69 @@ class TestInferenceFollows:
         pp._follow_kick()
         assert len(queued) == pp._FOLLOW_STUCK_MAX + 2
 
-    def case_switch_file_env_and_comments(self, certdir, monkeypatch):
+    def case_the_setting_arms_it_and_the_env_var_wins(
+            self, certdir, monkeypatch):
+        from claude_swap import settings as cs_settings
         from cswap_pin import proxy as pp
 
-        monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+        settings = certdir.parent / "settings.json"
+
+        def f(text=None, env=None):
+            settings.unlink(missing_ok=True)
+            if text is not None:
+                settings.write_text(text)
+            if env is None:
+                monkeypatch.delenv("CSWAP_PIN_INFERENCE_FOLLOWS", raising=False)
+            else:
+                monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", env)
+            pp._INFERENCE_CACHE.clear()
+            return pp.inference_follow_entrypoints(certdir)
+
+        def on(value):
+            return json.dumps({"pin": {"desktopFollows": value}})
+
+        desktop, off = frozenset({"claude-desktop"}), frozenset()
+        assert f() == off                      # no settings file
+        assert f(on(True)) == desktop
+        assert f(on(False)) == off
+        assert f(on("true")) == off            # only a real true arms it
+        assert f(json.dumps({"pin": True})) == off
+        assert f("{not json") == off
+        # read through cswap's own reader (its settings.local.json overlay),
+        # never settings.json parsed here
+        with monkeypatch.context() as m:
+            m.setattr(cs_settings, "_read_raw",
+                      lambda path: {"pin": {"desktopFollows": True}})
+            assert f() == desktop
+        # the env var overrides the setting both ways, "" included
+        assert f(on(False), env="claude-desktop") == desktop
+        assert f(on(True), env="") == off
+        # a change reaches a daemon that is already serving, after the recheck
+        assert f(on(True)) == desktop
+        settings.write_text(on(False))
+        assert pp.inference_follow_entrypoints(certdir) == desktop  # cached
         pp._INFERENCE_CACHE.clear()
+        assert pp.inference_follow_entrypoints(certdir) == off
+
+    def case_a_host_without_cswap_reads_off(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+        from cswap_pin._host import HostMissing
+
+        self._arm(monkeypatch, certdir)
+
+        def missing(name):
+            raise HostMissing("no claude-swap")
+
+        monkeypatch.setattr(pp, "require", missing)
         assert pp.inference_follow_entrypoints(certdir) == frozenset()
-        (certdir / "inference-follows").write_text(
-            "# on 2026-09-27\nclaude-desktop  # the Code tab\n\n")
-        pp._INFERENCE_CACHE.clear()
-        assert pp.inference_follow_entrypoints(certdir) == {"claude-desktop"}
-        monkeypatch.setenv("CSWAP_PIN_INFERENCE_FOLLOWS", "")
+
+    def case_the_old_switch_file_is_retired(self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        self._arm(monkeypatch, certdir, on=False)
+        (certdir / "inference-follows").write_text("claude-desktop\n")
         assert pp.inference_follow_entrypoints(certdir) == frozenset()
+        assert not hasattr(pp, "_INFERENCE_SWITCH_FILE")
 
     def case_desktop_inference_gets_active_bearer(self, certdir, monkeypatch):
         self._arm(monkeypatch, certdir)
@@ -27694,5 +27750,5 @@ class TestInferenceFollows:
         assert health["swapped"] == 1 and health["taken_back"] == {"403": 1}
         assert health["since"] and health["snapshot"]["failures"] == 0
         assert isinstance(health["snapshot"]["age_s"], float)
-        assert not list(certdir.glob("inference-follows.*")), (
+        assert not list(certdir.glob("inference-follow*")), (
             "a counter was written to a file")

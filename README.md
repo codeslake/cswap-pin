@@ -1386,20 +1386,22 @@ and after a rotation it is the one client left on "Weekly limit reached".
 
 Its traffic still comes through this proxy, and its User-Agent names the
 entrypoint (`claude-cli/<ver> (external, claude-desktop)`). So, opt-in, the
-proxy can re-bill it: list the entrypoints in `inference-follows` in the pin's
-directory, one per line.
+proxy can re-bill it: turn on cswap's `pin.desktopFollows` setting (a bool,
+default `false`). Any of the three flips it:
 
 ```bash
-echo claude-desktop > ~/.claude-swap-backup/pin-proxy/inference-follows   # on
-rm ~/.claude-swap-backup/pin-proxy/inference-follows                      # off
+cswap config set pin.desktopFollows true      # or false
+cswap pin --desktop on                        # or off
+# or press `d` in the Auto view
 ```
 
-The file is re-read every 2 seconds, so it reaches a daemon that is already
-serving. `CSWAP_PIN_INFERENCE_FOLLOWS=claude-desktop` (comma-separated) wins
-over the file, like `CSWAP_PIN_DEBUG` over `trace-to`. It is off by default,
-and while it is off no request changes.
+The setting is re-read every 2 seconds, so it reaches a daemon that is already
+serving, with no restart. `CSWAP_PIN_INFERENCE_FOLLOWS=claude-desktop`
+(comma-separated) wins over the setting, like `CSWAP_PIN_DEBUG` over
+`trace-to`; an empty value forces it off. It is off by default, and while it
+is off no request changes.
 
-What it does, for a listed entrypoint only:
+What it does, for a followed entrypoint only:
 
 - `/v1/messages` gets the active account's bearer. Unlike the proposal this
   was adapted from (#60), `/v1/messages/count_tokens` does not: the wall and
@@ -1408,7 +1410,7 @@ What it does, for a listed entrypoint only:
   routes keep the pin, and `/api/oauth/*`, usage and profile calls keep the
   host's own login.
 - The active credential is read by a thread of its own, never by a request:
-  every 10 seconds while an entrypoint is listed, and at once after a switch
+  every 10 seconds while an entrypoint is followed, and at once after a switch
   the wall or the access-grant check converted into a 401. A request that
   finds no token yet, an unreadable one, one no read has landed in for a
   minute (a reader that hangs), or one within a minute of expiry goes out as
