@@ -4316,10 +4316,10 @@ def _follow_kick() -> None:
 
 def _follow_clear(certdir) -> None:
     """Forget the followed token and read the active one again at once. For
-    every caller whose switch may have moved the active account (the wall and
-    the grant arms of `_relay_response`) and for a refusal of the token: left
-    in place, the snapshot would send the client's retry back onto it. The read
-    in flight began before this and is dropped when it returns."""
+    every caller whose switch moved the active account (the wall and the grant
+    arms of `_relay_response`, when they convert) and for a refusal of the
+    token: left in place, the snapshot would send the client's retry back onto
+    it. The read in flight began before this and is dropped when it returns."""
     snap = _follow_snap
     with _follow_lock:
         snap["stuck"] += snap["busy"]  # abandoned: its verdict will not land
@@ -22615,12 +22615,9 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
-        # INFERENCE FOLLOWS THE ACTIVE ACCOUNT (opt-in, see `_follow_token`), for
-        # a host that brought its own login; never a pinned route. FIRST, before
-        # affinity: the host's own bearer never changes across a cswap switch, so
-        # only the followed one lets a warm session bind (and an affinity entry
-        # still wins below). `x-organization-uuid` names the HOST's org, which
-        # beside another account's bearer is a 403 waiting to happen.
+        # INFERENCE FOLLOWS THE ACTIVE ACCOUNT (opt-in, `_follow_token`), never on a
+        # pinned route, and BEFORE affinity: the host's bearer never changes across
+        # a cswap switch, so only the followed one lets a warm session bind.
         followed = False
         followed_headers = original_headers
         if not pinned:
@@ -22630,7 +22627,7 @@ class PinProxy:
                 followed = True
                 followed_headers = headers = [
                     (k, v) for k, v in _swap_credential(headers, follow_token)
-                    if k.lower() != "x-organization-uuid"]
+                    if k.lower() != "x-organization-uuid"]  # the HOST's org
         # SESSION AFFINITY (off unless armed, see `session_affinity_config`): a
         # warm session may keep the account it was on, so this request goes out
         # with that slot's stored token. `original_headers` is the client's own
@@ -26230,7 +26227,8 @@ def _relay_response(
                 b"grant:"
                 + hashlib.sha256(_token.encode()).hexdigest()[:16].encode(),
                 b"", auth, session, kind="grant")
-            _follow_clear(certdir)
+            if _walled_401:
+                _follow_clear(certdir)
     if (reject_on_auth_error or affinity or following) and not _walled_401 and any(
         status_line.startswith(b"HTTP/1.1 " + c)
         for c in ((b"401", b"403", b"429") if kept
@@ -26287,7 +26285,7 @@ def _relay_response(
             b"",
         )
         _walled_401 = _switch_off_walled_account(reset, retry_after, auth, session)
-        if reset:  # an account-level wall: the switch may have moved the account
+        if _walled_401:  # the switch moved the active account off the wall
             _follow_clear(certdir)
         _wall_relay = bool(reset) and not _walled_401
         try:
