@@ -4198,7 +4198,6 @@ def _cache_aware_report(certdir) -> dict:
 # names the entrypoint, so this proxy can re-bill it: `/v1/messages` only (the
 # wall and grant arms of `_relay_response` match that path exactly, so a
 # refusal on another route could never be converted), never a pinned route.
-_INFERENCE_SWITCH_FILE = "inference-follows"
 _INFERENCE_CACHE: dict = {}
 _UA_ENTRYPOINT = re.compile(r"^\s*claude-cli/\S+\s+\(([^)]*)\)")
 # THE ACTIVE CREDENTIAL IS READ ON A THREAD OF ITS OWN (`_follow_kick`), never
@@ -4229,10 +4228,10 @@ def inference_follow_entrypoints(certdir) -> "frozenset[str]":
     """Client entrypoints whose inference is re-billed to the active account.
 
     ``CSWAP_PIN_INFERENCE_FOLLOWS`` (comma-separated) wins; absent it,
-    ``<certdir>/inference-follows`` lists one entrypoint per line, re-read at
-    most every ``_TRACE_RECHECK_S`` so the switch reaches a daemon that is
-    already serving, exactly like ``trace-to``. Missing, empty or unreadable
-    is OFF: this must never be the thing that breaks a request.
+    cswap's ``pin.desktopFollows`` (a true bool) follows ``claude-desktop``,
+    re-read at most every ``_TRACE_RECHECK_S`` so the switch reaches a daemon
+    that is already serving, exactly like ``trace-to``. Absent, malformed or
+    unreadable is OFF: this must never be the thing that breaks a request.
     """
     env = os.environ.get("CSWAP_PIN_INFERENCE_FOLLOWS")
     if env is not None:
@@ -4245,11 +4244,13 @@ def inference_follow_entrypoints(certdir) -> "frozenset[str]":
     if now - seen < _TRACE_RECHECK_S:
         return value
     try:
-        text = (Path(certdir) / _INFERENCE_SWITCH_FILE).read_text()
-        value = frozenset(
-            line.split("#", 1)[0].strip() for line in text.splitlines()) - {""}
-    except OSError:
-        value = frozenset()
+        _settings = require("settings")
+        pin = _settings._read_raw(
+            _settings.settings_path(Path(certdir).parent)).get("pin")
+        on = isinstance(pin, dict) and pin.get("desktopFollows") is True
+    except Exception:  # noqa: BLE001, a switch must not cost a request
+        on = False
+    value = frozenset({"claude-desktop"}) if on else frozenset()
     _INFERENCE_CACHE[key] = (now, value)
     return value
 
@@ -4343,7 +4344,7 @@ def _follow_token(certdir, path: str, ua: str, headers) -> "str | None":
     request with no bearer to replace (or a second credential unlike it):
     left alone (the fail-open the rest of this module uses), and counted by
     reason for `/health`."""
-    # the path first: a route that is not followed never reads the switch file
+    # the path first: a route that is not followed never reads the switch
     if (path.split("?", 1)[0].rstrip("/") != "/v1/messages"
             or ua_entrypoint(ua) not in inference_follow_entrypoints(certdir)):
         return None
@@ -4385,7 +4386,7 @@ def _follow_taken_back(certdir, code: int) -> None:
     _follow_clear(certdir)
     if more is not None:
         _log_lifecycle(
-            f"inference-follows: the active account answered {code} to a "
+            f"desktop follows: the active account answered {code} to a "
             f"followed request, resent on the host's own bearer"
             + (f"; {more} more" if more else ""))
 
