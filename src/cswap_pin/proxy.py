@@ -13479,7 +13479,8 @@ class PortHolder:
         if gone:
             _log_lifecycle(
                 f"retired {gone} standby(s) left behind on port {self.port} by "
-                f"holders that were killed rather than released"
+                f"holders that exited without releasing them (stood down for "
+                f"running old code, or ended by a signal)"
             )
 
     def _reap_standby(self) -> None:
