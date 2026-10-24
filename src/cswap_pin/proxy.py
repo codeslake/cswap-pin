@@ -4248,7 +4248,7 @@ def inference_follow_entrypoints(certdir) -> "frozenset[str]":
         pin = _settings._read_raw(
             _settings.settings_path(Path(certdir).parent)).get("pin")
         on = isinstance(pin, dict) and pin.get("desktopFollows") is True
-    except Exception:  # noqa: BLE001 — a switch must not cost a request
+    except Exception:  # noqa: BLE001, a switch must not cost a request
         on = False
     value = frozenset({"claude-desktop"}) if on else frozenset()
     _INFERENCE_CACHE[key] = (now, value)
