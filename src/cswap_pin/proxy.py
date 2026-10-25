@@ -4239,7 +4239,7 @@ class _SseReply:
                 raw = bytes(self._buf[:end])
                 del self._buf[:end + 2]
                 self._event(raw)
-        except Exception:  # noqa: BLE001 — a reply this cannot read is no message
+        except Exception:  # noqa: BLE001 (a reply this cannot read is no message)
             self._broken = True
             self._buf.clear()
 
@@ -4324,7 +4324,7 @@ def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
         with _affinity_lock:
             entry = _affinity_last.get(session)
             rb = entry[10] if entry else None
-    except Exception:  # noqa: BLE001 — never let a statistic break a request
+    except Exception:  # noqa: BLE001 (never let a statistic break a request)
         return None
     return _ReplyTee(rb, body) if rb is not None and rb.body is body else None
 
