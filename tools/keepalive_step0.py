@@ -1,6 +1,6 @@
 """Step 0 of the keep-alive gate: does a ping keep a session's cache warm?
 
-    PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> [--forms full,held]
+    PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> [--forms full,rebuilt]
         [--claude <client binary>] [--chain-port 8118] [--prompt <text>] [--thinking-tokens N]
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --no-ping
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --self-check
@@ -11,8 +11,9 @@ shown that the API accepts it, reads the cache instead of writing it, or leaves
 the session's NEXT real request alone (no `thread_not_found` 404, no dropped
 thinking). The ping has no trigger from outside the process, so the pin runs
 in-process here and `_keepalive_ping(session, force_form=True)` is called
-directly. Per body form (`full`: the whole history; `held`: a
-`message-threads-` turn the server holds the history of) it drives one Claude
+directly. Per ping form (`full`: the whole history; `rebuilt`: a
+`message-threads-` session the pin rebuilds as a create, see
+tools/keepalive_rebuilt.py for its idle run) it drives one Claude
 Code client through a throwaway pin, pings, sends one more real turn, and says
 PASS when the ping read the prefix (cache_read >= 0.9 P, cache_creation <=
 0.1 P) and the next turn did too (cache_read >= 0.9 P), in the SAME form, with
@@ -90,7 +91,7 @@ REAL_HOME = os.path.expanduser("~")  # home-read
 TOKEN_MIN_MS = 20 * 60 * 1000
 TURN_TIMEOUT_S = 240
 PROMPT = "reply with the word ok"
-FORM_TETHER = {"full": "0", "held": "1"}
+FORM_TETHER = {"full": "0", "rebuilt": "1"}
 
 
 def newest_client():
@@ -293,11 +294,11 @@ class Client:
     """One `claude -p` stream-json process, in a process group of its own so
     ``close`` takes its children with it: turns on stdin keep its thread."""
 
-    def __init__(self, claude, env, cwd, token):
+    def __init__(self, claude, env, cwd, token, extra_args=()):
         self.token, self.err, self.out = token, [], queue.Queue()
         self.proc = subprocess.Popen(
             [claude, "-p", "--input-format", "stream-json",
-             "--output-format", "stream-json", "--verbose"],
+             "--output-format", "stream-json", "--verbose", *extra_args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env, cwd=cwd, text=True, start_new_session=True)
         threading.Thread(target=lambda: [self.out.put(l) for l in self.proc.stdout],
@@ -338,11 +339,25 @@ class Client:
 
 
 def captured_form(pp):
-    """(session, form) of the pin's only kept body, else (None, None)."""
+    """(session, ping form) of the pin's only kept body, else (None, None)."""
     with pp._affinity_lock:
         for session, e in pp._affinity_last.items():
-            return session, pp._keepalive_form(e[0])
+            return session, pp._ping_form(e)
     return None, None
+
+
+def await_settle(pp, session, wait_s=10):
+    """Wait for ``session``'s rebuild to be ready: the relay settles a reply
+    just after the client has it, and a rebuild still awaiting one is not
+    pinged."""
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        with pp._affinity_lock:
+            e = pp._affinity_last.get(session)
+            if e is not None and e[10] is not None and e[10].ready():
+                return True
+        time.sleep(0.1)
+    return False
 
 
 def measure(pp, proxy, seen, scratch, home, token, form, claude,
@@ -365,7 +380,7 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude,
     client = Client(claude, env, str(work), token)
     try:
         session, got = None, None
-        for _ in range(4):  # held: turn 1 is a full create, turn 2 held
+        for _ in range(4):  # rebuilt: turn 1 is a create, turn 2 a continue
             last = client.turn(prompt)
             session, got = captured_form(pp)
             if got == form or not last["ok"]:
@@ -375,6 +390,9 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude,
         if got != form:
             return rec | {"verdict": "NOT MEASURED",
                           "reason": f"form never captured (got {got})"}
+        if form == "rebuilt" and not await_settle(pp, session):
+            return rec | {"verdict": "NOT MEASURED",
+                          "reason": "the rebuild never settled its last reply"}
         scan1 = scan_transcripts(cfg)
         rec["ping"] = None if no_ping else probe_ping(proxy, session)
         ping_mark = len(seen)  # a 404 before this mark is not the ping's
@@ -497,7 +515,7 @@ def self_check(pp, proxy, certdir, token, seen, scratch):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scratch", required=True, type=pathlib.Path)
-    ap.add_argument("--forms", default="full,held")
+    ap.add_argument("--forms", default="full,rebuilt")
     ap.add_argument("--claude", help="client binary (default: newest under the claude versions dir)")
     ap.add_argument("--chain-port", type=int, default=8118, help="the egress chain's port")
     ap.add_argument("--no-ping", action="store_true", help="the control arm: send no ping")

@@ -36340,3 +36340,167 @@ def test_a_term_unwinds_pytest_once_so_every_finally_runs(monkeypatch):
             "operator's `kill` or a plain `timeout`, would be ignored too")
     finally:
         signal.signal(signal.SIGTERM, real)
+
+
+class TestTheRebuiltKeepAliveHelpers:
+    """T2927: the pure parts of the rebuilt create ping. A held session's
+    thread is gone by the time its cache needs a ping, so the pin rebuilds the
+    conversation (the last create, each relayed reply, each later continue)
+    and sends that as a create."""
+
+    @staticmethod
+    def _sse(*events):
+        return b"".join(
+            b"event: %s\ndata: %s\n\n" % (
+                e["type"].encode(), json.dumps(e).encode()) for e in events)
+
+    @classmethod
+    def _stream(cls, deltas=(), stop=True, tail=': "ls"}'):
+        """One message of a thinking block, a text block and a tool call,
+        streamed; ``deltas`` are appended inside the text block."""
+        block = lambda i, b: {"type": "content_block_start", "index": i,
+                              "content_block": b}
+        delta = lambda i, d: {"type": "content_block_delta", "index": i,
+                              "delta": d}
+        end = lambda i: {"type": "content_block_stop", "index": i}
+        evs = [
+            {"type": "message_start", "message": {"id": "msg_x", "content": []}},
+            block(0, {"type": "thinking", "thinking": ""}),
+            {"type": "ping"},
+            delta(0, {"type": "thinking_delta", "thinking": "hm"}),
+            delta(0, {"type": "thinking_delta", "thinking": "m"}),
+            delta(0, {"type": "signature_delta", "signature": "sig"}),
+            end(0),
+            block(1, {"type": "text", "text": ""}),
+            delta(1, {"type": "text_delta", "text": "hel"}),
+            delta(1, {"type": "text_delta", "text": "lo"}),
+            *[delta(1, d) for d in deltas],
+            end(1),
+            block(2, {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                      "input": {}, "caller": {"type": "direct"}}),
+            delta(2, {"type": "input_json_delta", "partial_json": ""}),
+            delta(2, {"type": "input_json_delta", "partial_json": '{"command"'}),
+            delta(2, {"type": "input_json_delta", "partial_json": tail}),
+            end(2),
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        ]
+        if stop:
+            evs.append({"type": "message_stop"})
+        return cls._sse(*evs)
+
+    CONTENT = [
+        {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+        {"type": "text", "text": "hello"},
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+         "input": {"command": "ls"}, "caller": {"type": "direct"}}]
+
+    def test_a_reply_is_rebuilt_from_its_deltas_whatever_the_chunking(self):
+        from cswap_pin import proxy as pp
+        raw = self._stream()
+        for size in (1, 7, 64, len(raw)):
+            reply = pp._SseReply(1 << 20)
+            for k in range(0, len(raw), size):
+                reply.feed(raw[k:k + size])
+            assert reply.message == ("msg_x", self.CONTENT), size
+        crlf = pp._SseReply(1 << 20)
+        crlf.feed(raw.replace(b"\n", b"\r\n"))
+        assert crlf.message == ("msg_x", self.CONTENT), "an SSE with CRLF"
+
+    def test_a_reply_that_is_not_whole_has_no_message(self):
+        from cswap_pin import proxy as pp
+
+        def message(raw, cap=1 << 20):
+            reply = pp._SseReply(cap)
+            reply.feed(raw)
+            return reply.message
+
+        whole = self._stream()
+        assert message(whole) is not None
+        assert message(self._stream(stop=False)) is None, "no message_stop"
+        assert message(whole[:len(whole) // 2]) is None, "cut mid-stream"
+        assert message(whole, cap=len(whole) - 1) is None, "over its cap"
+        assert message(self._stream(deltas=[
+            {"type": "citations_delta", "citation": {}}])) is None, (
+            "a delta the rebuild cannot apply would be a silent hole")
+        assert message(self._stream(tail=': "ls"')) is None, (
+            "a tool call whose input is not JSON")
+        assert message(whole + self._sse(
+            {"type": "error", "error": {"type": "overloaded_error"}})) is None
+        assert message(b"event: x\ndata: not json\n\n") is None
+        assert message(b'{"error": "a json body, not a stream"}') is None
+        assert message(b"") is None
+
+    def test_a_message_is_normalised_as_the_clients_create_replay_sends_it(self):
+        from cswap_pin import proxy as pp
+        cc = {"type": "ephemeral", "ttl": "1h"}
+        text = {"type": "text", "text": "hi"}
+        for given, want in (
+                ([text], "hi"),
+                ([{**text, "cache_control": cc}], "hi"),
+                ([text, text], [text, text]),
+                ([{**text, "citations": []}], [{**text, "citations": []}]),
+                ("already", "already"),
+                ([{"type": "tool_result", "tool_use_id": "t", "content": [
+                    {**text, "cache_control": cc}], "cache_control": cc}],
+                 [{"type": "tool_result", "tool_use_id": "t",
+                   "content": [text]}])):
+            assert pp._rebuild_message({"role": "user", "content": given}) == {
+                "role": "user", "content": want}, given
+
+    def test_a_message_loses_only_the_breakpoints_the_api_puts_on_blocks(self):
+        from cswap_pin import proxy as pp
+        cc = {"type": "ephemeral", "ttl": "1h"}
+        # a tool call's input and a tool result's payload are the model's and
+        # the tool's data: a key named `cache_control` in them is not one
+        data = {"cache_control": {"x": 1}, "list": [{"cache_control": 2}]}
+        use = {"type": "tool_use", "id": "t", "name": "Edit", "input": data}
+        res = {"type": "tool_result", "tool_use_id": "t",
+               "content": json.dumps(data)}
+        for msg in ({"role": "assistant", "content": [use, {**use, "id": "u"}]},
+                    {"role": "user", "content": [res, {"type": "text", "text": "a"}]}):
+            blocks = [{**b, "cache_control": cc} for b in msg["content"]]
+            got = pp._rebuild_message({**msg, "content": blocks})
+            assert got == msg, got
+        assert pp._rebuild_message({"role": "assistant", "content": [
+            {**use, "cache_control": cc}]}) == {
+            "role": "assistant", "content": [use]}
+
+    def test_the_form_is_the_bodys_thread_not_a_header(self):
+        from cswap_pin import proxy as pp
+        for req in ({"thread": {"type": "create"}},
+                    {"thread": {"type": "continue",
+                                "previous_message_id": "msg_1"}}):
+            assert pp._keepalive_form(req) == "held", req
+        for req in ({}, None, {"thread": None}, {"thread": "create"},
+                    {"thread": {}}, {"messages": []}):
+            assert pp._keepalive_form(req) == "full", req
+
+    def test_the_rebuilt_create_is_a_create_with_one_breakpoint_at_the_end(self):
+        from cswap_pin import proxy as pp
+        cc = {"type": "ephemeral", "ttl": "1h"}
+        static = json.dumps({"system": [{"type": "text", "text": "s",
+                                         "cache_control": cc}],
+                             "tools": [{"name": "t"}]}).encode()
+        msgs = b",".join(json.dumps(m).encode() for m in (
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"}))
+        top = {"model": "m", "metadata": {"user_id": "u"},
+               "diagnostics": {"previous_message_id": "msg_2"}}
+        got = pp._rebuilt_create(static, top, msgs)
+        assert got == {
+            **top, "system": [{"type": "text", "text": "s",
+                               "cache_control": cc}],
+            "tools": [{"name": "t"}], "thread": {"type": "create"},
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": [{
+                    "type": "text", "text": "three", "cache_control": cc}]}]}
+        blocks = json.dumps(pp._rebuilt_create(static, top, json.dumps({
+            "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "x"},
+                {"type": "text", "text": "last"}]}).encode()))
+        assert blocks.count('"cache_control"') == 2, "system's and the last's"
+        assert blocks.index('"last"') < blocks.rindex('"cache_control"'), (
+            "the breakpoint is on the last block of the last message")
