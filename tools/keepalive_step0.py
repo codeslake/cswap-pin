@@ -347,9 +347,9 @@ def captured_form(pp):
 
 
 def await_settle(pp, session, wait_s=10):
-    """Wait for ``session``'s rebuild to hold its last reply: the relay settles
-    a reply just after the client has it, and a rebuild still awaiting one is
-    not pinged."""
+    """Wait for ``session``'s rebuild to be ready: the relay settles a reply
+    just after the client has it, and a rebuild still awaiting one is not
+    pinged."""
     end = time.monotonic() + wait_s
     while time.monotonic() < end:
         with pp._affinity_lock:

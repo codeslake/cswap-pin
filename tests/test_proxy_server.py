@@ -26356,13 +26356,15 @@ class TestSessionAffinityOnMessages:
         return json.dumps({**body, **top})
 
     @staticmethod
-    def _sse(msg_id, blocks, stop=True, frame="chunked", status=b"200 OK"):
+    def _sse(msg_id, blocks, stop=True, frame="chunked", status=b"200 OK",
+             error=False):
         """A streamed reply as the API sends it: ``blocks`` are what the
         message ends up holding (thinking, text, tool_use), streamed as the
         deltas that build them with a ping between events. ``frame`` is how
         the body ends: `chunked` in slices that cut across events, `length`,
         or `close` (the connection ends it). ``stop`` False: no message_stop,
-        a reply cut short."""
+        a reply cut short; ``error`` an `error` event in its place, as the API
+        sends a mid-stream `overloaded_error`."""
         def ev(name, data):
             return b"event: %s\ndata: %s\n\n" % (
                 name.encode(), json.dumps({"type": name, **data}).encode())
@@ -26396,8 +26398,11 @@ class TestSessionAffinityOnMessages:
             out.append(ev("content_block_stop", {"index": i}))
         out.append(ev("message_delta", {"delta": {"stop_reason": "end_turn"},
                                         "usage": {"output_tokens": 9}}))
-        if stop:
+        if stop and not error:
             out.append(ev("message_stop", {}))
+        if error:
+            out.append(ev("error", {"error": {
+                "type": "overloaded_error", "message": "Overloaded"}}))
         body = b"".join(out)
         head = (b"HTTP/1.1 " + status
                 + b"\r\nContent-Type: text/event-stream\r\n")
@@ -26449,11 +26454,13 @@ class TestSessionAffinityOnMessages:
             "user-agent": "claude-cli/2.1.310 (external, cli)", **headers})
 
     @classmethod
-    def _turns(cls, certdir, bodies, replies, session="S", got=None, **headers):
+    def _turns(cls, certdir, bodies, replies, session="S", got=None,
+               between=None, **headers):
         """Each of ``bodies`` through a real MITM on `tok-A` as one held
         client session, answered by ``replies`` in order. Returns the
         statuses and the (stopped) upstream, whose heads and bodies it kept;
-        ``got`` (a list) gets each reply body the client read."""
+        ``got`` (a list) gets each reply body the client read, ``between``
+        (a callable) runs after each request but the last."""
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
         up = _FakeUpstream(certdir, replies=replies)
@@ -26461,10 +26468,13 @@ class TestSessionAffinityOnMessages:
                          upstream=("127.0.0.1", up.port))
         proxy.start()
         try:
-            statuses = [_request_through_proxy(
-                proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
-                body=b, body_out=got, **cls._held_call(session, **headers))
-                for b in bodies]
+            statuses = []
+            for n, b in enumerate(bodies):
+                if n and between:
+                    between()
+                statuses.append(_request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
+                    body=b, body_out=got, **cls._held_call(session, **headers)))
             # the relay settles the last reply just after the client has it
             end = time.monotonic() + 5
             while time.monotonic() < end and any(
@@ -26600,6 +26610,53 @@ class TestSessionAffinityOnMessages:
         assert json.loads(up.seen_body)["metadata"] == {"user_id": "u0"}, (
             "the fields of the request that was answered")
 
+    def case_a_stream_that_ends_in_an_error_event_is_a_failed_request(
+            self, monkeypatch, certdir):
+        """An `overloaded_error` event under HTTP 200 made no message either:
+        its retry names the same previous id, so the rebuild must have given
+        the request back, not settled it as a reply that was cut."""
+        from cswap_pin import proxy as pp
+        bodies, replies, messages = self._talk()
+        failed = self._sse("msg_2", [{"type": "text", "text": "Ov"}],
+                           error=True)
+        self._wire(monkeypatch, certdir)
+        statuses, _ = self._turns(
+            certdir, [bodies[0], bodies[1], bodies[1], bodies[2]],
+            [replies[0], failed, replies[1], replies[2]])
+        assert statuses == [200, 200, 200, 200], statuses
+        assert pp._rebuild_counts["dropped"] == {}, pp._rebuild_counts
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert json.loads(up.seen_body)["messages"] == messages
+
+    def case_a_failed_continue_does_not_restart_the_idle_clock(
+            self, monkeypatch, certdir):
+        """The API's cache was last refreshed by the last request that
+        succeeded, however long after it the continue failed: the ping is due,
+        and refused as past its ttl, by that clock and never by the failed
+        attempt's, or a ping goes out on a cold cache and writes it whole."""
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        usage = {"cache_read_input_tokens": 30000}
+        failures = {
+            "429": self._reply({}, status=b"429 Too Many Requests"),
+            "an error event": self._sse(
+                "msg_2", [{"type": "text", "text": "Ov"}], error=True)}
+        for idle, pinged in ((3400, 1), (3700, 0)):
+            for how, failure in failures.items():
+                self._wire(monkeypatch, certdir)
+                self._turns(certdir, bodies[:2], [replies[0], failure],
+                            between=lambda: self._age(idle))
+                with self._pair(certdir, reply=self._reply(usage)) as (
+                        proxy, up):
+                    proxy._keepalive_tick()
+                assert len(up.bodies_seen) == pinged, (idle, how)
+                assert pp._affinity_pings["refused"] == (
+                    {} if pinged else {"past its cache ttl": 1}), (
+                    idle, how, pp._affinity_pings)
+
     def case_a_cut_reply_leaves_the_rebuild_pingable_but_not_chainable(
             self, monkeypatch, certdir):
         """The cache holds what the last request sent whether or not its
@@ -26674,7 +26731,8 @@ class TestSessionAffinityOnMessages:
             rb = pp._affinity_last["S"][10]
             assert rb.reply and rb.reply[0] == "msg_1", rb.reply
             parts = pp._rebuild_parts(json.loads(bodies[1]))
-            assert pp._rebuild_stage(rb, parts, bodies[1], None) is rb, (
+            assert pp._rebuild_stage(
+                rb, parts, bodies[1], None, time.monotonic()) is rb, (
                 "the continue chains")
         finally:
             client.join(10)

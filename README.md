@@ -1170,13 +1170,17 @@ thread gone. The rebuild lives in memory beside the body, under the same
 bounds, and is dropped, counted by reason, when it cannot be the conversation
 the cache holds: a 404 (the thread is gone), a `continue` that does not name
 the last reply, a rebuild over the body cap, a tee that failed. A `continue`
-the API answered with a 429, a 5xx or a 400 made no message and moved no
-thread: it is taken back out of the rebuild and its retry carries on from the
-turn before. A reply cut short (Esc, a dropped stream) leaves the rebuild
-pingable, since the cache holds the request's messages, but no `continue`
-chains to it. A held body with no rebuild is refused (`a held thread with no
-rebuild`), as is a headless session's. To read the replies the pin asks the
-upstream for an uncompressed one to an armed held request. It never refreshes,
+the API answered with a 429, a 5xx or a 400, or whose stream ended in an
+`error` event, made no message, moved no thread and renewed no cache: the
+rebuild gives it back, with the session's idle clock from before it, and its
+retry carries on from the turn before. (A 429 on a request the pin sent on a
+kept slot is another outcome: that slot refused it, the retry goes out on the
+client's account where the cache is not, and the session's entry is dropped,
+counted `taken back`.) A reply cut short (Esc, a dropped stream) leaves the
+rebuild pingable, since the cache holds the request's messages, but no
+`continue` chains to it. A held body with no rebuild is refused (`a held
+thread with no rebuild`), as is a headless session's. To read the replies the
+pin asks the upstream for an uncompressed one to an armed held request. It never refreshes,
 consumes or probes a token: an expired stored token is refused. Any answer but
 a 2xx, a 429 or a 401 included, is counted and ends that session's pings until
 its next real request; it never reaches the wall, take-back, rest or switch

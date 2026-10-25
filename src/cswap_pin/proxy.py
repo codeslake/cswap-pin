@@ -4118,9 +4118,9 @@ class _Rebuild:
     far, comma-joined; ``reply``, `(id, message)` of the last reply relayed
     whole, which the next continue must name (None: no continue chains, the
     last reply was cut); ``body``, the request whose reply is awaited;
-    ``mark``, `(len(msgs), reply, top)` from before that request if it was a
-    continue, for a request that fails to give back; ``dead``, why it was
-    dropped. Under `_affinity_lock`."""
+    ``mark``, `(len(msgs), reply, top, idle clock)` from before that request
+    if it was a continue, for a request that fails to give back; ``dead``, why
+    it was dropped. Under `_affinity_lock`."""
     __slots__ = ("static", "top", "msgs", "reply", "body", "mark", "dead")
 
     def __init__(self, static: bytes, top: dict, msgs: bytes, body=None):
@@ -4185,15 +4185,15 @@ def _affinity_trim() -> None:
         _held_forget(oldest, "over the total cap")
 
 
-def _rebuild_stage(prior, parts, body, why):
+def _rebuild_stage(prior, parts, body, why, at):
     """Under `_affinity_lock`: take the held request ``body`` into its
     session's rebuild and return the one it leaves, awaiting its reply, or
     None. ``prior`` is the rebuild the session's last request left, ``parts``
     this body's `_rebuild_parts`, ``why`` the reason `_affinity_capture` keeps
-    no body for it. A create starts a rebuild. A continue extends ``prior``
-    with the reply it relayed and its own messages when it names that reply,
-    else ``prior`` is lost: the thread the continue speaks of is not the one
-    that was rebuilt."""
+    no body for it, ``at`` the idle clock of the entry it replaces. A create
+    starts a rebuild. A continue extends ``prior`` with the reply it relayed
+    and its own messages when it names that reply, else ``prior`` is lost: the
+    thread the continue speaks of is not the one that was rebuilt."""
     live = prior if prior is not None and prior.dead is None else None
     if why or parts is None:
         _rebuild_kill(live, why or "unreadable")
@@ -4211,7 +4211,7 @@ def _rebuild_stage(prior, parts, body, why):
         _rebuild_kill(live, "continue does not chain")
         return None
     else:
-        live.mark = (len(live.msgs), live.reply, live.top)
+        live.mark = (len(live.msgs), live.reply, live.top, at)
         live.msgs += b"," + live.reply[1] + b"," + b",".join(msgs)
         live.top, live.reply, live.body = top, None, body
     if live.size > _AFFINITY_BODY_MAX:
@@ -4221,15 +4221,17 @@ def _rebuild_stage(prior, parts, body, why):
     return live
 
 
-def _rebuild_settle(rb, body, code: int, message) -> None:
+def _rebuild_settle(rb, entry, body, code: int, message) -> None:
     """The exchange ``rb`` awaited ended. A 2xx reply relayed whole
     (``message``, from `_SseReply`) is kept for the next continue to name; a
     cut one is not, and no continue chains to it (the cache still holds the
-    request's messages, so a ping can go out). A 429, 5xx or 400 made no
-    message and moved no thread: a continue is taken back out of the rebuild,
-    and its retry names the same reply. A 404 (the thread is gone: the client
-    replays a create) and a failed create drop it. A request that superseded
-    ``body`` since owns ``rb`` now."""
+    request's messages, so a ping can go out). A 429, 5xx or 400 (and an
+    `error` event under 200, as `_ReplyTee` reports it) made no message and
+    moved no thread, and renewed no cache: a continue is given back by the
+    rebuild and ``entry`` (its session's kept body) gets back the idle clock it
+    had, and its retry names the same reply. A 404 (the thread is gone: the
+    client replays a create) and a failed create drop it. A request that
+    superseded ``body`` since owns ``rb`` now."""
     reply = None if message is None else _json_bytes(_rebuild_message(
         {"role": "assistant", "content": message[1]}))
     with _affinity_lock:
@@ -4244,7 +4246,7 @@ def _rebuild_settle(rb, body, code: int, message) -> None:
         elif mark is None or code == 404:
             _rebuild_kill(rb, "not 2xx")
         else:
-            n, rb.reply, rb.top = mark
+            n, rb.reply, rb.top, entry[4] = mark
             del rb.msgs[n:]
 
 
@@ -4267,16 +4269,16 @@ class _SseReply:
     the blocks `content_block_start` opens, with the text, thinking, signature
     and tool-input deltas applied. ``message`` is `(id, content)` once
     `message_stop` has arrived and nothing is missing, else None: a stream cut
-    short, an error event, a delta this does not apply, a stream over ``cap``
-    bytes. Such a reply is never carried: the prefix a ping read would have a
-    hole in it."""
+    short, an error event (``errored``), a delta this does not apply, a stream
+    over ``cap`` bytes. Such a reply is never carried: the prefix a ping read
+    would have a hole in it."""
     _DELTAS = {"text_delta": "text", "thinking_delta": "thinking",
                "signature_delta": "signature", "input_json_delta": "partial_json"}
 
     def __init__(self, cap: int):
         self._cap, self._seen, self._buf = cap, 0, bytearray()
         self._id, self._blocks, self._open, self._parts = None, {}, set(), {}
-        self._stopped = self._broken = False
+        self._stopped = self._broken = self.errored = False
 
     def feed(self, data: bytes) -> None:
         if self._broken:
@@ -4325,6 +4327,7 @@ class _SseReply:
         elif kind == "message_stop":
             self._stopped = True
         elif kind == "error":
+            self.errored = True
             raise ValueError("an error event")
 
     @property
@@ -4362,8 +4365,8 @@ class _ReplyTee:
     never reached a body (the request was taken back and resent) settles
     nothing."""
 
-    def __init__(self, rb, body):
-        self._rb, self._body = rb, body
+    def __init__(self, entry, body):
+        self._entry, self._rb, self._body = entry, entry[10], body
         self._code = self._reply = None
         self._off = False
 
@@ -4376,14 +4379,17 @@ class _ReplyTee:
     def feed(self, data: bytes) -> None:
         if self._reply is not None:
             self._reply.feed(data)
-            if self._reply.message is not None:
+            if self._reply.message is not None or self._reply.errored:
                 self.end()
 
     @_tee_guard
     def end(self) -> None:
         code, reply, self._code, self._reply = self._code, self._reply, None, None
         if code is not None:
-            _rebuild_settle(self._rb, self._body, code,
+            # an `error` event under 200 (an overloaded_error mid-stream) is
+            # a failed request, as the API's 529 is
+            _rebuild_settle(self._rb, self._entry, self._body,
+                            529 if reply and reply.errored else code,
                             reply.message if reply else None)
 
 
@@ -4402,7 +4408,7 @@ def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
             rb = entry[10] if entry else None
     except Exception:  # noqa: BLE001 (never let a statistic break a request)
         return None
-    return _ReplyTee(rb, body) if rb is not None and rb.body is body else None
+    return _ReplyTee(entry, body) if rb is not None and rb.body is body else None
 
 
 def _affinity_capture(certdir, headers, body: bytes, path: str,
@@ -4461,7 +4467,8 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
         old = _affinity_last.pop(session, None)
         why = why or (None if session in _affinity else "session not bound")
         if held:
-            rb = _rebuild_stage(old[10] if old else None, parts, body, why)
+            rb = _rebuild_stage(old[10] if old else None, parts, body, why,
+                                old[4] if old else None)
         else:  # a body that is not parsed, or not held, carries no rebuild on
             rb = None
             _rebuild_kill(old[10] if old else None, why or "body not held")
