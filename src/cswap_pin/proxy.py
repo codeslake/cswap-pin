@@ -3433,8 +3433,9 @@ _affinity_logged: dict[tuple, tuple] = {}
 # (the clock the API's cache keeps: set at capture, renewed by a 2xx ping),
 # keep-alive pings sent since it, the reason the sender last refused it (a
 # reason is counted once per request), its request path, the bearer the request
-# went out on]. Held only while armed, and only as long as the session's
-# `_affinity` entry (dropped with it).
+# went out on, its form (`_keepalive_form`), its `_Rebuild` (a held body's, else
+# None)]. Held only while armed, and only as long as the session's `_affinity`
+# entry (dropped with it).
 _affinity_last: dict[str, list] = {}
 _AFFINITY_BODY_MAX = 8 << 20  # one body; a longer one is not kept
 _AFFINITY_BODY_TOTAL = 128 << 20  # all of them; the oldest go first
@@ -3449,17 +3450,24 @@ _affinity_ping_cost = dict.fromkeys(_PING_COST_KEYS, 0)
 # main-thread requests since `_AFFINITY_SINCE` whose body `_affinity_capture`
 # kept, and those it did not (and so dropped the one before), by reason.
 _affinity_captures = {"kept": 0, "dropped": {}}
-# The body forms the sandbox measured safe to ping ("full": the whole history;
-# "held": a `message-threads-` request whose history the server holds). Step 0,
-# client 2.1.302, P ~= 30.3k: a ping of either form answered 200 with
-# cache_read = P and no cache_creation, and the next real turn went out in the
-# same form with no 404. Step 0 pinged with no idle. A held ping is bounded by
-# the server's thread state, not the 1 h cache (T2925: an open turn's thread is
-# gone by 306 s, a closed one lives to 55 min in about half of `cli` sessions
-# and 7% of `sdk-cli` ones), so a headless held body is not pinged. Not shown: a
-# `thinking_drop` (no thinking block was produced) and the TTL extension after a
-# real idle (`/health` pings `hit` says).
-_KEEPALIVE_FORMS: frozenset = frozenset({"full", "held"})
+# held requests since `_AFFINITY_SINCE` that a `_Rebuild` took in, and the
+# rebuilds lost, by reason
+_rebuild_counts = {"kept": 0, "dropped": {}}
+# the pings above split by the form that sent them (`_ping_form`): form ->
+# {"sent", "hit", "refused": {reason: n}, "cost": {usage field: tokens}}
+_form_pings: dict[str, dict] = {}
+# The ping forms the sandbox measured safe ("full": the session's last body, the
+# whole history; "rebuilt": a `message-threads-` session's whole history, which
+# the pin rebuilds as a `create`, see `_Rebuild`). Step 0, client 2.1.302, P ~=
+# 30.3k: a full ping answered 200 with cache_read = P and no cache_creation, and
+# the next real turn went out in the same form with no 404. Step 0 pinged with
+# no idle. A held ping that replays the last `continue` is never sent: the
+# server refuses it (T2927: 400 while its ~300 s thread lives, 404 after, 0 of
+# 33 answered 200), and a rebuilt create read 30864 of 30866 tokens at 56 min
+# idle with the thread gone. Not shown: a `thinking_drop` (no thinking block was
+# produced) and the TTL extension after a real idle (`/health` pings `hit`
+# says).
+_KEEPALIVE_FORMS: frozenset = frozenset({"full", "rebuilt"})
 _KEEPALIVE_MAX_TOKENS = 0
 _KEEPALIVE_TICK_S = 60.0
 _KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping
@@ -3467,6 +3475,7 @@ _KEEPALIVE_MIN_PREFIX = 20000
 _KEEPALIVE_NOT_YET = "not idle long enough"  # cswap's wording; normal, uncounted
 _KEEPALIVE_ELSEWHERE = "sent on another account"
 _KEEPALIVE_HEADLESS = "a headless session's held thread"
+_KEEPALIVE_NO_REBUILD = "a held thread with no rebuild"
 _AFFINITY_SINCE = time.time()
 
 
@@ -3984,16 +3993,17 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     return (token, held, session) if token else None
 
 
-def _final_cache_ttl_s(body: bytes) -> "float | None":
+def _final_cache_ttl_s(body: bytes, req=None) -> "float | None":
     """The TTL in seconds (3600 for `1h`, else 300) of the last `cache_control`
     in prompt order (tools, system, messages), or None: no breakpoint, or not
     JSON. A body that parses and lacks the text `"1h"` is not walked (its
     final breakpoint can only be the 5 min one); one that does not parse is
-    unreadable, whatever it spells."""
+    unreadable, whatever it spells. ``req`` is ``body`` parsed, when the
+    caller has already done it."""
     if b'"cache_control"' not in body:
         return None
     try:
-        req = json.loads(body)
+        req = req if isinstance(req, dict) else json.loads(body)
         system = req.get("system")
         if b'"1h"' not in body:
             return 300.0
@@ -4012,14 +4022,22 @@ def _final_cache_ttl_s(body: bytes) -> "float | None":
         return None
 
 
-def _keepalive_form(headers) -> str:
-    """`held` for a request of Claude Code's `message-threads-` mode (the
-    server holds the history; the body is the new turn), else `full`. A ping
-    replays the form of the session's last real body and never converts it: a
-    full send after held ones makes the API drop thinking blocks."""
-    return "held" if any(
-        k.lower() == "anthropic-beta" and "message-threads-" in v
-        for k, v in headers) else "full"
+def _keepalive_form(req) -> str:
+    """`held` for a body of Claude Code's `message-threads-` mode (a `thread`
+    with a `type`: the server holds the history and the body is the new turn),
+    else `full`. ``req`` is the body parsed, or None. The body says it, not the
+    beta header: after a second thinking drop the client keeps the header and
+    sends no `thread` for the rest of the conversation (`held_stateless`), and
+    those bodies are whole. A held body is never replayed (the server refuses a
+    `continue` it has served): its ping is `rebuilt`, see `_ping_form`."""
+    thread = req.get("thread") if isinstance(req, dict) else None
+    return "held" if isinstance(thread, dict) and thread.get("type") else "full"
+
+
+def _ping_form(entry) -> str:
+    """The form a ping of ``entry`` takes: `rebuilt` for a held body (the
+    history is the pin's rebuild of it), else `full`."""
+    return "rebuilt" if entry[9] == "held" else "full"
 
 
 def _keepalive_headless(headers) -> bool:
@@ -4031,6 +4049,284 @@ def _keepalive_headless(headers) -> bool:
         if m and "sdk-cli" in (w.strip() for w in m.group(1).split(",")):
             return True
     return False
+
+
+def _strip_cc(x):
+    """``x`` (a message, or a part of one) without any `cache_control`."""
+    if isinstance(x, dict):
+        return {k: _strip_cc(v) for k, v in x.items() if k != "cache_control"}
+    if isinstance(x, list):
+        return [_strip_cc(v) for v in x]
+    return x
+
+
+def _rebuild_message(m: dict) -> dict:
+    """``m`` as the client's own create replay sends it: no `cache_control`,
+    and a content of one bare text block as the string of its text (the only
+    difference measured between a rebuilt message and a replayed one)."""
+    m = _strip_cc(m)
+    c = m.get("content")
+    if (isinstance(c, list) and len(c) == 1 and isinstance(c[0], dict)
+            and set(c[0]) == {"type", "text"} and c[0]["type"] == "text"):
+        m["content"] = c[0]["text"]
+    return m
+
+
+def _json_bytes(x) -> bytes:
+    return json.dumps(x, separators=(",", ":")).encode()
+
+
+def _rebuild_parts(req) -> "tuple | None":
+    """(a create?, the id a continue names, the create's `system` and `tools`,
+    the other top-level fields, the messages) of the held body ``req``: bytes
+    where `_Rebuild` keeps bytes. None when the body is not one a rebuild can
+    take."""
+    try:
+        kind, messages = req["thread"]["type"], req["messages"]
+        if (kind not in ("create", "continue") or not messages
+                or not isinstance(messages, list)):
+            return None
+        return (kind == "create", req["thread"].get("previous_message_id"),
+                _json_bytes({k: req[k] for k in ("system", "tools")
+                             if k in req}) if kind == "create" else b"",
+                {k: v for k, v in req.items()
+                 if k not in ("messages", "thread", "system", "tools")},
+                [_json_bytes(_rebuild_message(m)) for m in messages])
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+class _Rebuild:
+    """A held session's whole conversation, as the `create` that carries it,
+    kept as JSON text (a long session is megabytes; as objects it is several
+    times that): ``static``, the create's `system` and `tools`; ``top``, the
+    other top-level fields of the latest request; ``msgs``, every message so
+    far, comma-joined; ``reply``, `(id, message)` of the last reply relayed
+    whole, which the next continue must name; ``body``, the request whose
+    reply is awaited; ``dead``, why it was dropped. Under `_affinity_lock`."""
+    __slots__ = ("static", "top", "msgs", "reply", "body", "dead")
+
+    def __init__(self, static: bytes, top: dict, msgs: bytes, body=None):
+        self.static, self.top, self.msgs = static, top, bytearray(msgs)
+        self.reply, self.body, self.dead = None, body, None
+
+    @property
+    def size(self) -> int:
+        return len(self.static) + len(self.msgs) + (
+            len(self.reply[1]) if self.reply else 0)
+
+    def ready(self) -> bool:
+        """The last request was answered whole: what a ping would carry is the
+        conversation the cache holds."""
+        return self.dead is None and self.body is None and self.reply is not None
+
+
+def _entry_bytes(entry) -> int:
+    """What ``entry`` of `_affinity_last` holds: its body and its rebuild."""
+    return len(entry[1]) + (entry[10].size if entry[10] else 0)
+
+
+def _rebuild_dropped(why: str) -> None:
+    """Under `_affinity_lock`: count a rebuild lost to ``why``."""
+    dropped = _rebuild_counts["dropped"]
+    dropped[why] = dropped.get(why, 0) + 1
+
+
+def _rebuild_kill(rb, why: str) -> None:
+    """Under `_affinity_lock`: drop ``rb`` (a `_Rebuild`, or None) under
+    ``why``, once, and free what it held."""
+    if rb is not None and rb.dead is None:
+        rb.dead, rb.static, rb.reply, rb.body = why, b"", None, None
+        rb.msgs = bytearray()
+        _rebuild_dropped(why)
+
+
+def _rebuild_stage(prior, parts, body, why):
+    """Under `_affinity_lock`: take the held request ``body`` into its
+    session's rebuild and return the one it leaves, awaiting its reply, or
+    None. ``prior`` is the rebuild the session's last request left, ``parts``
+    this body's `_rebuild_parts`, ``why`` the reason `_affinity_capture` keeps
+    no body for it. A create starts a rebuild. A continue extends ``prior``
+    with the reply it relayed and its own messages when it names that reply,
+    else ``prior`` is lost: the thread the continue speaks of is not the one
+    that was rebuilt."""
+    live = prior if prior is not None and prior.dead is None else None
+    if why or parts is None:
+        _rebuild_kill(live, why or "unreadable")
+        return None
+    create, prev, static, top, msgs = parts
+    if create:
+        # the API takes four breakpoints, and the ping puts one on the last block
+        if static.count(b'"cache_control"') > 3:
+            _rebuild_dropped("no room for a breakpoint")
+            return None
+        live = _Rebuild(static, top, b",".join(msgs), body)
+    elif live is None:
+        return None
+    elif live.reply is None or live.reply[0] != prev:
+        _rebuild_kill(live, "continue does not chain")
+        return None
+    else:
+        live.msgs += b"," + live.reply[1] + b"," + b",".join(msgs)
+        live.top, live.reply, live.body = top, None, body
+    _rebuild_counts["kept"] += 1
+    if live.size > _AFFINITY_BODY_MAX:
+        _rebuild_kill(live, "rebuild over the body cap")
+        return None
+    return live
+
+
+def _rebuild_settle(rb, body, code: int, message) -> None:
+    """The exchange ``rb`` awaited ended: a 2xx reply relayed whole
+    (``message``, from `_SseReply`) is kept for the next continue to name, and
+    anything else drops the rebuild. A request that superseded ``body`` since
+    owns ``rb`` now."""
+    reply = None if message is None else _json_bytes(_rebuild_message(
+        {"role": "assistant", "content": message[1]}))
+    with _affinity_lock:
+        if rb.body is not body or rb.dead is not None:
+            return
+        rb.body = None
+        if not 200 <= code < 300:
+            _rebuild_kill(rb, "not 2xx")
+        elif reply is None:
+            _rebuild_kill(rb, "reply not complete")
+        else:
+            rb.reply = (message[0], reply)
+            if rb.size > _AFFINITY_BODY_MAX:
+                _rebuild_kill(rb, "rebuild over the body cap")
+
+
+def _rebuilt_create(static: bytes, top: dict, msgs: bytes) -> dict:
+    """The `create` a rebuild is pinged as: the latest request's fields, the
+    create's `system` and `tools`, every message, and the one message
+    breakpoint on the last block of the last message (the client puts it
+    there on every request, and the system's are kept as they were)."""
+    messages = json.loads(b"[" + msgs + b"]")
+    last = messages[-1]
+    if isinstance(last["content"], str):
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    last["content"][-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    return {**top, **json.loads(static), "thread": {"type": "create"},
+            "messages": messages}
+
+
+class _SseReply:
+    """The assistant message an SSE reply streams, rebuilt as its bytes pass:
+    the blocks `content_block_start` opens, with the text, thinking, signature
+    and tool-input deltas applied. ``message`` is `(id, content)` once
+    `message_stop` has arrived and nothing is missing, else None: a stream cut
+    short, an error event, a delta this does not apply, a stream over ``cap``
+    bytes. Such a reply is never carried: the prefix a ping read would have a
+    hole in it."""
+    _DELTAS = {"text_delta": "text", "thinking_delta": "thinking",
+               "signature_delta": "signature", "input_json_delta": "partial_json"}
+
+    def __init__(self, cap: int):
+        self._cap, self._seen, self._buf = cap, 0, bytearray()
+        self._id, self._blocks, self._open, self._parts = None, {}, set(), {}
+        self._stopped = self._broken = False
+
+    def feed(self, data: bytes) -> None:
+        if self._broken:
+            return
+        self._seen += len(data)
+        self._buf += data.replace(b"\r", b"")
+        try:
+            if self._seen > self._cap:
+                raise ValueError("over its cap")
+            while (end := self._buf.find(b"\n\n")) >= 0:
+                raw = bytes(self._buf[:end])
+                del self._buf[:end + 2]
+                self._event(raw)
+        except Exception:  # noqa: BLE001 — a reply this cannot read is no message
+            self._broken = True
+            self._buf.clear()
+
+    def _event(self, raw: bytes) -> None:
+        data = b"".join(l[5:].strip() for l in raw.split(b"\n")
+                        if l.startswith(b"data:"))
+        if not data:
+            return
+        ev = json.loads(data)
+        kind = ev["type"]
+        if kind == "message_start":
+            if self._id is not None:
+                raise ValueError("two messages")
+            self._id = ev["message"]["id"]
+        elif kind == "content_block_start":
+            self._blocks[ev["index"]] = ev["content_block"]
+            self._open.add(ev["index"])
+            self._parts[ev["index"]] = {}
+        elif kind == "content_block_delta":
+            field = self._DELTAS[ev["delta"]["type"]]
+            self._parts[ev["index"]].setdefault(field, []).append(
+                ev["delta"][field])
+        elif kind == "content_block_stop":
+            block = self._blocks[ev["index"]]
+            for field, pieces in self._parts.pop(ev["index"]).items():
+                text = "".join(pieces)
+                if field != "partial_json":
+                    block[field] = block.get(field, "") + text
+                elif text:
+                    block["input"] = json.loads(text)
+            self._open.discard(ev["index"])
+        elif kind == "message_stop":
+            self._stopped = True
+        elif kind == "error":
+            raise ValueError("an error event")
+
+    @property
+    def message(self) -> "tuple | None":
+        if (self._broken or not self._stopped or self._open
+                or self._id is None):
+            return None
+        return self._id, [self._blocks[i] for i in sorted(self._blocks)]
+
+
+class _ReplyTee:
+    """What `_relay_response` hands the status and every body byte of the
+    reply to an armed held request, to rebuild the assistant message the
+    session's next continue builds on (`_SseReply`). ``end`` settles the
+    session's `_Rebuild` with what came of it; a relay that never reached a
+    body (the request was taken back and resent) settles nothing."""
+
+    def __init__(self, rb, body):
+        self._rb, self._body = rb, body
+        self._code = self._reply = None
+
+    def start(self, code: int) -> None:
+        self._code = code
+        self._reply = _SseReply(_AFFINITY_BODY_MAX) if 200 <= code < 300 else None
+
+    def feed(self, data: bytes) -> None:
+        if self._reply is not None:
+            self._reply.feed(data)
+
+    def end(self) -> None:
+        code, self._code = self._code, None
+        if code is not None:
+            with contextlib.suppress(Exception):  # never into the relay's exit
+                _rebuild_settle(self._rb, self._body, code,
+                                self._reply.message if self._reply else None)
+
+
+def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
+    """The tee for the request ``body``, when `_affinity_capture` took it into
+    its session's rebuild (so: a main-thread held request of an armed session,
+    and still the session's newest), else None. Takes no lock off the
+    `/v1/messages` path, or while nothing is held."""
+    if not _affinity_last or path.split("?", 1)[0].rstrip("/") != "/v1/messages":
+        return None
+    session = next((v for k, v in headers
+                    if k.lower() == "x-claude-code-session-id"), "")
+    try:
+        with _affinity_lock:
+            entry = _affinity_last.get(session)
+            rb = entry[10] if entry else None
+    except Exception:  # noqa: BLE001 — never let a statistic break a request
+        return None
+    return _ReplyTee(rb, body) if rb is not None and rb.body is body else None
 
 
 def _affinity_capture(certdir, headers, body: bytes, path: str,
@@ -4048,8 +4344,13 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     `_affinity_pick`'s answer: the bearer the request goes out on is its token,
     else the client's.
 
-    The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes the oldest go,
-    and a body whose session lost its `_affinity` entry goes with it."""
+    A held body (one with a `thread`) is also taken into the session's
+    `_Rebuild` (`_rebuild_stage`), which its reply then completes
+    (`_reply_tee`): that, not the body, is what a ping of it sends.
+
+    The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes (bodies and
+    rebuilds) the oldest go, and a body whose session lost its `_affinity`
+    entry goes with it."""
     if session_affinity_config(certdir) is None or not body:
         return False
     session = client = ""
@@ -4064,19 +4365,27 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     if not session:
         return False
     sent = [(k, v) for k, v in headers if k.lower() != "authorization"]
-    held = _keepalive_form(sent) == "held"
+    # a body over the cap is not parsed on the request thread: it is not kept
+    over = len(body) > _AFFINITY_BODY_MAX
+    req = None
+    if not over and b'"thread"' in body:
+        with contextlib.suppress(ValueError):
+            req = json.loads(body)
+    form = _keepalive_form(req)
+    held = form == "held"
     has_cc = b'"cache_control"' in body
     if not (has_cc or held):
         return False
-    # a body over the cap is not parsed on the request thread: it is not kept
-    over = len(body) > _AFFINITY_BODY_MAX
-    ttl_s = None if over else _final_cache_ttl_s(body)
+    ttl_s = None if over else _final_cache_ttl_s(body, req)
     why = (None if ttl_s == 3600.0 else "5 min tier" if ttl_s else
            "over the body cap" if over else
            "unreadable" if has_cc else "no breakpoint")
+    parts = _rebuild_parts(req) if held and not why else None
     with _affinity_lock:
-        _affinity_last.pop(session, None)
+        old = _affinity_last.pop(session, None)
         why = why or (None if session in _affinity else "session not bound")
+        rb = _rebuild_stage(old[10] if old else None, parts, body, why
+                            ) if held else None
         if why:
             dropped = _affinity_captures["dropped"]
             dropped[why] = dropped.get(why, 0) + 1
@@ -4086,12 +4395,13 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
             sent, body, ttl_s,
             # a held body is the new turn only: its bytes say nothing
             0 if held else len(body) // 4,
-            time.monotonic(), 0, None, path, inject[0] if inject else client]
+            time.monotonic(), 0, None, path, inject[0] if inject else client,
+            form, rb]
         for gone in [x for x in _affinity_last if x not in _affinity]:
             del _affinity_last[gone]
-        total = sum(len(v[1]) for v in _affinity_last.values())
+        total = sum(_entry_bytes(v) for v in _affinity_last.values())
         while total > _AFFINITY_BODY_TOTAL:
-            total -= len(_affinity_last.pop(next(iter(_affinity_last)))[1])
+            total -= _entry_bytes(_affinity_last.pop(next(iter(_affinity_last))))
         return session in _affinity_last
 
 
@@ -4120,6 +4430,12 @@ def _ping_error_note(raw: bytes, rheaders, ratelimit: dict) -> str:
         *(f" {k}={v}" for k, v in ratelimit.items())))
 
 
+def _form_stat(form: str) -> dict:
+    """Under `_affinity_lock`: ``form``'s ping counts (`_form_pings`)."""
+    return _form_pings.setdefault(form, {
+        "sent": 0, "hit": 0, "refused": {}, "cost": dict.fromkeys(_PING_COST_KEYS, 0)})
+
+
 def _keepalive_refuse(session: str, why: str, entry,
                       drop: bool = False) -> str:
     """Count the sender declining ``entry``, ``session``'s body, for ``why``:
@@ -4132,8 +4448,9 @@ def _keepalive_refuse(session: str, why: str, entry,
         if mine and drop:
             del _affinity_last[session]
         if not mine or entry[6] != why:
-            refused = _affinity_pings["refused"]
-            refused[why] = refused.get(why, 0) + 1
+            for refused in (_affinity_pings["refused"],
+                            _form_stat(_ping_form(entry))["refused"]):
+                refused[why] = refused.get(why, 0) + 1
             if mine:
                 entry[6] = why
     return why
@@ -4167,8 +4484,11 @@ def _cache_aware_report(certdir) -> dict:
     the SUM of their kept bodies' estimates in tokens (what rides on the slot),
     and `ttl_left_min_s` the least TTL left among them (on the kept body's own
     clock where there is one, the clock the sender acts on, else the binding's).
-    `captures`: main-thread bodies kept, and dropped by reason. Never a session
-    id or a byte of a conversation. Empty `slots` when not armed."""
+    `captures`: main-thread bodies kept, and dropped by reason. `pings` also
+    splits its counts by `forms` (sent, hit, refused by reason, cost), and
+    `rebuilds` counts the held requests a `_Rebuild` took in and the rebuilds
+    lost, by reason. Never a session id or a byte of a conversation. Empty
+    `slots` when not armed."""
     cfg = session_affinity_config(certdir)
     now = time.monotonic()
     slots: dict = {}
@@ -4192,12 +4512,18 @@ def _cache_aware_report(certdir) -> dict:
         except Exception:  # noqa: BLE001 — a liveness probe answers anyway
             slots = {}
         pings = {**_affinity_pings, "refused": dict(_affinity_pings["refused"]),
-                 "cost": dict(_affinity_ping_cost)}
+                 "cost": dict(_affinity_ping_cost),
+                 "forms": {f: {**v, "refused": dict(v["refused"]),
+                               "cost": dict(v["cost"])}
+                           for f, v in _form_pings.items()}}
         captures = {**_affinity_captures,
                     "dropped": dict(_affinity_captures["dropped"])}
+        rebuilds = {**_rebuild_counts,
+                    "dropped": dict(_rebuild_counts["dropped"])}
     at = _affinity_snap["at"]
     return {"armed": cfg is not None, "slots": slots, "pings": pings,
-            "captures": captures, "since": _iso_utc(_AFFINITY_SINCE),
+            "captures": captures, "rebuilds": rebuilds,
+            "since": _iso_utc(_AFFINITY_SINCE),
             "snapshot": {
                 "age_s": None if at == -math.inf else round(now - at, 1),
                 "last_rebuild_ms": _affinity_snap["ms"],
@@ -23020,6 +23346,7 @@ class PinProxy:
             _release_bridge_hold()
             raise
 
+        tee = None
         try:
             # A WebSocket handshake must keep Connection/Upgrade even though
             # they are hop-by-hop: strip them and the server sees a plain GET
@@ -23044,6 +23371,7 @@ class PinProxy:
                 and (_TRACE is not None
                      or trace_target(getattr(self, "_certdir", None)))
                 else "")
+            tee = _reply_tee(headers, body, path)
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
             # _read_body decoded a chunked body, and the transfer-coding
@@ -23066,6 +23394,8 @@ class PinProxy:
                 if kl == "host":
                     v = UPSTREAM_HOST
                     sent_host = True
+                if kl == "accept-encoding" and tee is not None:
+                    v = "identity"  # the tee reads plain SSE: gzip or br would need a decoder (br, a dependency) for a reply of a few KB
                 out.append(f"{k}: {v}".encode("latin1"))
             if dechunked:
                 out.append(f"Content-Length: {len(body or b'')}".encode("latin1"))
@@ -23224,6 +23554,7 @@ class PinProxy:
                 # method says so.
                 method=method,
                 on_hop_trouble=hop_failed.set,
+                tee=tee,
             )
             # A 5xx RETIRES THE UPSTREAM IT CAME OVER, once its body is out: a
             # hop that failed inside the tunnel keeps failing on that socket
@@ -23247,6 +23578,8 @@ class PinProxy:
             # cause, a later request for this cse must not wait for an
             # exchange that is never going to settle on its own.
             _release_bridge_hold()
+            if tee is not None:
+                tee.end()  # the reply it relayed, or what was cut of it
 
     def _keepalive_ensure(self) -> None:
         """Start the keep-alive sender when a body was just kept (so: armed)
@@ -23297,11 +23630,13 @@ class PinProxy:
                 if bound is not None:
                     rows.append((
                         session, e, now - e[4], e[2], e[3], e[5],
-                        _keepalive_form(e[0]) in _KEEPALIVE_FORMS,
+                        _ping_form(e) in _KEEPALIVE_FORMS,
                         _affinity_slot_kept(_affinity_idents.get(bound[0]), now),
-                        _sent_on_binding(e, bound)))
+                        _sent_on_binding(e, bound),
+                        e[10] is not None and e[10].ready()))
         due, stale = [], False
-        for session, e, idle_s, ttl_s, prefix, pings, measured, kept, on in rows:
+        for (session, e, idle_s, ttl_s, prefix, pings, measured, kept, on,
+             rebuilt) in rows:
             ok, why = _keepalive_due(
                 idle_s=idle_s, pings_since_request=pings, ttl_s=ttl_s,
                 # unknown (a held body's): ping 1 measures it, ping 2 needs it
@@ -23313,13 +23648,15 @@ class PinProxy:
                 ok, why = False, "past its cache ttl"
             elif ok and not measured:
                 ok, why = False, "form not measured"
-            elif (ok and _keepalive_form(e[0]) == "held"
+            elif (ok and e[9] == "held"
                   and _keepalive_headless(e[0])):  # an exited `claude -p`
                 ok, why = False, _KEEPALIVE_HEADLESS
+            elif ok and e[9] == "held" and not rebuilt:
+                ok, why = False, _KEEPALIVE_NO_REBUILD
             if not ok:
                 if why != _KEEPALIVE_NOT_YET:
-                    _keepalive_refuse(session, why, e,
-                                      not on or why == _KEEPALIVE_HEADLESS)
+                    _keepalive_refuse(session, why, e, not on or why in (
+                        _KEEPALIVE_HEADLESS, _KEEPALIVE_NO_REBUILD))
             elif fresh:
                 due.append((session, e))
             else:
@@ -23341,8 +23678,10 @@ class PinProxy:
         tick ruled on: when a real request has replaced it since, nothing is
         sent, and that request's body is neither renewed nor dropped.
 
-        The session's last real body with `max_tokens` and `stream` set, on
-        its stored headers and the SNAPSHOT'S stored token for its slot, on a
+        The session's last real body with `max_tokens` and `stream` set (a held
+        session's: the `create` its `_Rebuild` makes of its whole conversation,
+        never a replayed `continue`, which the server always refuses), on its
+        stored headers and the SNAPSHOT'S stored token for its slot, on a
         socket of its own from `_connect_upstream`: not `_relay_response`,
         whose 429 and 403 paths switch the account off, and not urllib, whose
         proxy is this pin. NO refresh, no consume, no probe. A refusal of any
@@ -23358,19 +23697,24 @@ class PinProxy:
             stored = _affinity_kept.get(ident)
             kept = _affinity_slot_kept(ident, time.monotonic())
             other = bool(entry and bound and not _sent_on_binding(entry, bound))
+            rb = entry[10] if entry else None
+            rebuilt = ((bytes(rb.static), dict(rb.top), bytes(rb.msgs))
+                       if rb is not None and rb.ready() else None)
         if entry is None:
             return {**out, "refused": "no body held"}
-        headers, body, form = entry[0], entry[1], _keepalive_form(entry[0])
+        headers, body, form = entry[0], entry[1], _ping_form(entry)
         out["form"] = form
         why = (_KEEPALIVE_ELSEWHERE if other else
                "form not measured"
                if form not in _KEEPALIVE_FORMS and not force_form else
                "token expired" if stored
                and oauth.is_oauth_token_expired(stored[1]) else
-               "its slot is not kept" if not kept else None)
+               "its slot is not kept" if not kept else
+               _KEEPALIVE_NO_REBUILD if form == "rebuilt" and rebuilt is None
+               else None)
         if why:
-            return {**out,
-                    "refused": _keepalive_refuse(session, why, entry, other)}
+            return {**out, "refused": _keepalive_refuse(
+                session, why, entry, other or why == _KEEPALIVE_NO_REBUILD)}
 
         def ended(why: str, note: str = "") -> dict:
             _log_lifecycle(
@@ -23381,7 +23725,7 @@ class PinProxy:
                     "refused": _keepalive_refuse(session, why, entry, True)}
 
         try:
-            req = json.loads(body)
+            req = _rebuilt_create(*rebuilt) if form == "rebuilt" else json.loads(body)
             req.update(max_tokens=_KEEPALIVE_MAX_TOKENS, stream=False)
             status, rheaders, raw = self._keepalive_exchange(
                 entry[7], stored[0], headers,
@@ -23407,15 +23751,18 @@ class PinProxy:
         out["hit"] = hit = read > 0 and made <= read // 10
         now = time.monotonic()
         with _affinity_lock:
-            _affinity_pings["sent"] += 1
-            _affinity_pings["hit"] += hit
+            stat = _form_stat(form)
+            for tally in (_affinity_pings, stat):
+                tally["sent"] += 1
+                tally["hit"] += hit
             for k, u in _PING_COST_KEYS.items():
-                _affinity_ping_cost[k] += (
-                    usage[u] if isinstance(usage.get(u), int) else 0)
+                n = usage[u] if isinstance(usage.get(u), int) else 0
+                _affinity_ping_cost[k] += n
+                stat["cost"][k] += n
             if _affinity_last.get(session) is entry:
                 entry[4] = now  # the API's cache is renewed: so is the body's
                 entry[5] += 1
-                if form == "held" and read:
+                if form == "rebuilt" and read:
                     entry[3] = read  # the measure a held body lacks
             if session in _affinity:  # and the binding's clock and place
                 _bounded_put(_affinity, session, (_affinity[session][0], now))
@@ -26142,9 +26489,15 @@ def _relay_response(
     affinity: "tuple[str, str] | None" = None,
     drop_request_id: bool = False,
     follow: bool = False,
+    tee: "_ReplyTee | None" = None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``tee`` is handed the status and every body byte relayed (decoded, if the
+    body is chunked), for `_SseReply`: it learns nothing of a response that was
+    taken back above, and what it is handed does not change what the client
+    gets.
 
     ``drop_request_id`` strips the upstream's ``request-id`` header: CC 2.1.304
     stamps a profile answer by it and copies the PINNED account's plan into the
@@ -26549,7 +26902,7 @@ def _relay_response(
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
                 on_hop_trouble=on_hop_trouble, affinity=affinity,
-                drop_request_id=drop_request_id, follow=follow,
+                drop_request_id=drop_request_id, follow=follow, tee=tee,
             )
         return _relay_response(
             up, client, cid,
@@ -26557,7 +26910,7 @@ def _relay_response(
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             on_hop_trouble=on_hop_trouble, affinity=affinity,
-            drop_request_id=drop_request_id, follow=follow,
+            drop_request_id=drop_request_id, follow=follow, tee=tee,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
@@ -26568,6 +26921,11 @@ def _relay_response(
         _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
         return keep
     _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
+    if tee is not None:
+        code = _upstream_status_line[9:12]
+        tee.start(int(code) if code.isdigit() else 0)
+        if not chunked:  # a chunked body is `_pipe_chunked`'s, decoded
+            tee.feed(rest)
 
     # THE BODY RELAY, WATCHED TOO. Each loop below blocks in `up.recv` with no
     # timeout, and a dead client is otherwise noticed only by the next
@@ -26576,7 +26934,7 @@ def _relay_response(
     # as EOF: False, and the caller closes both legs and pays the debt.
     with _CLIENT_WATCH.over(client, up):
         if chunked:
-            return _pipe_chunked(up, client, bytearray(rest)) and keep
+            return _pipe_chunked(up, client, bytearray(rest), tee) and keep
         if length is not None:
             remaining = length - len(rest)
             while remaining > 0:
@@ -26587,6 +26945,8 @@ def _relay_response(
                 if not chunk:
                     return False
                 client.sendall(chunk)
+                if tee is not None:
+                    tee.feed(chunk)
                 remaining -= len(chunk)
             return keep
         # No framing: body runs to EOF (SSE and close-delimited replies).
@@ -26598,14 +26958,18 @@ def _relay_response(
             if not chunk:
                 break
             client.sendall(chunk)
+            if tee is not None:
+                tee.feed(chunk)
         return False
 
 
-def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> bool:
+def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray,
+                  tee: "_ReplyTee | None" = None) -> bool:
     """Forward a chunked body verbatim until the terminating 0-length chunk.
 
     Parses only enough to find the end of the body (so the next response on
     this connection starts at the right offset); every byte is relayed as-is.
+    ``tee`` is handed each chunk's data once it is whole.
     """
     while True:
         while b"\r\n" not in buf:
@@ -26633,6 +26997,8 @@ def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> b
                 return False
             client.sendall(chunk)
             buf += chunk
+        if tee is not None and size:
+            tee.feed(bytes(buf[:size]))
         buf = bytearray(buf[need:])
         if size == 0:
             return True

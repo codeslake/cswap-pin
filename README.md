@@ -1156,9 +1156,23 @@ process hands its listener to a successor. It sends that body once more with `ma
 before it expires: at most two per real request, and none for a prefix under
 20,000 tokens (a held body's is unknown, so its first ping goes out and the
 reply measures it; cswap's `autoswitch.keepalive_due` has the rule; the pin has
-a copy for a cswap without it). A ping replays exactly the form of the session's last real body (a
-full history, or a `message-threads-` request whose history the server holds)
-and never converts one into the other. It never refreshes, consumes or probes
+a copy for a cswap without it). A body is `held` when it carries a `thread`
+(a `message-threads-` request whose history the server holds) and `full`
+otherwise, whatever the beta header says. A full body is replayed as it was. A
+held body is never replayed: the server refuses a `continue` it has already
+served (400 while its ~300 s thread lives, 404 after), so the pin rebuilds the
+conversation as it relays it (the last `create`, then each reply, rebuilt from
+the SSE it relayed with its thinking signatures and tool input, and each later
+`continue`'s messages) and pings that as a `create`, the form `rebuilt`: the one
+message breakpoint (`1h`) on its last block, the create's `system` and `tools`
+as they were. It reads 30864 of 30866 tokens at 56 minutes idle with the
+thread gone. The rebuild lives in memory beside the body, under the same
+bounds, and is dropped, counted by reason, when it cannot be the conversation
+the cache holds: a request that is not a 2xx, a `continue` that does not name
+the last reply, a reply cut short, a rebuild over the body cap. A held body
+with no rebuild is refused (`a held thread with no rebuild`), as is a headless
+session's. To read the replies the pin asks the upstream for an uncompressed
+one to an armed held request. It never refreshes, consumes or probes
 a token: an expired stored token is refused. Any answer but a 2xx, a 429 or a
 401 included, is counted and ends that session's pings until its next real
 request; it never reaches the wall, take-back, rest or switch paths. A form no
@@ -1175,7 +1189,10 @@ counts 0 until a ping measures it) and `ttl_left_min_s` (the kept body's own
 clock where there is one, else the binding's); `pings` (`sent`, `hit`,
 `refused` by reason, each reason counted once per request; a session not idle
 long enough yet is the normal state and is not counted; `cost`, the `input`,
-`cache_read`, `cache_creation` and `output` tokens the answered pings used);
+`cache_read`, `cache_creation` and `output` tokens the answered pings used; and
+`forms`, the same four per ping form, `full` and `rebuilt`: `hit` over `sent`
+of `rebuilt` is what a held session's keep-alive achieves); `rebuilds` (`kept`,
+the held requests a rebuild took in, and `dropped` by reason);
 `snapshot` (`age_s`, `last_rebuild_ms`, `failures`); `captures` (`kept`,
 and `dropped` by reason, for main-thread requests; a subagent's, and one with
 no `cache_control` at all, are neither); and `since`, when this process started

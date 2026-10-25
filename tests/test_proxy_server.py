@@ -60,7 +60,11 @@ class _FakeUpstream:
                  reject_status: int = 403, reply: bytes | None = None,
                  reject_missing_auth: bool = False,
                  reject_headers: bytes = b"", reject_body: bytes = b"",
-                 reject_two_credentials: bool = False):
+                 reject_two_credentials: bool = False,
+                 replies: "list[bytes] | None" = None):
+        # replies: one whole response per request, in order (then `reply`, or
+        # the 200): a conversation whose every turn is answered differently.
+        self.replies = list(replies or [])
         # reject_two_credentials: also answer `reject_status` to a request whose
         # `x-api-key` is not the bearer it carries ("more than one credential").
         # reject_bearer: answer `reject_status` to exactly this credential
@@ -151,7 +155,8 @@ class _FakeUpstream:
                     )
                     tls.close()
                     continue
-                tls.sendall(self.reply or (
+                tls.sendall((self.replies.pop(0) if self.replies else None)
+                            or self.reply or (
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                     b"Content-Type: application/json\r\n\r\n{}"
                 ))
@@ -24160,6 +24165,9 @@ class TestSessionAffinityOnMessages:
         pp._affinity_pings["refused"].clear()
         pp._affinity_captures.update(kept=0)
         pp._affinity_captures["dropped"].clear()
+        pp._rebuild_counts.update(kept=0)
+        pp._rebuild_counts["dropped"].clear()
+        pp._form_pings.clear()
         # ARMED THE WAY CSWAP ARMS IT: dynamic + cache_aware. The CI host's
         # claude-swap has no `cache_aware` and turns `dynamic` into `best`, so
         # the loaded settings are faked; `seen.loaded` is what a case flips.
@@ -25779,12 +25787,13 @@ class TestSessionAffinityOnMessages:
         before = time.monotonic()
         self._send(certdir, [self._call("S")], body=body)
         (headers, kept, ttl_s, est, at, pings, why, path,
-         sent_on) = pp._affinity_last["S"]
+         sent_on, form, rebuild) = pp._affinity_last["S"]
         assert kept == body.encode(), "the body is kept byte for byte"
         assert sent_on == "tok-A", "the bearer the request went out on"
         assert ttl_s == 3600.0 and est == len(body.encode()) // 4, (ttl_s, est)
         assert before <= at <= time.monotonic() and pings == 0, (at, pings)
         assert why is None and path == "/v1/messages", (why, path)
+        assert form == "full" and rebuild is None, (form, rebuild)
         names = {k.lower() for k, _ in headers}
         assert "authorization" not in names, "a kept body carries no bearer"
         assert "x-claude-code-session-id" in names, names
@@ -25839,9 +25848,15 @@ class TestSessionAffinityOnMessages:
             assert after(other) == first.encode(), (
                 f"{name} dropped the body the API's 1 h entry still holds")
         held = {"anthropic-beta": "message-threads-2026-08-12"}
-        assert after(json.dumps({"model": "m", "messages": []}), held) is None, (
+        cont = {"model": "m", "messages": [], "thread": {
+            "type": "continue", "previous_message_id": "msg_1"}}
+        assert after(json.dumps(cont), held) is None, (
             "a held-form request with no breakpoint advances the server's "
             "thread and must drop the body")
+        assert after(json.dumps({"model": "m", "messages": []}),
+                     held) == first.encode(), (
+            "a beta request with no `thread` is a full body: no breakpoint, "
+            "a side call")
         monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", len(first.encode()) + 5)
         assert after(self._body(pad=200)) is None, (
             "a 1 h body over the cap is not kept and drops the stale one")
@@ -25920,8 +25935,9 @@ class TestSessionAffinityOnMessages:
     def case_health_carries_the_cache_aware_key(self, monkeypatch, certdir):
         import datetime as dt
         from cswap_pin import proxy as pp
-        shape = {"sent": 0, "refused": {}, "hit": 0, "cost": dict.fromkeys(
-            ("input", "cache_read", "cache_creation", "output"), 0)}
+        shape = {"sent": 0, "refused": {}, "hit": 0, "forms": {},
+                 "cost": dict.fromkeys(
+                     ("input", "cache_read", "cache_creation", "output"), 0)}
         self._wire(monkeypatch, certdir, armed=False)
         got = self._health(certdir)
         assert got["armed"] is False and got["slots"] == {}, got
@@ -25929,7 +25945,8 @@ class TestSessionAffinityOnMessages:
             "age_s": None, "last_rebuild_ms": None, "failures": 0}, got
         assert got["pings"] == shape, got
         assert got["captures"] == {"kept": 0, "dropped": {}}, got
-        since = dt.datetime.strptime(got["since"], "%Y-%m-%dT%H:%M:%SZ")
+        assert got["rebuilds"] == {"kept": 0, "dropped": {}}, got
+        since =dt.datetime.strptime(got["since"], "%Y-%m-%dT%H:%M:%SZ")
         assert since <= dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
         self._wire(monkeypatch, certdir)
@@ -25969,6 +25986,8 @@ class TestSessionAffinityOnMessages:
         for body, headers in (
                 (self._body(tail="kept"), {}),
                 (self._body(ttl=None, tail="5m"), {}),
+                (json.dumps({"model": "m", "messages": [],
+                             "thread": {"type": "create"}}), held),
                 (bare, held),
                 (bare, {}),
                 (self._body(tail="agent"), {"x-claude-code-agent-id": "a1"})):
@@ -26013,7 +26032,7 @@ class TestSessionAffinityOnMessages:
                 % len(body) + body)
 
     def _armed(self, monkeypatch, certdir, body=None, beta=None,
-               path="/v1/messages", forms=("full", "held"), headers=None,
+               path="/v1/messages", forms=("full", "rebuilt"), headers=None,
                **wire):
         """Wire, then one real armed request, so the pin holds `S`'s body and
         a fresh snapshot. The session is idle 3400 s afterwards."""
@@ -26147,7 +26166,7 @@ class TestSessionAffinityOnMessages:
         spent = "pings since its last request are spent"
         rows = [  # (reason, forms enabled, what makes the session so)
             ("form not measured", (), lambda e: None),
-            ("form not measured", ("held",), lambda e: None),
+            ("form not measured", ("rebuilt",), lambda e: None),
             ("its slot is not kept", ("full",),
              lambda e: pp._affinity_kept.pop(ident)),
             ("its slot is not kept", ("full",), lambda e:
@@ -26291,42 +26310,343 @@ class TestSessionAffinityOnMessages:
             "input": 5, "cache_read": 30000, "cache_creation": 100,
             "output": 1}
 
-    def case_a_held_body_is_pinged_as_it_was_sent_and_its_reply_sets_the_prefix(
-            self, monkeypatch, certdir):
-        from cswap_pin import proxy as pp
-        small = self._body(pad=10)
-        self._armed(monkeypatch, certdir, body=small, forms=("held",),
-                    beta="claude-code-20250219,message-threads-2026-08-12")
-        assert pp._affinity_last["S"][3] == 0, (
-            "a held body's prefix is unknown until a ping reply measures it")
-        usage = {"cache_read_input_tokens": 250000,
-                 "cache_creation_input_tokens": 0}
-        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
-            proxy._keepalive_tick()
-        assert len(up.bodies_seen) == 1, "20000 passes the floor"
-        assert json.loads(up.seen_body) == {**json.loads(small),
-                                            "max_tokens": 0, "stream": False}
-        assert "message-threads-2026-08-12" in up.seen_head
-        assert pp._affinity_last["S"][3] == 250000
-        assert pp._affinity_pings["hit"] == 1
-        self._armed(monkeypatch, certdir, forms=("held",))
-        with self._pair(certdir) as (proxy, up):
-            proxy._keepalive_tick()
-        assert up.bodies_seen == [] and pp._affinity_pings["refused"] == {
-            "form not measured": 1}, "a full body sent as held"
+    # ---- the rebuilt create ping (T2927) ----------------------------------
+    # A held (`message-threads-`) session's server thread lives ~300 s, so a
+    # ping that replays its last `continue` is refused (400 while the thread
+    # lives, 404 after: 0 of 33 answered 200). The pin rebuilds the session's
+    # whole conversation instead (the last create, each relayed reply, each
+    # later continue's messages) and pings with that as a `create`.
 
     HELD_BETA = "claude-code-20250219,message-threads-2026-08-12"
     HEADLESS = "a headless session's held thread"
+    NO_REBUILD = "a held thread with no rebuild"
+    CC1H = {"type": "ephemeral", "ttl": "1h"}
+    SYS = [{"type": "text", "text": "x-billing-header: cch=1"},
+           {"type": "text", "text": "the system prompt", "cache_control": CC1H}]
+    TOOLS = [{"name": "Bash", "description": "run a command",
+              "input_schema": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}]
+
+    @classmethod
+    def _held(cls, thread, content, **top):
+        """A held body: a create carries the system and tools, a continue its
+        new turn only. ``content`` is the last user message (a string, or the
+        blocks of it); the 1 h breakpoint sits on its last block, as the
+        client puts it. ``top`` overrides any top-level field."""
+        blocks = ([{"type": "text", "text": content}]
+                  if isinstance(content, str) else [dict(b) for b in content])
+        blocks[-1]["cache_control"] = cls.CC1H
+        body = {"model": "claude-opus-5-5", "max_tokens": 32000, "stream": True,
+                "thinking": {"type": "adaptive"}, "metadata": {"user_id": "u0"},
+                "diagnostics": {"previous_message_id":
+                                thread.get("previous_message_id")},
+                "thread": thread,
+                "messages": [{"role": "user", "content": blocks}]}
+        if thread["type"] == "create":
+            body.update(system=cls.SYS, tools=cls.TOOLS)
+        return json.dumps({**body, **top})
+
+    @staticmethod
+    def _sse(msg_id, blocks, stop=True, frame="chunked", status=b"200 OK"):
+        """A streamed reply as the API sends it: ``blocks`` are what the
+        message ends up holding (thinking, text, tool_use), streamed as the
+        deltas that build them with a ping between events. ``frame`` is how
+        the body ends: `chunked` in slices that cut across events, `length`,
+        or `close` (the connection ends it). ``stop`` False: no message_stop,
+        a reply cut short."""
+        def ev(name, data):
+            return b"event: %s\ndata: %s\n\n" % (
+                name.encode(), json.dumps({"type": name, **data}).encode())
+
+        out = [ev("message_start", {"message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [], "usage": {"input_tokens": 2}}})]
+        for i, b in enumerate(blocks):
+            if b["type"] == "thinking":
+                t = b["thinking"]
+                start = {"type": "thinking", "thinking": ""}
+                deltas = [{"type": "thinking_delta", "thinking": t[:4]},
+                          {"type": "thinking_delta", "thinking": t[4:]},
+                          {"type": "signature_delta",
+                           "signature": b["signature"]}]
+            elif b["type"] == "text":
+                t = b["text"]
+                start = {"type": "text", "text": ""}
+                deltas = [{"type": "text_delta", "text": t[:5]},
+                          {"type": "text_delta", "text": t[5:]}]
+            else:  # tool_use
+                j = json.dumps(b["input"])
+                start = {**b, "input": {}}
+                deltas = [{"type": "input_json_delta", "partial_json": p}
+                          for p in ("", j[:7], j[7:])]
+            out += [ev("content_block_start", {"index": i,
+                                               "content_block": start}),
+                    ev("ping", {})]
+            out += [ev("content_block_delta", {"index": i, "delta": d})
+                    for d in deltas]
+            out.append(ev("content_block_stop", {"index": i}))
+        out.append(ev("message_delta", {"delta": {"stop_reason": "end_turn"},
+                                        "usage": {"output_tokens": 9}}))
+        if stop:
+            out.append(ev("message_stop", {}))
+        body = b"".join(out)
+        head = (b"HTTP/1.1 " + status
+                + b"\r\nContent-Type: text/event-stream\r\n")
+        if frame == "length":
+            return head + b"Content-Length: %d\r\n\r\n" % len(body) + body
+        if frame == "close":
+            return head + b"Connection: close\r\n\r\n" + body
+        cuts = [body[k:k + 37] for k in range(0, len(body), 37)]
+        return (head + b"Transfer-Encoding: chunked\r\n\r\n" + b"".join(
+            b"%x\r\n%s\r\n" % (len(c), c) for c in cuts) + b"0\r\n\r\n")
+
+    def _talk(self):
+        """Three turns of one held session, as (bodies, replies, the messages
+        a rebuild of it must hold): a create, a continue answering a tool
+        call, a continue with a new question. The replies carry signed
+        thinking, a tool call with streamed input, and text."""
+        r1 = [{"type": "thinking", "thinking": "I should run ls",
+               "signature": "sig-one"},
+              {"type": "tool_use", "id": "toolu_1", "name": "Bash",
+               "input": {"command": "ls", "description": "list"},
+               "caller": {"type": "direct"}}]
+        r2 = [{"type": "thinking", "thinking": "one file", "signature": "sig-two"},
+              {"type": "text", "text": "There is one file, a.txt."}]
+        res = [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "a.txt"}]
+        bodies = [
+            self._held({"type": "create"}, "list the files"),
+            self._held({"type": "continue", "previous_message_id": "msg_1"},
+                       res, metadata={"user_id": "u1"}),
+            self._held({"type": "continue", "previous_message_id": "msg_2"},
+                       "and its size?", metadata={"user_id": "u2"})]
+        replies = [self._sse("msg_1", r1), self._sse("msg_2", r2),
+                   self._sse("msg_3", [{"type": "text", "text": "Four."}])]
+        messages = [
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": r1},
+            {"role": "user", "content": res},
+            {"role": "assistant", "content": r2},
+            {"role": "user", "content": [{
+                "type": "text", "text": "and its size?",
+                "cache_control": self.CC1H}]}]
+        return bodies, replies, messages
+
+    @classmethod
+    def _turns(cls, certdir, bodies, replies, session="S", **headers):
+        """Each of ``bodies`` through a real MITM on `tok-A` as one held
+        client session, answered by ``replies`` in order. Returns the
+        statuses and the (stopped) upstream, whose heads and bodies it kept."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        up = _FakeUpstream(certdir, replies=replies)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            statuses = [_request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
+                body=b, **cls._call(session, **{
+                    "anthropic-version": "2023-06-01",
+                    "accept-encoding": "gzip",
+                    "anthropic-beta": cls.HELD_BETA,
+                    "user-agent": "claude-cli/2.1.310 (external, cli)",
+                    **headers})) for b in bodies]
+            # the relay settles the last reply just after the client has it
+            end = time.monotonic() + 5
+            while time.monotonic() < end and any(
+                    e[10] is not None and e[10].body is not None
+                    for e in list(pp._affinity_last.values())):
+                time.sleep(0.01)
+        finally:
+            proxy.stop()
+            up.stop()
+        return statuses, up
+
+    def case_an_idle_held_session_is_pinged_with_a_create_rebuilt_from_its_replies(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, messages = self._talk()
+        seen = self._wire(monkeypatch, certdir)
+        statuses, real = self._turns(certdir, bodies, replies)
+        self._age(3400)
+        assert statuses == [200, 200, 200], statuses
+        assert all("accept-encoding: identity" in h.lower()
+                   for h in real.heads_seen), (
+            "the tee reads plain SSE, so an armed held request asks the "
+            "upstream for identity whatever the client accepts")
+        assert pp._affinity_last["S"][9] == "held"
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0, "input_tokens": 2}
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, "one ping"
+        sent = json.loads(up.seen_body)
+        assert sent["messages"] == messages, sent["messages"]
+        assert sent["system"] == self.SYS and sent["tools"] == self.TOOLS, (
+            "the create's, whole: a continue carries no tools")
+        assert sent["thread"] == {"type": "create"}, sent["thread"]
+        assert sent["max_tokens"] == 0 and sent["stream"] is False
+        assert sent["metadata"] == {"user_id": "u2"} and (
+            sent["model"] == "claude-opus-5-5"), "the latest request's fields"
+        assert up.seen_body.count(b'"cache_control"') == 2, (
+            "the system prompt's and the last block's, no other")
+        assert up.seen_auth == "Bearer tok-A", "the slot's stored token"
+        assert "message-threads-2026-08-12" in up.seen_head
+        assert pp._affinity_last["S"][3] == 30000, "the reply measures it"
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        assert "form rebuilt status 200 cache_read 30000" in line, line
+        got = self._health(certdir)
+        cost = {"input": 2, "cache_read": 30000, "cache_creation": 0,
+                "output": 0}
+        assert got["pings"]["sent"] == 1 and got["pings"]["hit"] == 1, got
+        assert got["pings"]["forms"] == {"rebuilt": {
+            "sent": 1, "hit": 1, "refused": {}, "cost": cost}}, got["pings"]
+        assert got["rebuilds"] == {"kept": 3, "dropped": {}}, got["rebuilds"]
+
+    def case_a_reply_is_rebuilt_whatever_frames_it(self, monkeypatch, certdir):
+        bodies, replies, messages = self._talk()
+        usage = {"cache_read_input_tokens": 30000}
+        for frame in ("chunked", "length", "close"):
+            self._wire(monkeypatch, certdir)
+            replies = [self._sse(f"msg_{n}", b, frame=frame) for n, b in (
+                (1, [{"type": "text", "text": "one"}]),
+                (2, [{"type": "text", "text": "two"}]))]
+            self._turns(certdir, bodies[:2], replies)
+            self._age(3400)
+            with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+                got = proxy._keepalive_ping("S")
+            assert got["form"] == "rebuilt" and got["status"] == 200, (
+                frame, got)
+            assert [m["content"] for m in json.loads(up.seen_body)["messages"]
+                    ][:2] == ["list the files", "one"], frame
+
+    def case_a_rebuild_that_cannot_be_trusted_is_dropped_and_nothing_is_sent(
+            self, monkeypatch, certdir):
+        """A rebuild that may not be the conversation the cache holds would
+        write the whole prefix again, on a ping: it is dropped under its
+        reason, counted once, and the ping is refused under its own."""
+        import gzip
+
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        cut = self._sse("msg_1", [{"type": "text", "text": "cut"}], stop=False)
+        raw = b"".join(self._sse("msg_1", [{"type": "text", "text": "z"}],
+                                 frame="close").partition(b"\r\n\r\n")[2:])
+        zipped = gzip.compress(raw)
+        gz = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+              b"Content-Encoding: gzip\r\nContent-Length: %d\r\n\r\n"
+              % len(zipped) + zipped)
+        for reason, sent, answers in (
+                ("not 2xx", bodies[:2],
+                 [replies[0], self._reply({}, status=b"400 Bad Request")]),
+                ("reply not complete", bodies[:2], [cut, replies[1]]),
+                ("reply not complete", bodies[:1], [gz]),  # a compressed one
+                ("continue does not chain", [bodies[0], bodies[2]],
+                 [replies[0], replies[2]])):
+            self._wire(monkeypatch, certdir)
+            statuses, _ = self._turns(certdir, sent, answers)
+            assert statuses[0] == 200, (reason, statuses)
+            self._age(3400)
+            assert self._health(certdir)["rebuilds"]["dropped"] == {
+                reason: 1}, (reason, pp._rebuild_counts)
+            with self._pair(certdir, reply=self._reply(
+                    {"cache_read_input_tokens": 30000})) as (proxy, up):
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+            assert up.bodies_seen == [], (reason, "a ping went out")
+            assert pp._affinity_pings["refused"] == {self.NO_REBUILD: 1}, (
+                reason, pp._affinity_pings)
+            assert "S" not in pp._affinity_last, (reason, "asked every tick")
+            assert self._health(certdir)["pings"]["forms"] == {"rebuilt": {
+                "sent": 0, "hit": 0, "refused": {self.NO_REBUILD: 1},
+                "cost": dict.fromkeys(
+                    ("input", "cache_read", "cache_creation", "output"), 0)}}
+
+    def case_a_404_drops_the_rebuild_and_the_clients_create_replay_starts_another(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        replay = self._held({"type": "create"}, "ignored", messages=[
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [{
+                "type": "text", "text": "size?", "cache_control": self.CC1H}]}])
+        self._wire(monkeypatch, certdir)
+        statuses, _ = self._turns(
+            certdir, [bodies[0], bodies[1], replay],
+            [replies[0], self._reply({}, status=b"404 Not Found"),
+             self._sse("msg_9", [{"type": "text", "text": "fine"}])])
+        assert statuses == [200, 404, 200], statuses
+        assert pp._rebuild_counts["dropped"] == {"not 2xx": 1}
+        self._age(3400)
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert [m["content"] for m in json.loads(up.seen_body)["messages"]] == [
+            "list the files", "ok", [{"type": "text", "text": "size?",
+                                      "cache_control": self.CC1H}]], (
+            "the replay is the new base: nothing of the old thread is in it")
+
+    def case_a_rebuild_over_the_body_cap_is_dropped_and_counted(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        big = [{"type": "text", "text": "the system prompt " * 200}]
+        self._turns(certdir, [self._held({"type": "create"}, "go", system=big),
+                              ], replies[:1])
+        base = pp._affinity_last["S"][10].size
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", base + 50)
+        self._turns(certdir, bodies[1:2], replies[1:2])
+        assert len(bodies[1]) < pp._AFFINITY_BODY_MAX, "each body fits"
+        assert pp._rebuild_counts["dropped"] == {
+            "rebuild over the body cap": 1}, pp._rebuild_counts
+        assert pp._affinity_last["S"][10] is None
+
+    def case_the_total_cap_counts_the_rebuilds_bytes(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2], session="S0")
+        e = pp._affinity_last["S0"]
+        one = len(e[1]) + e[10].size
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_TOTAL", one + one // 2)
+        self._turns(certdir, bodies[:2], replies[:2], session="S1")
+        assert list(pp._affinity_last) == ["S1"], (
+            "the oldest session's body and rebuild went first",
+            list(pp._affinity_last))
+
+    def case_a_beta_body_with_no_thread_is_a_full_body(
+            self, monkeypatch, certdir):
+        """`held_stateless`: the client keeps the beta and drops `thread` for
+        the rest of the conversation. The form is the body's."""
+        from cswap_pin import proxy as pp
+        body = self._body(pad=90000)
+        seen = self._armed(monkeypatch, certdir, body=body, beta=self.HELD_BETA)
+        assert pp._affinity_last["S"][9] == "full"
+        assert any("accept-encoding: gzip" in h.lower() for h in self.heads), (
+            "only an armed held request is asked of the upstream as identity")
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert json.loads(up.seen_body) == {
+            **json.loads(body), "max_tokens": 0, "stream": False}
+        (line,) = [l for l in seen.logs if "keep-alive" in l]
+        assert "form full status 200" in line, line
 
     def case_a_headless_sessions_held_body_is_refused_once_due_and_dropped(
             self, monkeypatch, certdir):
-        """T2925: the server drops a held thread long before the 1 h cache,
-        and an `sdk-cli` session is a `claude -p` that has exited by then, so
-        a ping answers 404 and buys nothing. Refused only when it would
-        otherwise have been pinged."""
+        """T2925: an `sdk-cli` session is a `claude -p` that has exited by
+        the time a ping is due. Refused only when it would otherwise have
+        been pinged, rebuild or no."""
         from cswap_pin import proxy as pp
-        self._armed(monkeypatch, certdir, forms=("held",), beta=self.HELD_BETA,
-                    headers={"user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2], **{
+            "user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        assert pp._affinity_last["S"][10].ready(), "a complete rebuild"
         self._age(100)
         with self._pair(certdir) as (proxy, up):
             proxy._keepalive_tick()
@@ -26339,17 +26659,26 @@ class TestSessionAffinityOnMessages:
         assert "S" not in pp._affinity_last, "dropped: never asked again"
         assert pp._affinity_pings["refused"] == {self.HEADLESS: 1}
 
-    def case_an_interactive_sessions_held_body_is_still_pinged(
+    def case_an_unknown_held_prefix_passes_the_floor_once(
             self, monkeypatch, certdir):
+        """A held body's prefix is unknown until a ping reply measures it, so
+        ping 1 is allowed; a reply that measures nothing leaves ping 2 to the
+        floor."""
         from cswap_pin import proxy as pp
-        self._armed(monkeypatch, certdir, forms=("held",), beta=self.HELD_BETA,
-                    headers={"user-agent": "claude-cli/2.1.309 (external, cli)"})
-        usage = {"cache_read_input_tokens": 250000,
-                 "cache_creation_input_tokens": 0}
-        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+        bodies, replies, _ = self._talk()
+        self._wire(monkeypatch, certdir)
+        self._turns(certdir, bodies[:2], replies[:2])
+        self._age(3400)
+        assert pp._affinity_last["S"][3] == 0
+        miss = {"cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 30000}
+        with self._pair(certdir, reply=self._reply(miss)) as (proxy, up):
             proxy._keepalive_tick()
-        assert len(up.bodies_seen) == 1
-        assert pp._affinity_pings["sent"] == 1 and pp._affinity_pings["refused"] == {}
+            self._age(3400)
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, "an unmeasured prefix was pinged twice"
+        assert pp._affinity_pings["refused"] == {
+            "its prefix is too small to pay": 1}, pp._affinity_pings
 
     def case_a_headless_sessions_full_body_is_still_pinged(
             self, monkeypatch, certdir):
@@ -26504,7 +26833,7 @@ class TestSessionAffinityOnMessages:
     def case_the_shipped_gate_holds_the_measured_forms_and_a_closed_one_costs_no_rebuild(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
-        assert pp._KEEPALIVE_FORMS == frozenset({"full", "held"}), (
+        assert pp._KEEPALIVE_FORMS == frozenset({"full", "rebuilt"}), (
             "the two forms the sandbox measured")
         seen = self._armed(monkeypatch, certdir, forms=())
         pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
@@ -26626,25 +26955,6 @@ class TestSessionAffinityOnMessages:
                 f"{what} holds the same cache")
             assert pp._affinity_pings["refused"] == {}
 
-    def case_an_unknown_held_prefix_passes_the_floor_once(
-            self, monkeypatch, certdir):
-        """A held body's prefix is unknown until a ping reply measures it, so
-        ping 1 is allowed; a reply that measures nothing leaves ping 2 to the
-        floor."""
-        from cswap_pin import proxy as pp
-        self._armed(monkeypatch, certdir, body=self._body(pad=10),
-                    forms=("held",),
-                    beta="claude-code-20250219,message-threads-2026-08-12")
-        miss = {"cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 30000}
-        with self._pair(certdir, reply=self._reply(miss)) as (proxy, up):
-            proxy._keepalive_tick()
-            self._age(3400)
-            proxy._keepalive_tick()
-        assert len(up.bodies_seen) == 1, "an unmeasured prefix was pinged twice"
-        assert pp._affinity_pings["refused"] == {
-            "its prefix is too small to pay": 1}, pp._affinity_pings
-
     def case_a_ping_moves_its_session_to_the_end_of_the_bounded_table(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
@@ -26666,7 +26976,8 @@ class TestSessionAffinityOnMessages:
         pp._affinity_last["S"] = [[], b""]  # a row the report cannot read
         got = self._health(certdir)
         assert got["armed"] is True and got["slots"] == {}, got
-        assert set(got["pings"]) == {"sent", "refused", "hit", "cost"}, got
+        assert set(got["pings"]) == {"sent", "refused", "hit", "cost",
+                                     "forms"}, got
 
     def case_a_thread_that_cannot_start_does_not_fail_the_request(
             self, monkeypatch, certdir):
