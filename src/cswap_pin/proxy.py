@@ -3434,8 +3434,10 @@ _affinity_logged: dict[tuple, tuple] = {}
 # keep-alive pings sent since it, the reason the sender last refused it (a
 # reason is counted once per request), its request path, the bearer the request
 # went out on, its form (`_keepalive_form`), its `_Rebuild` (a held body's, else
-# None)]. Held only while armed, and only as long as the session's `_affinity`
-# entry (dropped with it).
+# None), and while a full body's reply is awaited, slots 0-8 of the entry it
+# replaced (`[]`: none; None: settled, or a held body, see `_full_settle`)].
+# Held only while armed, and only as long as the session's `_affinity` entry
+# (dropped with it).
 _affinity_last: dict[str, list] = {}
 _AFFINITY_BODY_MAX = 8 << 20  # one body; a longer one is not kept
 _AFFINITY_BODY_TOTAL = 128 << 20  # all of them; the oldest go first
@@ -4141,8 +4143,10 @@ class _Rebuild:
 
 
 def _entry_bytes(entry) -> int:
-    """What ``entry`` of `_affinity_last` holds: its body and its rebuild."""
-    return len(entry[1]) + (entry[10].size if entry[10] else 0)
+    """What ``entry`` of `_affinity_last` holds: its body, its rebuild, and
+    the body it gives back if its request fails."""
+    return (len(entry[1]) + (entry[10].size if entry[10] else 0)
+            + (len(entry[11][1]) if entry[11] else 0))
 
 
 def _rebuild_dropped(why: str) -> None:
@@ -4250,6 +4254,27 @@ def _rebuild_settle(rb, entry, body, code: int, message) -> None:
             del rb.msgs[n:]
 
 
+def _full_settle(entry, session: str, code: int) -> None:
+    """The request ``entry`` (``session``'s kept full body) awaited was
+    answered. `_affinity_capture` kept it, with the idle clock of its capture,
+    before its reply was known; a 2xx makes that so. A 429, 5xx or 400 (and an
+    `error` event under 200, as `_ReplyTee` reports it) wrote no cache: the
+    request before it still holds the cache, so ``entry`` gets that request
+    back whole (body, clock, pings), and is forgotten when there was none. A
+    request that superseded ``entry`` since owns the session now."""
+    with _affinity_lock:
+        mark = entry[11]
+        if mark is None or _affinity_last.get(session) is not entry:
+            return
+        entry[11] = None
+        if 200 <= code < 300:
+            return
+        if mark:
+            entry[:9] = mark
+        else:
+            _held_forget(session, "not 2xx")
+
+
 def _rebuilt_create(static: bytes, top: dict, msgs: bytes) -> dict:
     """The `create` a rebuild is pinged as: the latest request's fields, the
     create's `system` and `tools`, every message, and the one message
@@ -4350,23 +4375,26 @@ def _tee_guard(method):
             except Exception:  # noqa: BLE001
                 self._off = True
                 with contextlib.suppress(Exception), _affinity_lock:
-                    if self._rb.body is self._body:
+                    if self._rb is not None and self._rb.body is self._body:
                         _rebuild_kill(self._rb, "tee failed")
     return guarded
 
 
 class _ReplyTee:
     """What `_relay_response` hands the status and every body byte of the
-    reply to an armed held request, to rebuild the assistant message the
-    session's next continue builds on (`_SseReply`). It settles the session's
-    `_Rebuild` with what came of it: at `message_stop` (the client's next
-    continue may arrive while the relay still waits for the upstream to end
-    the body), else at ``end``, for a stream that never got there. A relay that
-    never reached a body (the request was taken back and resent) settles
+    reply to an armed request, to rebuild the assistant message the session's
+    next continue builds on (`_SseReply`), for a held one, and to tell a
+    request that failed from one that did not, for either. It settles the
+    session's `_Rebuild` (`_rebuild_settle`), or for a full body its entry
+    (`_full_settle`), with what came of it: at `message_stop` (the client's
+    next continue may arrive while the relay still waits for the upstream to
+    end the body), else at ``end``, for a stream that never got there. A relay
+    that never reached a body (the request was taken back and resent) settles
     nothing."""
 
-    def __init__(self, entry, body):
-        self._entry, self._rb, self._body = entry, entry[10], body
+    def __init__(self, entry, session: str, body):
+        self._entry, self._session, self._rb, self._body = (
+            entry, session, entry[10], body)
         self._code = self._reply = None
         self._off = False
 
@@ -4388,16 +4416,20 @@ class _ReplyTee:
         if code is not None:
             # an `error` event under 200 (an overloaded_error mid-stream) is
             # a failed request, as the API's 529 is
-            _rebuild_settle(self._rb, self._entry, self._body,
-                            529 if reply and reply.errored else code,
-                            reply.message if reply else None)
+            code = 529 if reply and reply.errored else code
+            if self._rb is None:
+                _full_settle(self._entry, self._session, code)
+            else:
+                _rebuild_settle(self._rb, self._entry, self._body, code,
+                                reply.message if reply else None)
 
 
 def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
-    """The tee for the request ``body``, when `_affinity_capture` took it into
-    its session's rebuild (so: a main-thread held request of an armed session,
-    and still the session's newest), else None. Takes no lock off the
-    `/v1/messages` path, or while nothing is held."""
+    """The tee for the request ``body``, when `_affinity_capture` kept it and
+    awaits its reply (so: a main-thread request of an armed session, held and
+    taken into its session's rebuild, or full, and still the session's
+    newest), else None. Takes no lock off the `/v1/messages` path, or while
+    nothing is held."""
     if not _affinity_last or path.split("?", 1)[0].rstrip("/") != "/v1/messages":
         return None
     session = next((v for k, v in headers
@@ -4406,9 +4438,12 @@ def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
         with _affinity_lock:
             entry = _affinity_last.get(session)
             rb = entry[10] if entry else None
+            awaited = (rb.body is body if rb is not None
+                       else entry is not None and entry[1] is body
+                       and entry[11] is not None)
     except Exception:  # noqa: BLE001 (never let a statistic break a request)
         return None
-    return _ReplyTee(entry, body) if rb is not None and rb.body is body else None
+    return _ReplyTee(entry, session, body) if awaited else None
 
 
 def _affinity_capture(certdir, headers, body: bytes, path: str,
@@ -4428,7 +4463,10 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
 
     A held body (one with a `thread`) is also taken into the session's
     `_Rebuild` (`_rebuild_stage`), which its reply then completes
-    (`_reply_tee`): that, not the body, is what a ping of it sends.
+    (`_reply_tee`): that, not the body, is what a ping of it sends. A full
+    body is kept before its reply is known, and carries the entry it replaces
+    (the last that was answered, if this one is not yet): its reply settles it
+    (`_full_settle`), and a failed request gives that entry back.
 
     The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes (bodies and
     rebuilds) the oldest go, and a body whose session lost its `_affinity`
@@ -4477,12 +4515,16 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
             dropped[why] = dropped.get(why, 0) + 1
             return False
         _affinity_captures["kept"] += 1
+        # a held body gives nothing back (its rebuild does); a full one the
+        # entry that held the cache before it, or what that one gives back
+        mark = (None if held else old[11] if old and old[11] is not None
+                else old[:9] if old and old[9] == "full" else [])
         _affinity_last[session] = [
             sent, body, ttl_s,
             # a held body is the new turn only: its bytes say nothing
             0 if held else len(body) // 4,
             time.monotonic(), 0, None, path, inject[0] if inject else client,
-            form, rb]
+            form, rb, mark]
         for gone in [x for x in _affinity_last if x not in _affinity]:
             _held_forget(gone, "session not bound")
         _affinity_trim()
@@ -23479,9 +23521,9 @@ class PinProxy:
                     v = UPSTREAM_HOST
                     sent_host = True
                 if kl == "accept-encoding" and tee is not None:
-                    # identity: the tee reads plain SSE, and decoding gzip or
-                    # br here would take a codec (br, a dependency) for a reply
-                    # of a few KB
+                    # identity: the tee (held or full) reads plain SSE, and
+                    # decoding gzip or br here would take a codec (br, a
+                    # dependency) for a reply of a few KB
                     v = "identity"
                 out.append(f"{k}: {v}".encode("latin1"))
             if dechunked:

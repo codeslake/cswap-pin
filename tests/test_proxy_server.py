@@ -24653,7 +24653,7 @@ class TestSessionAffinityOnMessages:
         self._seed("S2", "tok-A")
         pp._affinity_last["S1"] = [
             [], b"a kept body", 3600.0, 0, time.monotonic(), 0, None,
-            "/v1/messages", "tok-A", "full", None]
+            "/v1/messages", "tok-A", "full", None, None]
         statuses, auths = self._send(
             certdir, [("tok-B", "S1"), ("tok-B", "S1"), ("tok-B", "S2")],
             reject_bearer="tok-A", reject_status=404, reject_body=body)
@@ -25796,13 +25796,14 @@ class TestSessionAffinityOnMessages:
         before = time.monotonic()
         self._send(certdir, [self._call("S")], body=body)
         (headers, kept, ttl_s, est, at, pings, why, path,
-         sent_on, form, rebuild) = pp._affinity_last["S"]
+         sent_on, form, rebuild, mark) = pp._affinity_last["S"]
         assert kept == body.encode(), "the body is kept byte for byte"
         assert sent_on == "tok-A", "the bearer the request went out on"
         assert ttl_s == 3600.0 and est == len(body.encode()) // 4, (ttl_s, est)
         assert before <= at <= time.monotonic() and pings == 0, (at, pings)
         assert why is None and path == "/v1/messages", (why, path)
         assert form == "full" and rebuild is None, (form, rebuild)
+        assert not mark, "no request before it to give back"
         names = {k.lower() for k, _ in headers}
         assert "authorization" not in names, "a kept body carries no bearer"
         assert "x-claude-code-session-id" in names, names
@@ -26453,6 +26454,18 @@ class TestSessionAffinityOnMessages:
             "anthropic-beta": cls.HELD_BETA,
             "user-agent": "claude-cli/2.1.310 (external, cli)", **headers})
 
+    @staticmethod
+    def _await_settled():
+        """The relay settles a reply just after the client has it: wait for
+        every request that awaits one (a held body's rebuild, a full body's
+        entry)."""
+        from cswap_pin import proxy as pp
+        end = time.monotonic() + 5
+        while time.monotonic() < end and any(
+                (e[10] is not None and e[10].body is not None)
+                or e[11] is not None for e in list(pp._affinity_last.values())):
+            time.sleep(0.01)
+
     @classmethod
     def _turns(cls, certdir, bodies, replies, session="S", got=None,
                between=None, **headers):
@@ -26461,7 +26474,6 @@ class TestSessionAffinityOnMessages:
         statuses and the (stopped) upstream, whose heads and bodies it kept;
         ``got`` (a list) gets each reply body the client read, ``between``
         (a callable) runs after each request but the last."""
-        from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
         up = _FakeUpstream(certdir, replies=replies)
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PIN-TOKEN",
@@ -26475,12 +26487,7 @@ class TestSessionAffinityOnMessages:
                 statuses.append(_request_through_proxy(
                     proxy.port, certdir / "ca.pem", "/v1/messages?beta=true",
                     body=b, body_out=got, **cls._held_call(session, **headers)))
-            # the relay settles the last reply just after the client has it
-            end = time.monotonic() + 5
-            while time.monotonic() < end and any(
-                    e[10] is not None and e[10].body is not None
-                    for e in list(pp._affinity_last.values())):
-                time.sleep(0.01)
+            cls._await_settled()
         finally:
             proxy.stop()
             up.stop()
@@ -26656,6 +26663,135 @@ class TestSessionAffinityOnMessages:
                 assert pp._affinity_pings["refused"] == (
                     {} if pinged else {"past its cache ttl": 1}), (
                     idle, how, pp._affinity_pings)
+
+    def case_a_failed_full_request_does_not_restart_the_idle_clock(
+            self, monkeypatch, certdir):
+        """A full body is kept when it is captured, before its reply is known.
+        A request that then fails wrote no cache: the cache holds the last 2xx
+        request's body, on that request's clock. The ping is due by that
+        clock, carries that body, and is refused as past its ttl by it, never
+        by the failed attempt's, or a ping goes out on a cold cache (or of a
+        turn that was never cached) and writes the whole prefix."""
+        from cswap_pin import proxy as pp
+        first = self._body(pad=90000, tail="first")
+        second = self._body(pad=90000, tail="second")
+        answered = self._sse("msg_1", [{"type": "text", "text": "ok"}])
+        failures = {
+            "429": self._reply({}, status=b"429 Too Many Requests"),
+            "400": self._reply({}, status=b"400 Bad Request"),
+            "529": self._reply({}, status=b"529 Overloaded"),
+            "an error event": self._sse(
+                "msg_2", [{"type": "text", "text": "Ov"}], error=True)}
+        for idle, pinged in ((2300, 1), (2700, 0)):
+            for how, failure in failures.items():
+                self._wire(monkeypatch, certdir)
+                self._turns(certdir, [first, second], [answered, failure],
+                            between=lambda: self._age(1000))
+                pp._affinity_last["S"][4] -= idle  # 1000 s + idle: 3300, 3700
+                with self._pair(certdir, reply=self._reply(
+                        {"cache_read_input_tokens": 30000})) as (proxy, up):
+                    proxy._keepalive_tick()
+                assert len(up.bodies_seen) == pinged, (idle, how)
+                assert pp._affinity_pings["refused"] == (
+                    {} if pinged else {"past its cache ttl": 1}), (
+                    idle, how, pp._affinity_pings)
+                if pinged:
+                    assert json.loads(up.seen_body) == {
+                        **json.loads(first), "max_tokens": 0,
+                        "stream": False}, (how, "the 2xx request's body")
+
+    def case_a_full_request_answered_2xx_replaces_the_body_and_the_clock(
+            self, monkeypatch, certdir):
+        """Whatever a 2xx reply looks like (whole JSON, a stream, one cut
+        short), the request it answers wrote the cache: its body and its
+        capture's clock are the entry's, and nothing is left to give back."""
+        from cswap_pin import proxy as pp
+        first = self._body(pad=90000, tail="first")
+        second = self._body(pad=90000, tail="second")
+        text = [{"type": "text", "text": "ok"}]
+        for how, answer in (
+                ("json", self._reply({})), ("a stream", self._sse("m2", text)),
+                ("a cut stream", self._sse("m2", text, stop=False))):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, [first, second],
+                        [self._sse("m1", text), answer],
+                        between=lambda: self._age(1000))
+            entry = pp._affinity_last["S"]
+            assert entry[1] == second.encode() and entry[11] is None, how
+            assert 0 <= time.monotonic() - entry[4] < 60, (
+                how, "the clock is the new request's")
+
+    def case_a_failed_first_full_request_keeps_no_body(
+            self, monkeypatch, certdir):
+        """No request before it answered: its body was never cached, and a
+        ping of it would write it at the 1 h rate. Its retry is kept."""
+        from cswap_pin import proxy as pp
+        body = self._body(pad=90000)
+        for how, failure in (
+                ("429", self._reply({}, status=b"429 Too Many Requests")),
+                ("an error event", self._sse(
+                    "m1", [{"type": "text", "text": "Ov"}], error=True))):
+            self._wire(monkeypatch, certdir)
+            self._turns(certdir, [body], [failure])
+            assert "S" not in pp._affinity_last, how
+            self._turns(certdir, [body, body], [failure, self._reply({})])
+            assert pp._affinity_last["S"][1] == body.encode(), how
+            assert pp._affinity_last["S"][11] is None, how
+
+    def case_a_kept_401s_resend_is_the_tee_that_settles_the_request(
+            self, monkeypatch, certdir):
+        """A kept 401 returns before the tee has a status, and the resend on
+        the rotated token is the same body: that resend's tee settles it, and
+        the first settled nothing (a failure would give the old body back)."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn:
+                            threading.Thread(target=fn, daemon=True).start())
+        old = self._body(pad=90000, tail="old")
+        new = self._body(pad=90000, tail="new")
+        pp._affinity_last["S"] = [
+            [], old.encode(), 3600.0, 22500, time.monotonic() - 1000, 0, None,
+            "/v1/messages", "tok-A", "full", None, None]
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], body=new, reject_bearer="tok-A",
+            reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-A2"])
+        self._await_settled()
+        entry = pp._affinity_last["S"]
+        assert entry[1] == new.encode() and entry[11] is None, entry[11]
+        assert 0 <= time.monotonic() - entry[4] < 60, "the new request's clock"
+
+    def case_a_full_request_gives_back_the_last_answered_one(
+            self, monkeypatch, certdir):
+        """A request that comes in while another awaits its reply gives back
+        what that one would have: the last answered. A request that has been
+        replaced settles nothing."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        headers = [("x-claude-code-session-id", "S")]
+
+        def capture(tail):
+            body = self._body(pad=100, tail=tail).encode()
+            assert pp._affinity_capture(certdir, headers, body, "/v1/messages")
+            return pp._affinity_last["S"]
+
+        a = capture("a")
+        assert a[11] == [], "nothing before it"
+        pp._full_settle(a, "S", 200)
+        assert a[11] is None
+        b = capture("b")
+        assert b[11] == a[:9], "the answered request, whole"
+        c = capture("c")
+        assert c[11] is b[11], "b is not answered yet: c gives back a"
+        pp._full_settle(b, "S", 529)
+        assert pp._affinity_last["S"] is c and c[11] is not None, (
+            "a replaced request settles nothing")
+        c[5] = 1
+        pp._full_settle(c, "S", 429)
+        assert c[:9] == a[:9] and c[11] is None, "a, whole, as it was"
+        pp._full_settle(c, "S", 429)
+        assert c[:9] == a[:9], "settled once"
 
     def case_a_cut_reply_leaves_the_rebuild_pingable_but_not_chainable(
             self, monkeypatch, certdir):
@@ -26915,8 +27051,8 @@ class TestSessionAffinityOnMessages:
         body = self._body(pad=90000)
         seen = self._armed(monkeypatch, certdir, body=body, beta=self.HELD_BETA)
         assert pp._affinity_last["S"][9] == "full"
-        assert any("accept-encoding: gzip" in h.lower() for h in self.heads), (
-            "only an armed held request is asked of the upstream as identity")
+        assert all("accept-encoding: identity" in h.lower() for h in self.heads), (
+            "a full request is watched too, as plain SSE")
         with self._pair(certdir, reply=self._reply(
                 {"cache_read_input_tokens": 30000})) as (proxy, up):
             proxy._keepalive_tick()
@@ -26924,6 +27060,22 @@ class TestSessionAffinityOnMessages:
             **json.loads(body), "max_tokens": 0, "stream": False}
         (line,) = [l for l in seen.logs if "keep-alive" in l]
         assert "form full status 200" in line, line
+
+    def case_only_a_request_with_a_tee_is_asked_for_identity(
+            self, monkeypatch, certdir):
+        """The tee reads plain SSE, so the upstream is asked for identity
+        whatever the client accepts, for the request it watches (an armed
+        main-thread body that is kept) and no other."""
+        self._wire(monkeypatch, certdir)
+        gz = {"accept-encoding": "gzip"}
+        for call, body, want in (
+                (self._call("S", **gz), self._body(pad=100), "identity"),
+                (self._call("S", **gz, **{"x-claude-code-agent-id": "a1"}),
+                 self._body(pad=100), "gzip"),
+                (self._call("S", **gz), self._body(ttl=None), "gzip")):
+            self._send(certdir, [call], body=body)
+            assert f"accept-encoding: {want}" in self.heads[-1].lower(), (
+                want, self.heads[-1])
 
     def case_a_headless_sessions_held_body_is_refused_once_due_and_dropped(
             self, monkeypatch, certdir):
