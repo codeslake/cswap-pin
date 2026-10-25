@@ -3781,7 +3781,7 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
         wait = reset - time.time()
     now = time.monotonic()
     with _affinity_lock:
-        _affinity_last.pop(session, None)
+        _held_forget(session, "taken back")
         _affinity.pop(session, None)
         _bounded_put(_affinity_rest, ident, now + wait)
         more = _affinity_due(_affinity_logged, (ident[0], code), now)
@@ -3803,7 +3803,7 @@ def _affinity_relay_404(session: str, ident: tuple) -> None:
     line per slot per `_BUSY_REPORT_COOLDOWN_S`, as `_affinity_take_back`'s."""
     now = time.monotonic()
     with _affinity_lock:
-        _affinity_last.pop(session, None)
+        _held_forget(session, "404 relayed")
         more = _affinity_due(_affinity_logged, (ident[0], 404), now)
     if more is not None:
         _log_lifecycle(
@@ -3914,7 +3914,7 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
             with _affinity_lock:
                 _affinity_kept.clear()
                 _affinity_why.clear()
-                _affinity_last.clear()
+                _held_clear("switched off")
         return None
     ttl, threshold, strategy = cfg
     client = session = key = ""
@@ -4051,13 +4051,27 @@ def _keepalive_headless(headers) -> bool:
     return False
 
 
-def _strip_cc(x):
-    """``x`` (a message, or a part of one) without any `cache_control`."""
-    if isinstance(x, dict):
-        return {k: _strip_cc(v) for k, v in x.items() if k != "cache_control"}
-    if isinstance(x, list):
-        return [_strip_cc(v) for v in x]
-    return x
+def _bare(block):
+    """The content block ``block`` without its `cache_control`."""
+    if not isinstance(block, dict):
+        return block
+    return {k: v for k, v in block.items() if k != "cache_control"}
+
+
+def _strip_cc(m: dict) -> dict:
+    """The message ``m`` without the `cache_control` of its content blocks and
+    of the blocks inside a `tool_result`, where the API takes one. Never
+    deeper: a tool call's `input` and a tool's payload are data."""
+    blocks = m.get("content")
+    if not isinstance(blocks, list):
+        return dict(m)
+    out = []
+    for b in map(_bare, blocks):
+        if (isinstance(b, dict) and b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list)):
+            b["content"] = [_bare(x) for x in b["content"]]
+        out.append(b)
+    return {**m, "content": out}
 
 
 def _rebuild_message(m: dict) -> dict:
@@ -4102,13 +4116,17 @@ class _Rebuild:
     times that): ``static``, the create's `system` and `tools`; ``top``, the
     other top-level fields of the latest request; ``msgs``, every message so
     far, comma-joined; ``reply``, `(id, message)` of the last reply relayed
-    whole, which the next continue must name; ``body``, the request whose
-    reply is awaited; ``dead``, why it was dropped. Under `_affinity_lock`."""
-    __slots__ = ("static", "top", "msgs", "reply", "body", "dead")
+    whole, which the next continue must name (None: no continue chains, the
+    last reply was cut); ``body``, the request whose reply is awaited;
+    ``mark``, `(len(msgs), reply, top)` from before that request if it was a
+    continue, for a request that fails to give back; ``dead``, why it was
+    dropped. Under `_affinity_lock`."""
+    __slots__ = ("static", "top", "msgs", "reply", "body", "mark", "dead")
 
     def __init__(self, static: bytes, top: dict, msgs: bytes, body=None):
         self.static, self.top, self.msgs = static, top, bytearray(msgs)
-        self.reply, self.body, self.dead = None, body, None
+        self.reply = self.mark = self.dead = None
+        self.body = body
 
     @property
     def size(self) -> int:
@@ -4116,9 +4134,10 @@ class _Rebuild:
             len(self.reply[1]) if self.reply else 0)
 
     def ready(self) -> bool:
-        """The last request was answered whole: what a ping would carry is the
-        conversation the cache holds."""
-        return self.dead is None and self.body is None and self.reply is not None
+        """No request is awaiting its reply: what a ping would carry is the
+        conversation the cache holds, the last request's messages and no
+        more. It needs no reply; only a continue does (``reply``)."""
+        return self.dead is None and self.body is None
 
 
 def _entry_bytes(entry) -> int:
@@ -4136,9 +4155,34 @@ def _rebuild_kill(rb, why: str) -> None:
     """Under `_affinity_lock`: drop ``rb`` (a `_Rebuild`, or None) under
     ``why``, once, and free what it held."""
     if rb is not None and rb.dead is None:
-        rb.dead, rb.static, rb.reply, rb.body = why, b"", None, None
+        rb.dead, rb.static, rb.reply, rb.body, rb.mark = why, b"", None, None, None
         rb.msgs = bytearray()
         _rebuild_dropped(why)
+
+
+def _held_forget(session: str, why: str):
+    """Under `_affinity_lock`: forget ``session``'s kept body and return it;
+    its rebuild is lost to ``why``, counted."""
+    entry = _affinity_last.pop(session, None)
+    if entry is not None:
+        _rebuild_kill(entry[10], why)
+    return entry
+
+
+def _held_clear(why: str) -> None:
+    """Under `_affinity_lock`: `_held_forget` every session."""
+    for session in list(_affinity_last):
+        _held_forget(session, why)
+
+
+def _affinity_trim() -> None:
+    """Under `_affinity_lock`: past `_AFFINITY_BODY_TOTAL` bytes (bodies and
+    rebuilds) the oldest go."""
+    total = sum(_entry_bytes(v) for v in _affinity_last.values())
+    while total > _AFFINITY_BODY_TOTAL:
+        oldest = next(iter(_affinity_last))
+        total -= _entry_bytes(_affinity_last[oldest])
+        _held_forget(oldest, "over the total cap")
 
 
 def _rebuild_stage(prior, parts, body, why):
@@ -4167,34 +4211,41 @@ def _rebuild_stage(prior, parts, body, why):
         _rebuild_kill(live, "continue does not chain")
         return None
     else:
+        live.mark = (len(live.msgs), live.reply, live.top)
         live.msgs += b"," + live.reply[1] + b"," + b",".join(msgs)
         live.top, live.reply, live.body = top, None, body
-    _rebuild_counts["kept"] += 1
     if live.size > _AFFINITY_BODY_MAX:
         _rebuild_kill(live, "rebuild over the body cap")
         return None
+    _rebuild_counts["kept"] += 1
     return live
 
 
 def _rebuild_settle(rb, body, code: int, message) -> None:
-    """The exchange ``rb`` awaited ended: a 2xx reply relayed whole
-    (``message``, from `_SseReply`) is kept for the next continue to name, and
-    anything else drops the rebuild. A request that superseded ``body`` since
-    owns ``rb`` now."""
+    """The exchange ``rb`` awaited ended. A 2xx reply relayed whole
+    (``message``, from `_SseReply`) is kept for the next continue to name; a
+    cut one is not, and no continue chains to it (the cache still holds the
+    request's messages, so a ping can go out). A 429, 5xx or 400 made no
+    message and moved no thread: a continue is taken back out of the rebuild,
+    and its retry names the same reply. A 404 (the thread is gone: the client
+    replays a create) and a failed create drop it. A request that superseded
+    ``body`` since owns ``rb`` now."""
     reply = None if message is None else _json_bytes(_rebuild_message(
         {"role": "assistant", "content": message[1]}))
     with _affinity_lock:
         if rb.body is not body or rb.dead is not None:
             return
-        rb.body = None
-        if not 200 <= code < 300:
-            _rebuild_kill(rb, "not 2xx")
-        elif reply is None:
-            _rebuild_kill(rb, "reply not complete")
-        else:
-            rb.reply = (message[0], reply)
+        rb.body, mark, rb.mark = None, rb.mark, None
+        if 200 <= code < 300:
+            rb.reply = None if reply is None else (message[0], reply)
             if rb.size > _AFFINITY_BODY_MAX:
                 _rebuild_kill(rb, "rebuild over the body cap")
+            _affinity_trim()
+        elif mark is None or code == 404:
+            _rebuild_kill(rb, "not 2xx")
+        else:
+            n, rb.reply, rb.top = mark
+            del rb.msgs[n:]
 
 
 def _rebuilt_create(static: bytes, top: dict, msgs: bytes) -> dict:
@@ -4284,31 +4335,56 @@ class _SseReply:
         return self._id, [self._blocks[i] for i in sorted(self._blocks)]
 
 
+def _tee_guard(method):
+    """A `_ReplyTee` method that never raises: a failure turns the tee off for
+    the rest of its request and drops the rebuild still awaiting it, counted.
+    The tee is a statistic of the relay, never part of it."""
+    @functools.wraps(method)
+    def guarded(self, *args):
+        if not self._off:
+            try:
+                method(self, *args)
+            except Exception:  # noqa: BLE001
+                self._off = True
+                with contextlib.suppress(Exception), _affinity_lock:
+                    if self._rb.body is self._body:
+                        _rebuild_kill(self._rb, "tee failed")
+    return guarded
+
+
 class _ReplyTee:
     """What `_relay_response` hands the status and every body byte of the
     reply to an armed held request, to rebuild the assistant message the
-    session's next continue builds on (`_SseReply`). ``end`` settles the
-    session's `_Rebuild` with what came of it; a relay that never reached a
-    body (the request was taken back and resent) settles nothing."""
+    session's next continue builds on (`_SseReply`). It settles the session's
+    `_Rebuild` with what came of it: at `message_stop` (the client's next
+    continue may arrive while the relay still waits for the upstream to end
+    the body), else at ``end``, for a stream that never got there. A relay that
+    never reached a body (the request was taken back and resent) settles
+    nothing."""
 
     def __init__(self, rb, body):
         self._rb, self._body = rb, body
         self._code = self._reply = None
+        self._off = False
 
+    @_tee_guard
     def start(self, code: int) -> None:
         self._code = code
         self._reply = _SseReply(_AFFINITY_BODY_MAX) if 200 <= code < 300 else None
 
+    @_tee_guard
     def feed(self, data: bytes) -> None:
         if self._reply is not None:
             self._reply.feed(data)
+            if self._reply.message is not None:
+                self.end()
 
+    @_tee_guard
     def end(self) -> None:
-        code, self._code = self._code, None
+        code, reply, self._code, self._reply = self._code, self._reply, None, None
         if code is not None:
-            with contextlib.suppress(Exception):  # never into the relay's exit
-                _rebuild_settle(self._rb, self._body, code,
-                                self._reply.message if self._reply else None)
+            _rebuild_settle(self._rb, self._body, code,
+                            reply.message if reply else None)
 
 
 def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
@@ -4384,8 +4460,11 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     with _affinity_lock:
         old = _affinity_last.pop(session, None)
         why = why or (None if session in _affinity else "session not bound")
-        rb = _rebuild_stage(old[10] if old else None, parts, body, why
-                            ) if held else None
+        if held:
+            rb = _rebuild_stage(old[10] if old else None, parts, body, why)
+        else:  # a body that is not parsed, or not held, carries no rebuild on
+            rb = None
+            _rebuild_kill(old[10] if old else None, why or "body not held")
         if why:
             dropped = _affinity_captures["dropped"]
             dropped[why] = dropped.get(why, 0) + 1
@@ -4398,10 +4477,8 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
             time.monotonic(), 0, None, path, inject[0] if inject else client,
             form, rb]
         for gone in [x for x in _affinity_last if x not in _affinity]:
-            del _affinity_last[gone]
-        total = sum(_entry_bytes(v) for v in _affinity_last.values())
-        while total > _AFFINITY_BODY_TOTAL:
-            total -= _entry_bytes(_affinity_last.pop(next(iter(_affinity_last))))
+            _held_forget(gone, "session not bound")
+        _affinity_trim()
         return session in _affinity_last
 
 
@@ -4446,7 +4523,7 @@ def _keepalive_refuse(session: str, why: str, entry,
     with _affinity_lock:
         mine = _affinity_last.get(session) is entry
         if mine and drop:
-            del _affinity_last[session]
+            _held_forget(session, why)
         if not mine or entry[6] != why:
             for refused in (_affinity_pings["refused"],
                             _form_stat(_ping_form(entry))["refused"]):
@@ -23622,7 +23699,7 @@ class PinProxy:
         cfg = session_affinity_config(getattr(self, "_certdir", None))
         if cfg is None or self._stop:
             with _affinity_lock:
-                _affinity_last.clear()
+                _held_clear("switched off")
             return False
         now = time.monotonic()
         with _affinity_lock:

@@ -346,6 +346,20 @@ def captured_form(pp):
     return None, None
 
 
+def await_settle(pp, session, wait_s=10):
+    """Wait for ``session``'s rebuild to hold its last reply: the relay settles
+    a reply just after the client has it, and a rebuild still awaiting one is
+    not pinged."""
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        with pp._affinity_lock:
+            e = pp._affinity_last.get(session)
+            if e is not None and e[10] is not None and e[10].ready():
+                return True
+        time.sleep(0.1)
+    return False
+
+
 def measure(pp, proxy, seen, scratch, home, token, form, claude,
             no_ping=False, prompt=PROMPT, thinking_tokens=None):
     cfg = os.environ["CLAUDE_CONFIG_DIR"]
@@ -376,6 +390,9 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude,
         if got != form:
             return rec | {"verdict": "NOT MEASURED",
                           "reason": f"form never captured (got {got})"}
+        if form == "rebuilt" and not await_settle(pp, session):
+            return rec | {"verdict": "NOT MEASURED",
+                          "reason": "the rebuild never settled its last reply"}
         scan1 = scan_transcripts(cfg)
         rec["ping"] = None if no_ping else probe_ping(proxy, session)
         ping_mark = len(seen)  # a 404 before this mark is not the ping's

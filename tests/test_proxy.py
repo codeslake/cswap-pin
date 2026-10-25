@@ -36447,6 +36447,24 @@ class TestTheRebuiltKeepAliveHelpers:
             assert pp._rebuild_message({"role": "user", "content": given}) == {
                 "role": "user", "content": want}, given
 
+    def test_a_message_loses_only_the_breakpoints_the_api_puts_on_blocks(self):
+        from cswap_pin import proxy as pp
+        cc = {"type": "ephemeral", "ttl": "1h"}
+        # a tool call's input and a tool result's payload are the model's and
+        # the tool's data: a key named `cache_control` in them is not one
+        data = {"cache_control": {"x": 1}, "list": [{"cache_control": 2}]}
+        use = {"type": "tool_use", "id": "t", "name": "Edit", "input": data}
+        res = {"type": "tool_result", "tool_use_id": "t",
+               "content": json.dumps(data)}
+        for msg in ({"role": "assistant", "content": [use, {**use, "id": "u"}]},
+                    {"role": "user", "content": [res, {"type": "text", "text": "a"}]}):
+            blocks = [{**b, "cache_control": cc} for b in msg["content"]]
+            got = pp._rebuild_message({**msg, "content": blocks})
+            assert got == msg, got
+        assert pp._rebuild_message({"role": "assistant", "content": [
+            {**use, "cache_control": cc}]}) == {
+            "role": "assistant", "content": [use]}
+
     def test_the_form_is_the_bodys_thread_not_a_header(self):
         from cswap_pin import proxy as pp
         for req in ({"thread": {"type": "create"}},

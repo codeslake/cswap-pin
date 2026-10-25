@@ -1168,20 +1168,25 @@ message breakpoint (`1h`) on its last block, the create's `system` and `tools`
 as they were. It reads 30864 of 30866 tokens at 56 minutes idle with the
 thread gone. The rebuild lives in memory beside the body, under the same
 bounds, and is dropped, counted by reason, when it cannot be the conversation
-the cache holds: a request that is not a 2xx, a `continue` that does not name
-the last reply, a reply cut short, a rebuild over the body cap. A held body
-with no rebuild is refused (`a held thread with no rebuild`), as is a headless
-session's. To read the replies the pin asks the upstream for an uncompressed
-one to an armed held request. It never refreshes, consumes or probes
-a token: an expired stored token is refused. Any answer but a 2xx, a 429 or a
-401 included, is counted and ends that session's pings until its next real
-request; it never reaches the wall, take-back, rest or switch paths. A form no
-sandbox run has measured is refused (`form not measured`). Each ping writes one
-line to `daemon.log`: the slot, the form, the status, `cache_read` and
-`cache_creation`, whether it was a hit, and the reply's `utilization` headers.
-A ping the API refuses writes `error.type`, `error.details.error_code`,
-`error.message` (120 characters, control characters and backticks made
-spaces) and the `request-id` header instead, never the body as received.
+the cache holds: a 404 (the thread is gone), a `continue` that does not name
+the last reply, a rebuild over the body cap, a tee that failed. A `continue`
+the API answered with a 429, a 5xx or a 400 made no message and moved no
+thread: it is taken back out of the rebuild and its retry carries on from the
+turn before. A reply cut short (Esc, a dropped stream) leaves the rebuild
+pingable, since the cache holds the request's messages, but no `continue`
+chains to it. A held body with no rebuild is refused (`a held thread with no
+rebuild`), as is a headless session's. To read the replies the pin asks the
+upstream for an uncompressed one to an armed held request. It never refreshes,
+consumes or probes a token: an expired stored token is refused. Any answer but
+a 2xx, a 429 or a 401 included, is counted and ends that session's pings until
+its next real request; it never reaches the wall, take-back, rest or switch
+paths. A form no sandbox run has measured is refused (`form not measured`).
+Each ping writes one line to `daemon.log`: the slot, the form, the status,
+`cache_read` and `cache_creation`, whether it was a hit, and the reply's
+`utilization` headers. A ping the API refuses writes `error.type`,
+`error.details.error_code`, `error.message` (120 characters, control
+characters and backticks made spaces) and the `request-id` header instead,
+never the body as received.
 
 `/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
 sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
