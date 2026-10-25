@@ -3453,8 +3453,12 @@ _affinity_captures = {"kept": 0, "dropped": {}}
 # "held": a `message-threads-` request whose history the server holds). Step 0,
 # client 2.1.302, P ~= 30.3k: a ping of either form answered 200 with
 # cache_read = P and no cache_creation, and the next real turn went out in the
-# same form with no 404. Not shown: a `thinking_drop` (no thinking block was
-# produced) and the TTL extension after a real idle (`/health` pings `hit` says).
+# same form with no 404. Step 0 pinged with no idle. A held ping is bounded by
+# the server's thread state, not the 1 h cache (T2925: an open turn's thread is
+# gone by 306 s, a closed one lives to 55 min in about half of `cli` sessions
+# and 7% of `sdk-cli` ones), so a headless held body is not pinged. Not shown: a
+# `thinking_drop` (no thinking block was produced) and the TTL extension after a
+# real idle (`/health` pings `hit` says).
 _KEEPALIVE_FORMS: frozenset = frozenset({"full", "held"})
 _KEEPALIVE_MAX_TOKENS = 0
 _KEEPALIVE_TICK_S = 60.0
@@ -3462,6 +3466,7 @@ _KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping
 _KEEPALIVE_MIN_PREFIX = 20000
 _KEEPALIVE_NOT_YET = "not idle long enough"  # cswap's wording; normal, uncounted
 _KEEPALIVE_ELSEWHERE = "sent on another account"
+_KEEPALIVE_HEADLESS = "a headless session's held thread"
 _AFFINITY_SINCE = time.time()
 
 
@@ -4015,6 +4020,17 @@ def _keepalive_form(headers) -> str:
     return "held" if any(
         k.lower() == "anthropic-beta" and "message-threads-" in v
         for k, v in headers) else "full"
+
+
+def _keepalive_headless(headers) -> bool:
+    """Whether the request came from Claude Code's headless entrypoint: the
+    word `sdk-cli` among the parenthesised ones of its user agent, as in
+    `claude-cli/2.1.310 (external, sdk-cli)`."""
+    for k, v in headers:
+        m = re.search(r"\(([^)]*)\)", v) if k.lower() == "user-agent" else None
+        if m and "sdk-cli" in (w.strip() for w in m.group(1).split(",")):
+            return True
+    return False
 
 
 def _affinity_capture(certdir, headers, body: bytes, path: str,
@@ -23297,9 +23313,13 @@ class PinProxy:
                 ok, why = False, "past its cache ttl"
             elif ok and not measured:
                 ok, why = False, "form not measured"
+            elif (ok and _keepalive_form(e[0]) == "held"
+                  and _keepalive_headless(e[0])):  # an exited `claude -p`
+                ok, why = False, _KEEPALIVE_HEADLESS
             if not ok:
                 if why != _KEEPALIVE_NOT_YET:
-                    _keepalive_refuse(session, why, e, not on)
+                    _keepalive_refuse(session, why, e,
+                                      not on or why == _KEEPALIVE_HEADLESS)
             elif fresh:
                 due.append((session, e))
             else:
