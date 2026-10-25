@@ -23395,7 +23395,10 @@ class PinProxy:
                     v = UPSTREAM_HOST
                     sent_host = True
                 if kl == "accept-encoding" and tee is not None:
-                    v = "identity"  # the tee reads plain SSE: gzip or br would need a decoder (br, a dependency) for a reply of a few KB
+                    # identity: the tee reads plain SSE, and decoding gzip or
+                    # br here would take a codec (br, a dependency) for a reply
+                    # of a few KB
+                    v = "identity"
                 out.append(f"{k}: {v}".encode("latin1"))
             if dechunked:
                 out.append(f"Content-Length: {len(body or b'')}".encode("latin1"))
