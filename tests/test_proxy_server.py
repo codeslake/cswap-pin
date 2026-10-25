@@ -26315,6 +26315,65 @@ class TestSessionAffinityOnMessages:
         assert up.bodies_seen == [] and pp._affinity_pings["refused"] == {
             "form not measured": 1}, "a full body sent as held"
 
+    HELD_BETA = "claude-code-20250219,message-threads-2026-08-12"
+    HEADLESS = "a headless session's held thread"
+
+    def case_a_headless_sessions_held_body_is_refused_once_due_and_dropped(
+            self, monkeypatch, certdir):
+        """T2925: the server drops a held thread long before the 1 h cache,
+        and an `sdk-cli` session is a `claude -p` that has exited by then, so
+        a ping answers 404 and buys nothing. Refused only when it would
+        otherwise have been pinged."""
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("held",), beta=self.HELD_BETA,
+                    headers={"user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        self._age(100)
+        with self._pair(certdir) as (proxy, up):
+            proxy._keepalive_tick()
+            assert "S" in pp._affinity_last and pp._affinity_pings["refused"] == {}, (
+                "not due yet: the new reason is not counted early")
+            self._age(3400)
+            proxy._keepalive_tick()
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "no ping goes out"
+        assert "S" not in pp._affinity_last, "dropped: never asked again"
+        assert pp._affinity_pings["refused"] == {self.HEADLESS: 1}
+
+    def case_an_interactive_sessions_held_body_is_still_pinged(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("held",), beta=self.HELD_BETA,
+                    headers={"user-agent": "claude-cli/2.1.309 (external, cli)"})
+        usage = {"cache_read_input_tokens": 250000,
+                 "cache_creation_input_tokens": 0}
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1
+        assert pp._affinity_pings["sent"] == 1 and pp._affinity_pings["refused"] == {}
+
+    def case_a_headless_sessions_full_body_is_still_pinged(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir,
+                    headers={"user-agent": "claude-cli/2.1.310 (external, sdk-cli)"})
+        with self._pair(certdir, reply=self._reply(
+                {"cache_read_input_tokens": 30000})) as (proxy, up):
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1 and pp._affinity_pings["refused"] == {}
+
+    def case_the_headless_gate_matches_the_entrypoint_token_alone(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        for ua in ("claude-cli/2.1.310 (external, sdk-cli, agent-sdk/0.2.1)",
+                   "claude-cli/2.1.310 (external,sdk-cli)"):
+            assert pp._keepalive_headless([("User-Agent", ua)]), ua
+        for ua in ("claude-cli/2.1.309 (external, cli)", "sdk-cli/1.0",
+                   "claude-cli/2.1.310 (external, not-sdk-cli)",
+                   "claude-cli/2.1.310 (external, sdk-cli-x)", "sdk-cli (x"):
+            assert not pp._keepalive_headless([("User-Agent", ua)]), ua
+        assert not pp._keepalive_headless([("X-Other", "(sdk-cli)")])
+        assert not pp._keepalive_headless([])
+
     def case_the_one_shot_returns_the_reply_and_skips_only_the_form_gate(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
