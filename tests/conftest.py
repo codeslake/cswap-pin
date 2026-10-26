@@ -264,7 +264,13 @@ def _redirect_everything_to(tmp_path, monkeypatch):
                  # The standby's hand-down source. Same hazard as the two
                  # LISTEN vars above: a stale value from a shell makes a test
                  # adopt a descriptor that is not the one under test.
-                 "CSWAP_PIN_STANDBY_FROM"):
+                 "CSWAP_PIN_STANDBY_FROM",
+                 # The relocation's opt-in and its marks (T2939): a stale
+                 # RELOCATE from a developer's shell would pull from a
+                 # namespace the case never made, and a stale RELOCATED or
+                 # HANDS_ACROSS would change what `/health` publishes.
+                 "CSWAP_PIN_RELOCATE", "CSWAP_PIN_RELOCATED",
+                 "CSWAP_PIN_HOLDER_HANDS_ACROSS"):
         monkeypatch.delenv(name, raising=False)
 
     store = tmp_path / "data-home"
