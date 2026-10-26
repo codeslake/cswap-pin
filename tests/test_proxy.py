@@ -35649,8 +35649,13 @@ else:
         pp.write_daemon_state(tmp_path, 4321, pid, "fp", handover=True)
         assert due() == 0, "pulled while a handover was in flight"
         pp.write_daemon_state(tmp_path, 4321, os.getpid(), "fp")
-        assert due({**health, "pid": os.getpid()}) == 0, (
-            "pulled a daemon this namespace can see: the arm is directional")
+        # A DAEMON THIS CALLER CAN SEE (T2942) is a pin daemon of this certdir
+        # in ITS ps, not merely a pid that answers `kill 0`.
+        with monkeypatch.context() as m:
+            m.setattr(pp, "_pin_daemon_pids", lambda cd: [os.getpid()])
+            assert due({**health, "pid": os.getpid()}) == 0, (
+                "pulled a daemon this namespace can see: the arm is "
+                "directional")
 
         # THE LAUNCH: nothing asked without the knob, the helper started with
         # it and a daemon that is due, and none for one that already moved.
@@ -35802,6 +35807,9 @@ else:
 
         pp.write_daemon_state(tmp_path, 1, 777777, "fp")
         monkeypatch.setattr(pp, "_pid_alive", lambda pid: False)
+        # THE WINDOW IT WAITS OUT (T2942) IS SHORT HERE: 111 answers for ever.
+        monkeypatch.setattr(pp, "_PORT_WATCH_PROBE_S", 0.05)
+        monkeypatch.setattr(pp, "_PORT_WATCH_CONFIRM_S", 0.1)
         exited = types.SimpleNamespace(pid=111)
         for answering, want in ((777777, 777777), (111, 0), (None, 0)):
             monkeypatch.setattr(pp, "_health_pid",
@@ -35840,12 +35848,120 @@ else:
                 ("answers at once", [777777], 777777, [probe]),
                 ("misses once, then answers", [None, 777777], 777777,
                  [probe, confirm]),
-                ("misses twice: nobody", [None, None], 0, [probe, confirm]),
-                ("another daemon answers: not retried", [111], 0, [probe])):
+                ("misses twice: nobody", [None, None], 0, [probe, confirm])):
             asked.clear()
             answers[:] = script
             assert _Holder()._hand_off_served_by(exited) == want, label
             assert asked == budgets, f"{label}: probed with {asked}"
+
+    @staticmethod
+    def _served_by(pp, tmp_path, monkeypatch, record, steps, alive=()):
+        """`_hand_off_served_by` of a holder whose daemon (pid 111) exited
+        after its socket went to a caller's lineage, with ``proxy.json``
+        naming ``record``. ``steps``: (answer, record written after the probe)
+        for each `/health` probe, the last one repeating; ``alive``: the pids
+        a signal-0 probe sees. Returns the verdict and the timeouts asked."""
+        class _Holder(pp.PortHolder):
+            def __init__(self):
+                self._certdir = tmp_path
+                self.port = 1
+                self._handed_off = True
+
+        asked = []
+
+        def health(port, timeout=1.0):
+            answer, after = steps[min(len(asked), len(steps) - 1)]
+            asked.append(timeout)
+            if after:
+                pp.write_daemon_state(tmp_path, 1, after, "fp")
+            return answer
+
+        pp.write_daemon_state(tmp_path, 1, record, "fp")
+        monkeypatch.setattr(pp, "_pid_alive", lambda pid: pid in alive)
+        monkeypatch.setattr(pp, "_health_pid", health)
+        return _Holder()._hand_off_served_by(types.SimpleNamespace(pid=111)), asked
+
+    # T2942: while the successor lineage hands over to ITS successor both
+    # daemons accept on the port. The new one serves before it publishes its
+    # record, and the old one releases the listener only once it sees that
+    # record, so `/health` can name a pid other than the record's in either
+    # order. Read as "nobody", it respawns a daemon beside the live successor
+    # (`_supervise_locked`): two acceptors. So the record is re-read and the
+    # port re-asked until the answer is the record's pid.
+
+    def case_the_new_successor_answers_while_the_record_names_the_old_one(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 777777,
+            [(888888, 888888), (888888, None)])
+        assert served == 888888, "the record caught up and was not re-read"
+        assert asked == [pp._PORT_WATCH_PROBE_S] * 2
+
+    def case_the_old_successor_answers_after_the_record_names_the_new_one(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 888888, [(777777, None), (888888, None)])
+        assert served == 888888, "the port was not asked again"
+        assert asked == [pp._PORT_WATCH_PROBE_S] * 2
+
+    def case_each_re_read_of_the_record_keeps_its_guards(
+            self, tmp_path, monkeypatch):
+        """A record that comes to name the exited daemon again is a failed
+        hand-off (nobody else serves it), and one that comes to name a pid
+        alive here needs no answer from the port."""
+        from cswap_pin import proxy as pp
+
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 777777, [(888888, 111)])
+        assert (served, len(asked)) == (0, 1)
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 777777, [(888888, 333333)],
+            alive={333333})
+        assert (served, len(asked)) == (333333, 1)
+
+    def case_a_handover_window_that_never_closes_is_nobody_at_the_old_bound(
+            self, tmp_path, monkeypatch):
+        """The wall is no longer than before: `_PORT_WATCH_PROBE_S` +
+        `_PORT_WATCH_CONFIRM_S`, here 0.9 s."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_PORT_WATCH_PROBE_S", 0.3)
+        monkeypatch.setattr(pp, "_PORT_WATCH_CONFIRM_S", 0.6)
+        began = time.monotonic()
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 888888, [(777777, None)])
+        wall = time.monotonic() - began
+        assert served == 0
+        assert len(asked) > 1, "another pid's answer was not asked again"
+        assert 0.9 <= wall < 1.9, f"gave up after {wall:.2f}s, not at 0.9s"
+
+    def case_a_host_pid_that_collides_with_a_live_unrelated_pid_is_still_pulled(
+            self, tmp_path, monkeypatch):
+        """T2942: the opt-in arm took "the recorded pid is not alive here" for
+        "this namespace cannot see the daemon". A host pid that collides with
+        a live, unrelated pid in the caller's namespace reads alive, and the
+        pull silently did not happen. The arm asks the caller's own ps
+        instead (`_pin_daemon_pids`): no pin daemon of this certdir by that
+        pid is a daemon it cannot see, and `/health` (it answered as that pid)
+        still decides whether it may be pulled."""
+        from cswap_pin import proxy as pp
+
+        me = os.getpid()                # alive here, and no pin daemon
+        pp.write_daemon_state(tmp_path, 4321, me, "fp")
+        health = {"pid": me, "code_watch_age_s": 1.0, "relocated": False}
+        monkeypatch.setattr(
+            pp, "_keychain_denied_here", lambda confirm=True: False)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [])
+        monkeypatch.setenv(pp._RELOCATE_ENV, "1")
+        assert pp._relocation_is_due(tmp_path, health, confirm=False) == me, (
+            "a colliding live pid hid the daemon from the pull")
+        assert pp._relocation_is_due(
+            tmp_path, {**health, "relocated": True}, confirm=False) == 0, (
+            "the colliding pid's `/health` word no longer decides")
 
     def case_health_says_whether_the_lineage_moved_only_under_a_holder_that_can_hand_it_across(
             self, tmp_path, monkeypatch):
