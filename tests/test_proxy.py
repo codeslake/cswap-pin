@@ -35104,8 +35104,7 @@ else:
             return out, list(calls)
 
         me = os.getpid()
-        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
-        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        # A live successor is a pin daemon in the holder's ps (T2948).
         monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         for code in (0, pp._RESTART_ME_CODE, -9):
             assert run(True, me, code) == ("return", ["stop"]), (
@@ -35181,8 +35180,7 @@ else:
             return list(signalled), h._standby
 
         me = os.getpid()
-        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
-        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        # A live successor is a pin daemon in the holder's ps (T2948).
         monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         sent, standby = run(True, me)
         assert sent == [signal.SIGHUP] and standby is None, (
@@ -35260,8 +35258,7 @@ else:
             return [e for e in log if e != "probe"], "probe" in log, h._handed_off
 
         me = os.getpid()
-        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
-        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        # A live successor is a pin daemon in the holder's ps (T2948).
         monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         assert run(True, me) == ([], False, True), (
             "the port-watch probed or replaced the daemon of a confirmed "
