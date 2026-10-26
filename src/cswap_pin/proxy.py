@@ -19620,7 +19620,9 @@ class PinProxy:
         (`_carry_out`): this generation forgets them once `_stop` is set, and
         the successor of a holder or of a relocation has published by now.
         Still accepting meanwhile, so the short send stalls no one; with no
-        successor on a carry socket it costs nothing.
+        successor on a carry socket it costs nothing. The hand-down arm
+        (``hand_down``) releases BEFORE its successor is spawned, so nothing
+        listens yet and that arm carries nothing: its bodies are dropped.
         """
         if not self._stop and _affinity_last:
             with contextlib.suppress(Exception):  # a carry never costs the release
