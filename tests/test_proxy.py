@@ -35659,8 +35659,12 @@ else:
             lambda port, timeout=1.0: asked.append(port) or health)
         monkeypatch.delenv(pp._RELOCATE_ENV)
         assert pp._move_into_this_lineage(tmp_path, "2", self.EMAIL, 4321) == 4321
-        assert not asked and not started, (
-            "a launch with no knob asked or started something off macOS")
+        # A Mac asks /health on every launch (the Keychain path) and, told
+        # nothing is denied, starts nothing; off macOS it asks nothing.
+        assert asked == ([4321] if sys.platform == "darwin" else []), (
+            f"a launch with no knob asked {asked} on {sys.platform}")
+        assert not started, "a launch with no knob started a helper"
+        asked.clear()
         monkeypatch.setenv(pp._RELOCATE_ENV, "1")
         health["relocated"] = True
         assert pp._move_into_this_lineage(tmp_path, "2", self.EMAIL, 4321) == 4321
