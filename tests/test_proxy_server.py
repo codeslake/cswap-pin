@@ -27524,9 +27524,11 @@ class TestSessionAffinityOnMessages:
             release = gen2.release_listener
             gen2.release_listener = lambda hand_down=False: (
                 order.append("release"), release(hand_down))[1]
+            pp._affinity_snap["at"] = float("-inf")  # gen2 lands only when told
             PinProxy(certdir=certdir, pin_token_provider=lambda: None
                      ).release_listener()  # gen1, asked by the holder
             pp._affinity_last.clear()  # gen1 is gone: gen2 lands what it sent
+            pp._affinity_snap["at"] = time.monotonic()
             end = time.monotonic() + 5
             while not pp._affinity_carry["landed"] and time.monotonic() < end:
                 time.sleep(0.02)
