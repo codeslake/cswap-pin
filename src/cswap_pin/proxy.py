@@ -17413,6 +17413,10 @@ def _resume_serving(server) -> bool:
     """
     try:
         server._stop = False
+        # SERVING AGAIN OWES NO SUCCESSOR ANYTHING: a hand-down whose spawn
+        # failed left this set, and the sender's switch-off then waited on a
+        # carry that is never coming.
+        server._carry_owed = False
         server.start()
     except Exception as exc:  # noqa: BLE001 — the caller has a fallback
         _log_lifecycle(f"could not resume serving: {exc!r}")
@@ -18843,21 +18847,19 @@ class PinProxy:
             return
         path = Path(certdir) / f"{_CARRY_SOCK_PREFIX}{os.getpid()}.sock"
         srv = socket.socket(socket.AF_UNIX)
-        # BOUND UNDER UMASK 0o177, so the file is born 0600 and no other user
-        # can connect in between. The umask is the process's: a file another
-        # thread creates inside the bind's microseconds is born 0600 too, never
-        # wider.
-        umask = os.umask(0o177)
+        # NO UMASK: it is the process's, and a directory another thread creates
+        # while it is narrowed is born unusable. Connecting needs write on the
+        # file, which the usual umask already denies to others, and the
+        # certdir sits under the user's own tree.
         try:
             path.unlink(missing_ok=True)
             srv.bind(str(path))
+            path.chmod(0o600)
             srv.listen(1)
             ino = path.stat().st_ino
         except OSError:
             srv.close()
             return
-        finally:
-            os.umask(umask)
         self._carry_in_path, self._carry_in_srv = path, srv
         self._carry_in_thread = threading.Thread(
             target=self._carry_in_held, args=(srv, path, ino), daemon=True)

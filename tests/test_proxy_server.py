@@ -27551,6 +27551,29 @@ class TestSessionAffinityOnMessages:
             gen2._keepalive_tick()
             assert not pp._affinity_last, "bodies kept once the carry is over"
 
+    def case_a_failed_spawn_owes_nothing_so_a_later_switch_off_still_clears(
+            self, monkeypatch, certdir):
+        """The hand-down arm marks the bodies owed to the successor it is about
+        to spawn. When that spawn fails the daemon resumes serving with nothing
+        owed: left set, a switch-off hit the owed branch of every tick and the
+        sender never cleared the bodies nor ended."""
+        from cswap_pin import proxy as pp
+        seen = self._armed(monkeypatch, certdir, forms=("full",))
+        for env in (pp._HELD_BY_ENV, pp._SELF_HEAL_ENV):
+            monkeypatch.delenv(env, raising=False)
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        monkeypatch.setattr(pp, "_spawn_daemon", lambda *a, **k: None)
+        with self._pair(certdir, started=True) as (proxy, _):
+            pp._watch_own_code(
+                proxy, "1", self.EMAIL.format("1"), certdir, threading.Event(),
+                lambda *a: None, interval=0.01, _own_fingerprint="never-matches")
+            assert not proxy._stop and "S" in pp._affinity_last, (
+                "premise: the failed spawn resumed serving with its bodies")
+            seen.loaded.cache_aware = False
+            pp._AFFINITY_CACHE.clear()
+            assert proxy._keepalive_tick() is False, "the sender never ends"
+            assert not pp._affinity_last, "a stale debt kept the bodies up"
+
     def case_a_released_process_takes_no_carry_and_a_sender_picks_its_target(
             self, monkeypatch, certdir):
         """A process that released its listener is no longer the server, and
