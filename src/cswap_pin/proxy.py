@@ -18821,10 +18821,11 @@ class PinProxy:
         the OS refuses (over 107 bytes, a read-only directory) carries nothing
         in, and the bodies are dropped as they always were."""
         t = getattr(self, "_carry_in_thread", None)
+        certdir = getattr(self, "_certdir", None)  # a stub proxy has none
         if (t is not None and t.is_alive()
-                or session_affinity_config(self._certdir) is None):
+                or session_affinity_config(certdir) is None):
             return
-        path = Path(self._certdir) / f"{_CARRY_SOCK_PREFIX}{os.getpid()}.sock"
+        path = Path(certdir) / f"{_CARRY_SOCK_PREFIX}{os.getpid()}.sock"
         srv = socket.socket(socket.AF_UNIX)
         try:
             path.unlink(missing_ok=True)
