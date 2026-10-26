@@ -35104,6 +35104,9 @@ else:
             return out, list(calls)
 
         me = os.getpid()
+        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
+        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         for code in (0, pp._RESTART_ME_CODE, -9):
             assert run(True, me, code) == ("return", ["stop"]), (
                 f"exit {code} after a hand-off with a live successor on "
@@ -35178,6 +35181,9 @@ else:
             return list(signalled), h._standby
 
         me = os.getpid()
+        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
+        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         sent, standby = run(True, me)
         assert sent == [signal.SIGHUP] and standby is None, (
             f"the standby was not released during the drain: {sent}")
@@ -35254,6 +35260,9 @@ else:
             return [e for e in log if e != "probe"], "probe" in log, h._handed_off
 
         me = os.getpid()
+        # A LIVE SUCCESSOR IS A PIN DAEMON OF THIS CERTDIR IN THE HOLDER'S ps
+        # (T2948), not any pid that answers `kill 0`: this process stands in.
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
         assert run(True, me) == ([], False, True), (
             "the port-watch probed or replaced the daemon of a confirmed "
             "hand-off, or reset its flag")
@@ -35932,12 +35941,15 @@ else:
             assert asked == budgets, f"{label}: probed with {asked}"
 
     @staticmethod
-    def _served_by(pp, tmp_path, monkeypatch, record, steps, alive=()):
+    def _served_by(pp, tmp_path, monkeypatch, record, steps, alive=(),
+                   daemons=None):
         """`_hand_off_served_by` of a holder whose daemon (pid 111) exited
         after its socket went to a caller's lineage, with ``proxy.json``
         naming ``record``. ``steps``: (answer, record written after the probe)
         for each `/health` probe, the last one repeating; ``alive``: the pids
-        a signal-0 probe sees. Returns the verdict and the timeouts asked."""
+        a signal-0 probe sees, ``daemons``: the pin daemons of this certdir
+        in the holder's ps (default: those same pids). Returns the verdict
+        and the timeouts asked."""
         class _Holder(pp.PortHolder):
             def __init__(self):
                 self._certdir = tmp_path
@@ -35955,6 +35967,8 @@ else:
 
         pp.write_daemon_state(tmp_path, 1, record, "fp")
         monkeypatch.setattr(pp, "_pid_alive", lambda pid: pid in alive)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: list(
+            alive if daemons is None else daemons))
         monkeypatch.setattr(pp, "_health_pid", health)
         return _Holder()._hand_off_served_by(types.SimpleNamespace(pid=111)), asked
 
@@ -35999,6 +36013,33 @@ else:
             pp, tmp_path, monkeypatch, 777777, [(888888, 333333)],
             alive={333333})
         assert (served, len(asked)) == (333333, 1)
+
+    def case_a_successor_pid_that_collides_with_a_live_unrelated_pid_is_asked_of_the_port(
+            self, tmp_path, monkeypatch):
+        """T2948: the record's pid came from another pid namespace, where a
+        successor that has since died can share its number with an unrelated
+        live process here. `kill 0` answering is not "the successor lives":
+        the shortcut stood the holder down with nobody serving the port, an
+        outage until the next `--ensure`. It needs a pin daemon of this
+        certdir in the holder's own ps; else the port is asked, and a port
+        that stays silent is nobody."""
+        from cswap_pin import proxy as pp
+
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 333333, [(None, None)],
+            alive={333333}, daemons=())
+        assert served == 0, "a colliding live pid stood the holder down"
+        assert asked == [pp._PORT_WATCH_PROBE_S, pp._PORT_WATCH_CONFIRM_S]
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 333333, [(333333, None)],
+            alive={333333}, daemons=())
+        assert (served, len(asked)) == (333333, 1), (
+            "the successor answering as the record's pid is still served by")
+        served, asked = self._served_by(
+            pp, tmp_path, monkeypatch, 333333, [(None, None)],
+            alive={333333}, daemons=(333333, 5))
+        assert (served, len(asked)) == (333333, 0), (
+            "a pin daemon of this certdir in this ps needs no answer")
 
     def case_a_handover_window_that_never_closes_is_nobody_at_the_old_bound(
             self, tmp_path, monkeypatch):
