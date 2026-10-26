@@ -2261,7 +2261,10 @@ class _LoopbackConnectProxy:
             self.connects += 1
             buf = b""
             while b"\r\n\r\n" not in buf:
-                buf += conn.recv(1)
+                d = conn.recv(1)
+                if not d:
+                    return
+                buf += d
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             # blind-pipe both directions
@@ -2293,6 +2296,17 @@ class TestLoopbackChainTrust:
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
+
+    def case_a_chain_stopped_before_any_connect_ends_its_thread(self):
+        """`stop()` wakes the accept with a connect that closes at once. The
+        helper's head read took that EOF for "more later" and spun on `recv`
+        for the rest of the process, a core each (T2951: two of them burnt 55.6
+        s and 24.8 s of CPU in one file run, starving every real-socket timing
+        case after them)."""
+        chain = _LoopbackConnectProxy(("127.0.0.1", 9))
+        chain.stop()
+        assert not chain._thr.is_alive(), (
+            "the stopped chain's thread is still running")
 
     def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
@@ -4985,6 +4999,7 @@ class TestChainRediscovery:
         this). That path also fell through to `egress REFUSED` with no hop
         reason above it.
         """
+        monkeypatch.setattr("cswap_pin.proxy._TUNNEL_EOF_WINDOW_MS", 2000)
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
@@ -5005,6 +5020,7 @@ class TestChainRediscovery:
                             break
                         seen += d
                     c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    time.sleep(0.05)  # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -15659,6 +15675,7 @@ class TestOptimisticConnectIsDetected:
                             break
                         buf += d
                     c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    time.sleep(0.05)   # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -15683,6 +15700,10 @@ class TestOptimisticConnectIsDetected:
         """
         import cswap_pin.proxy as pp
 
+        # The chain's FIN trails its 200 by a scheduling gap. The pin's EOF
+        # window (a named 5 ms shortcut, T2157) is not this case's to race:
+        # it waits for the FIN, which ends the poll the moment it lands.
+        monkeypatch.setattr(pp, "_TUNNEL_EOF_WINDOW_MS", 2000)
         chain = self._optimistic_chain()
 
         peer = socket.socket()
