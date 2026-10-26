@@ -1375,7 +1375,8 @@ tunnels, so the **socket** moves instead.
   It is **directional**: only the side with the knob pulls, and only a pid it
   cannot see. One `/health` field, `"relocated"`, decides. It is published
   only by a daemon whose own holder runs this code (the holder marks the
-  daemons it starts with its pid, and a daemon under an older holder carries
+  daemons it starts with its pid in `CSWAP_PIN_HOLDER_HANDS_ACROSS`, an
+  internal mark and not a setting, and a daemon under an older holder carries
   no mark), so ABSENT refuses (the holder cannot hand across namespaces),
   `true` refuses (this lineage was already moved, the ping-pong backstop) and
   `false` allows the pull. A daemon outside the helper's namespace cannot
