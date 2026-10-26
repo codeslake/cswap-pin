@@ -13,6 +13,7 @@ import http.client
 import io
 import json
 import math
+import os
 import types
 import pathlib
 import re
@@ -27354,7 +27355,9 @@ class TestSessionAffinityOnMessages:
         usage = {"cache_read_input_tokens": 30000,
                  "cache_creation_input_tokens": 0}
         with self._pair(certdir, reply=self._reply(usage)) as (succ, up):
+            umask = os.umask(0o022)
             succ._carry_in_held_start()
+            assert os.umask(umask) == 0o022, "the bind left the umask changed"
             sock = succ._carry_in_path
             assert stat.S_IMODE(sock.stat().st_mode) == 0o600, sock.stat()
             assert len(str(sock)) < 107, sock
@@ -27467,6 +27470,132 @@ class TestSessionAffinityOnMessages:
             stuck.close()
         assert proxy._stop and pp._affinity_carry["sent"] == 0
 
+    @staticmethod
+    def _carry_sink(certdir, pid, mtime=None):
+        """A stand-in successor: listens on `.carry-<pid>.sock` and collects
+        the lines one connection sends. Returns (listener, lines, thread)."""
+        path = certdir / f".carry-{pid}.sock"
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(str(path))
+        srv.listen(1)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        got = []
+
+        def serve():
+            try:
+                conn = srv.accept()[0]
+            except OSError:
+                return
+            with conn, conn.makefile("rb") as f:
+                got.extend(f)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return srv, got, t
+
+    def case_a_deploy_carries_the_bodies_across_both_handovers(
+            self, monkeypatch, certdir):
+        """A fleet deploy is two handovers. The holder ask: gen1 releases its
+        listener to gen2, which the holder spawned and which has bound its carry
+        socket. Then gen2's watchdog finds the holder on old code, retires it,
+        and is an orphan: the hand-down arm releases BEFORE its successor
+        exists, so nobody listens until `_spawn_daemon` returns. It carries
+        then, to the process it spawned, and a sender tick that falls in the
+        spawn's wait (a minute apart) must not drop the bodies first."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        self._armed(monkeypatch, certdir, forms=("full",))
+        for env in (pp._HELD_BY_ENV, pp._SELF_HEAL_ENV):
+            monkeypatch.delenv(env, raising=False)
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        order, gen3 = [], {}
+
+        def spawn(account_num, email, cdir, listen_fd=None):
+            order.append("spawn")
+            gen2._keepalive_tick()
+            gen3["held"] = "S" in pp._affinity_last
+            gen3["sink"] = self._carry_sink(cdir, 424242)
+            pp.write_daemon_state(cdir, 1234, 424242, pp._OWN_FINGERPRINT,
+                                  ungated=True)
+            return 1234
+
+        with self._pair(certdir, started=True) as (gen2, _):
+            release = gen2.release_listener
+            gen2.release_listener = lambda hand_down=False: (
+                order.append("release"), release(hand_down))[1]
+            PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                     ).release_listener()  # gen1, asked by the holder
+            pp._affinity_last.clear()  # gen1 is gone: gen2 lands what it sent
+            end = time.monotonic() + 5
+            while not pp._affinity_carry["landed"] and time.monotonic() < end:
+                time.sleep(0.02)
+            assert pp._affinity_carry == {"sent": 1, "landed": 1}, pp._affinity_carry
+            assert "S" in pp._affinity_last
+            monkeypatch.setattr(pp, "_spawn_daemon", spawn)
+            pp._watch_own_code(
+                gen2, "1", self.EMAIL.format("1"), certdir, threading.Event(),
+                lambda *a: None, interval=0.01, _own_fingerprint="never-matches")
+            with contextlib.suppress(OSError, TypeError):
+                os.close(gen2._handed_fd)  # the fd a real successor inherits
+            srv, got, t = gen3["sink"]
+            t.join(5)
+            srv.close()
+            assert order == ["release", "spawn"], order
+            assert gen3["held"], "a tick in the spawn's wait dropped the bodies"
+            assert len(got) == 1 and json.loads(got[0])["s"] == "S", (
+                "the hand-down arm carried nothing to its successor", got)
+            assert pp._affinity_carry == {"sent": 2, "landed": 1}, pp._affinity_carry
+            gen2._keepalive_tick()
+            assert not pp._affinity_last, "bodies kept once the carry is over"
+
+    def case_a_released_process_takes_no_carry_and_a_sender_picks_its_target(
+            self, monkeypatch, certdir):
+        """A process that released its listener is no longer the server, and
+        one that listened for five minutes on its carry socket was a target a
+        later handover could hand the bodies to. The sender goes to the
+        process `proxy.json` names, else the newest socket, never the first
+        of the sorted names."""
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("full",))
+        with self._pair(certdir, started=True) as (draining, _):
+            sock = draining._carry_in_path
+            assert sock.exists()
+            draining.release_listener()
+            assert not sock.exists(), "a released process kept its carry socket"
+            probe = socket.socket(socket.AF_UNIX)
+            with pytest.raises(OSError):
+                probe.connect(str(sock))
+            probe.close()
+        for named, want in ((None, 222), (111, 111)):
+            if named:
+                pp.write_daemon_state(certdir, 1234, named, "fp", ungated=True)
+            sinks = {pid: self._carry_sink(certdir, pid, time.time() - age)
+                     for pid, age in ((111, 60), (222, 0))}
+            try:
+                assert pp._carry_out(certdir) == 1
+                sinks[want][2].join(5)
+                assert [len(sinks[p][1]) for p in sinks] == [
+                    int(p == want) for p in sinks], (named, sinks)
+            finally:
+                for pid, (srv, _, _) in sinks.items():
+                    srv.close()
+                    (certdir / f".carry-{pid}.sock").unlink(missing_ok=True)
+
+    def case_a_carried_body_is_decoded_outside_the_affinity_lock(
+            self, monkeypatch, certdir):
+        """The request path waits on `_affinity_lock`: turning up to 256 MB of
+        rows back into bytes under it stalls every request for as long."""
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("full",))
+        (line,) = pp._carry_lines()
+        pp._affinity_last.clear()
+        held, real = [], pp._carry_bytes
+        monkeypatch.setattr(pp, "_carry_bytes", lambda s: (
+            held.append(pp._affinity_lock.locked()), real(s))[1])
+        assert pp._carry_land([json.loads(line)]) == 1
+        assert held == [False], held
+
     def case_a_slot_is_refused_as_not_kept_only_once_the_session_is_due(
             self, monkeypatch, certdir):
         """The due rule asks `slot_kept` before idle, so the counter held every
@@ -27503,6 +27632,21 @@ class TestSessionAffinityOnMessages:
             (line,) = [l for l in seen.logs if "is not kept" in l]
             assert f"slot {slot} is not kept" in line and why in line, line
             assert up.bodies_seen == [] and "session S" not in line
+        # A session whose pings are spent, or whose prefix is too small, needs
+        # no ping on any slot: it keeps its own reason, and the slot is never
+        # named for it (cswap's rule asks the slot first; this one asks last).
+        for field, value, reason in (
+                (5, 2, "pings since its last request are spent"),
+                (3, 100, "its prefix is too small to pay")):
+            seen = self._armed(monkeypatch, certdir, forms=("full",))
+            pp._affinity_kept.pop(self.IDENT)
+            self._age(3400)
+            pp._affinity_last["S"][field] = value
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+            assert pp._affinity_pings["refused"] == {reason: 1}, (
+                reason, pp._affinity_pings)
+            assert not [l for l in seen.logs if "is not kept" in l], seen.logs
 
     def case_a_body_sent_on_another_slot_than_the_binding_is_not_pinged(
             self, monkeypatch, certdir):
