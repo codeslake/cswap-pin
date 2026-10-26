@@ -1123,7 +1123,17 @@ conversation) in `affinity-carry.json` beside `proxy.json`, written by the
 running daemon at most every 5 s while armed, and the successor lands them with
 its first snapshot, so a session inside the cache time keeps its account across
 the handover; the first release to carry them hands over cold, since the
-predecessor writes none.
+predecessor writes none. The kept bodies (see Keep-alive) cross a handover in
+memory only, never through a file: for five minutes after it starts, the
+successor listens on `.carry-<pid>.sock` (mode 0600) beside `proxy.json`, and
+the predecessor, as it releases its listener, sends over it each `full` body
+and each `held` one whose rebuild is ready, as the slot they went out on (never
+a token; an `x-api-key` header keeps its name and loses its value) and the idle
+clock as wall time. The successor lands one for a session it has bound to that
+slot and holds no body of, when its snapshot keeps the slot, on its own token
+for the slot, and starts its sender. A successor that is not there, or slow,
+gets nothing: the send stops at five seconds and the bodies are dropped, as
+they were before this, so a release is never held up longer than that.
 
 A snapshot older than two minutes is still used for a slot it read at least 10
 points under its bar (the slot's own switch threshold, else the engine's), for
@@ -1197,12 +1207,16 @@ sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
 counts 0 until a ping measures it) and `ttl_left_min_s` (the kept body's own
 clock where there is one, else the binding's); `pings` (`sent`, `hit`,
 `refused` by reason, each reason counted once per request; a session not idle
-long enough yet is the normal state and is not counted; `cost`, the `input`,
+long enough yet is the normal state and is not counted, and nor is one whose
+slot is not kept until it is idle long enough (one that is due and refused for
+it is, and `daemon.log` says the slot and why, once a minute at most per slot
+and reason); `cost`, the `input`,
 `cache_read`, `cache_creation` and `output` tokens the answered pings used; and
 `forms`, the same four per ping form, `full` and `rebuilt`: `hit` over `sent`
 of `rebuilt` is what a held session's keep-alive achieves); `rebuilds` (`kept`,
-the held requests a rebuild took in, and `dropped` by reason);
-`snapshot` (`age_s`, `last_rebuild_ms`, `failures`); `captures` (`kept`,
+the held requests a rebuild took in, and `dropped` by reason); `carry`
+(`sent`, `landed`: kept bodies sent to a successor and landed from a
+predecessor, since this process started); `snapshot` (`age_s`, `last_rebuild_ms`, `failures`); `captures` (`kept`,
 and `dropped` by reason, for main-thread requests; a subagent's, and one with
 no `cache_control` at all, are neither); and `since`, when this process started
 counting. Never a session id or a byte of a

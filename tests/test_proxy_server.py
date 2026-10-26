@@ -24175,6 +24175,7 @@ class TestSessionAffinityOnMessages:
         pp._rebuild_counts.update(kept=0)
         pp._rebuild_counts["dropped"].clear()
         pp._form_pings.clear()
+        pp._affinity_carry.update(sent=0, landed=0)
         # ARMED THE WAY CSWAP ARMS IT: dynamic + cache_aware. The CI host's
         # claude-swap has no `cache_aware` and turns `dynamic` into `best`, so
         # the loaded settings are faked; `seen.loaded` is what a case flips.
@@ -25956,6 +25957,7 @@ class TestSessionAffinityOnMessages:
         assert got["pings"] == shape, got
         assert got["captures"] == {"kept": 0, "dropped": {}}, got
         assert got["rebuilds"] == {"kept": 0, "dropped": {}}, got
+        assert got["carry"] == {"sent": 0, "landed": 0}, got
         since = dt.datetime.strptime(got["since"], "%Y-%m-%dT%H:%M:%SZ")
         assert since <= dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
@@ -27317,6 +27319,190 @@ class TestSessionAffinityOnMessages:
             thread.join(5)
             assert not thread.is_alive(), "a released generation kept pinging"
             assert not pp._affinity_last, "it kept the bodies it no longer serves"
+
+    def case_a_handover_carries_the_kept_bodies_memory_to_memory(
+            self, monkeypatch, certdir):
+        """A session idle across a handover kept no body in the successor: a
+        held one was refused `a held thread with no rebuild`, a full one had
+        no entry. The predecessor sends its `full` bodies and its held ones
+        with a ready rebuild over a unix socket the successor listens on, as
+        the slot they went out on (never a bearer, no `x-api-key` value) and
+        the idle clock as wall time. The successor lands them for sessions it
+        has not captured itself, on ITS token for the slot, and starts its
+        sender. The conversation is written nowhere and logged nowhere."""
+        import stat
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        marker = "BODY-MARKER-9c1e7f"
+        seen = self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS",
+                            frozenset({"full", "rebuilt"}))
+        self._turns(certdir, [self._held({"type": "create"}, "list " + marker)],
+                    [self._sse("msg_1", [{"type": "text", "text": "ok " + marker}])],
+                    session="H")
+        for session, extra in (("F", {"x-api-key": "tok-A"}), ("C", {})):
+            self._send(certdir, [self._call(session, **extra)],
+                       body=self._body(pad=90000, tail=marker + session))
+        for session in "HFC":
+            pp._affinity[session] = ("tok-A", time.monotonic() - 3400)
+            pp._affinity_last[session][4] = time.monotonic() - 3400
+        assert {s: e[9] for s, e in pp._affinity_last.items()} == {
+            "H": "held", "F": "full", "C": "full"}
+        lines = list(pp._carry_lines())
+        assert len(lines) == 3 and all(marker.encode() in l for l in lines)
+        assert not any(b"tok-" in l for l in lines), "a bearer is on the wire"
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+        with self._pair(certdir, reply=self._reply(usage)) as (succ, up):
+            succ._carry_in_held_start()
+            sock = succ._carry_in_path
+            assert stat.S_IMODE(sock.stat().st_mode) == 0o600, sock.stat()
+            assert len(str(sock)) < 107, sock
+            # the successor's first snapshot has not landed: the bodies wait
+            pp._affinity_snap["at"] = float("-inf")
+            started = time.monotonic()
+            PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                     ).release_listener()
+            assert time.monotonic() - started < 2, "the carry held up the release"
+            assert pp._affinity_carry == {"sent": 3, "landed": 0}, pp._affinity_carry
+            # the predecessor is gone: what is left is a new process's own
+            # tables, its token for the slot the rotated one, and a capture of
+            # its own for `C`
+            pp._affinity_last.clear()
+            pp._affinity_idents.clear()
+            pp._affinity_idents["tok-A2"] = self.IDENT
+            pp._affinity_kept[self.IDENT] = (
+                "tok-A2", *pp._affinity_kept[self.IDENT][1:])
+            for session in "HFC":
+                pp._affinity[session] = ("tok-A2", time.monotonic() - 3400)
+            own = [[], b"own", 3600.0, 22500, time.monotonic(), 0, None,
+                   "/v1/messages", "tok-A2", "full", None, None]
+            pp._affinity_last["C"] = own
+            pp._affinity_snap["at"] = time.monotonic()
+            end = time.monotonic() + 5
+            while pp._affinity_carry["landed"] < 2 and time.monotonic() < end:
+                time.sleep(0.02)
+            assert pp._affinity_carry == {"sent": 3, "landed": 2}, pp._affinity_carry
+            assert pp._affinity_last["C"] is own, "its own capture lost"
+            assert not sock.exists(), "the carry socket outlived the carry"
+            for session, form in (("H", "held"), ("F", "full")):
+                e = pp._affinity_last[session]
+                assert e[9] == form and e[8] == "tok-A2", (session, e[8], e[9])
+                assert 3399 < time.monotonic() - e[4] < 3430, "the idle clock"
+                assert (e[10] is not None and e[10].ready()) == (form == "held")
+                assert not any(k.lower() == "authorization" for k, _ in e[0])
+                assert {v for k, v in e[0] if k.lower() == "x-api-key"} <= {""}
+            assert succ._keepalive_thread.is_alive(), "no sender for the bodies"
+            succ._keepalive_tick()
+            assert len(up.bodies_seen) == 2, "one ping for each carried body"
+            held, full = sorted(up.bodies_seen, key=lambda b: b'"thread"' not in b)
+            assert json.loads(held)["thread"] == {"type": "create"}
+            assert marker.encode() in held and (marker + "F").encode() in full
+            assert json.loads(full)["max_tokens"] == 0
+            creds = sorted(map(self._creds, up.heads_seen), key=len)
+            assert creds == [{"authorization": "Bearer tok-A2"},
+                             {"authorization": "Bearer tok-A2",
+                              "x-api-key": "tok-A2"}], (
+                "the ping is on the successor's token, as the client sent it", creds)
+            assert self._health(certdir)["carry"] == {"sent": 3, "landed": 2}
+            succ._trace_tick_stop.set()
+            succ._keepalive_thread.join(5)
+        roots = {certdir.parent}
+        if str(Path.home()).startswith(tempfile.gettempdir()):
+            roots.add(Path.home())  # the suite runs under a scratch HOME
+        for root in roots:
+            for f in root.rglob("*"):
+                assert not f.is_file() or marker.encode() not in f.read_bytes(), (
+                    "the conversation was written to", f)
+        assert not any(marker in l for l in seen.logs), "the conversation was logged"
+        assert any("carried 3 kept" in l for l in seen.logs), seen.logs
+
+    def case_a_carried_body_lands_only_where_the_successor_can_ping_it(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._armed(monkeypatch, certdir, forms=("full",))
+        (line,) = pp._carry_lines()
+        row = json.loads(line)
+        pp._affinity_last.clear()
+        gone = dict(row, i=["9", "gone@example.com"])
+        cold = dict(row, w=row["w"] - 4000)
+        elsewhere = dict(row, i=["2", self.EMAIL.format("2")])
+        for why, r in (("a slot the successor does not keep", gone),
+                       ("a body past its ttl", cold),
+                       ("a session bound to another slot", elsewhere)):
+            assert pp._carry_land([r]) == 0 and not pp._affinity_last, why
+        del pp._affinity["S"]
+        assert pp._carry_land([row]) == 0, "a session the successor never bound"
+        pp._affinity["S"] = ("tok-A", time.monotonic())
+        assert pp._carry_land([row, {"junk": 1}]) == 1
+        assert pp._affinity_last["S"][8] == "tok-A"
+
+    def case_an_unreachable_or_stalled_successor_does_not_hold_up_the_release(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        self._armed(monkeypatch, certdir, forms=("full",),
+                    body=self._body(pad=1500000))
+        monkeypatch.setattr(pp, "_CARRY_OUT_S", 0.5)
+        end = time.monotonic() + 3  # the request's pin, stopped, ends its listener
+        while list(certdir.glob(".carry-*.sock")) and time.monotonic() < end:
+            time.sleep(0.02)
+        dead = socket.socket(socket.AF_UNIX)  # a successor that died: its file stays
+        dead.bind(str(certdir / ".carry-1.sock"))
+        dead.close()
+        started = time.monotonic()
+        PinProxy(certdir=certdir, pin_token_provider=lambda: None
+                 ).release_listener()
+        assert time.monotonic() - started < 1, "a dead socket held up the release"
+        (certdir / ".carry-1.sock").unlink()
+        stuck = socket.socket(socket.AF_UNIX)  # listens, never reads
+        stuck.bind(str(certdir / ".carry-2.sock"))
+        stuck.listen(1)
+        try:
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+            started = time.monotonic()
+            proxy.release_listener()
+            assert time.monotonic() - started < 3, "a stalled successor held it up"
+        finally:
+            stuck.close()
+        assert proxy._stop and pp._affinity_carry["sent"] == 0
+
+    def case_a_slot_is_refused_as_not_kept_only_once_the_session_is_due(
+            self, monkeypatch, certdir):
+        """The due rule asks `slot_kept` before idle, so the counter held every
+        tick of a session on a slot that is not kept (78 on one host, none of
+        them readable as a session that needed a ping). Only a session that is
+        otherwise due is refused as not kept, and `daemon.log` says which slot
+        and why, once, with no session in the line."""
+        from cswap_pin import proxy as pp
+        ident = self.IDENT
+        refused = {"its slot is not kept": 1}
+        for make, slot, why in (
+                (lambda: (pp._affinity_kept.pop(ident),
+                          pp._affinity_why.update({ident: "at its bar"})),
+                 "1", "at its bar"),
+                (lambda: pp._affinity_rest.update(
+                    {ident: time.monotonic() + 99}), "1", "resting"),
+                (lambda: pp._affinity_kept.update(
+                    {ident: ("tok-A", 1, 90.0, None, 10.0)}), "1",
+                 "expiry buffer"),
+                (lambda: pp._affinity_idents.clear(), "?", "no slot")):
+            seen = self._armed(monkeypatch, certdir, forms=("full",))
+            make()
+            self._age(100)
+            with self._pair(certdir) as (proxy, up):
+                proxy._keepalive_tick()
+                assert pp._affinity_pings["refused"] == {}, (
+                    why, "a session that is not due was counted")
+                assert not [l for l in seen.logs if "is not kept" in l], seen.logs
+                self._age(3400)
+                proxy._keepalive_tick()
+                proxy._keepalive_tick()
+            assert pp._affinity_pings["refused"] == refused, (
+                why, pp._affinity_pings)
+            (line,) = [l for l in seen.logs if "is not kept" in l]
+            assert f"slot {slot} is not kept" in line and why in line, line
+            assert up.bodies_seen == [] and "session S" not in line
 
     def case_a_body_sent_on_another_slot_than_the_binding_is_not_pinged(
             self, monkeypatch, certdir):

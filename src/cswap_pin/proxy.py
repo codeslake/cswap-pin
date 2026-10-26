@@ -3458,6 +3458,18 @@ _rebuild_counts = {"kept": 0, "dropped": {}}
 # the pings above split by the form that sent them (`_ping_form`): form ->
 # {"sent", "hit", "refused": {reason: n}, "cost": {usage field: tokens}}
 _form_pings: dict[str, dict] = {}
+# A HANDOVER CARRIES THE KEPT BODIES MEMORY TO MEMORY, never through a file (the
+# conversation is not written: T2618). A started, armed daemon listens on
+# `<certdir>/.carry-<pid>.sock` (0600) for `_CARRY_IN_S`; the predecessor, as it
+# releases its listener, sends one JSON line per body it can hand over
+# (`_carry_lines`) and stops at `_CARRY_OUT_S`, so an unreachable or stalled
+# successor costs a short wait and the bodies are dropped, as they always were.
+_CARRY_SOCK_PREFIX = ".carry-"
+_CARRY_OUT_S = 5.0
+_CARRY_IN_S = 300.0
+# bodies sent to a successor, and landed from a predecessor, since this process
+# started (`/health` `cache_aware.carry`)
+_affinity_carry = {"sent": 0, "landed": 0}
 # The ping forms the sandbox measured safe ("full": the session's last body, the
 # whole history; "rebuilt": a `message-threads-` session's whole history, which
 # the pin rebuilds as a `create`, see `_Rebuild`). Step 0, client 2.1.302, P ~=
@@ -3474,6 +3486,7 @@ _KEEPALIVE_MAX_TOKENS = 0
 _KEEPALIVE_TICK_S = 60.0
 _KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping
 _KEEPALIVE_MIN_PREFIX = 20000
+_KEEPALIVE_IDLE_S = 3300.0  # cswap's KEEPALIVE_IDLE_S (991a1055)
 _KEEPALIVE_NOT_YET = "not idle long enough"  # cswap's wording; normal, uncounted
 _KEEPALIVE_ELSEWHERE = "sent on another account"
 _KEEPALIVE_HEADLESS = "a headless session's held thread"
@@ -3516,7 +3529,7 @@ def _keepalive_due_inline(*, idle_s, pings_since_request, ttl_s, prefix_est,
         return False, "a 5 min cache tier is not worth a ping"
     if not slot_kept:
         return False, "its slot is not kept"
-    if idle_s < 3300.0:
+    if idle_s < _KEEPALIVE_IDLE_S:
         return False, _KEEPALIVE_NOT_YET
     if pings_since_request >= 2:
         return False, "pings since its last request are spent"
@@ -4189,6 +4202,115 @@ def _affinity_trim() -> None:
         _held_forget(oldest, "over the total cap")
 
 
+def _carry_str(b: bytes) -> str:
+    """A body is JSON text but not provably UTF-8: this and `_carry_bytes`
+    round-trip any bytes through a JSON string."""
+    return b.decode("utf-8", "surrogateescape")
+
+
+def _carry_bytes(s: str) -> bytes:
+    return s.encode("utf-8", "surrogateescape")
+
+
+def _carry_lines():
+    """One JSON line (bytes, no newline) for each kept body a successor can
+    ping, taken one session at a time under `_affinity_lock`. Carried: a `full`
+    body whose reply is known and a `held` one whose rebuild is ready, sent on
+    the account its session is bound to and not past its TTL. A line names the
+    slot (slot, email) the body went out on, never the bearer; `x-api-key`
+    keeps its name and loses its value (a ping sends the key only when the
+    client did); the idle clock is wall time."""
+    for session in list(_affinity_last):
+        with _affinity_lock:
+            e, bound = _affinity_last.get(session), _affinity.get(session)
+            rb = e[10] if e else None
+            ident = _affinity_idents.get(e[8]) if e else None
+            now = time.monotonic()
+            if not (ident and bound and ident == _affinity_idents.get(bound[0])
+                    and now - e[4] < e[2]
+                    and (rb is not None and rb.ready() if e[9] == "held"
+                         else e[11] is None)):
+                continue
+            row = {"s": session, "i": ident, "w": time.time() - (now - e[4]),
+                   "h": [[k, "" if k.lower() == "x-api-key" else v]
+                         for k, v in e[0] if k.lower() != "authorization"],
+                   "b": _carry_str(e[1]) if rb is None else "",
+                   "t": e[2], "p": e[3], "n": e[5], "u": e[7], "f": e[9],
+                   "r": rb and [_carry_str(rb.static), dict(rb.top),
+                                _carry_str(bytes(rb.msgs)),
+                                rb.reply and [rb.reply[0],
+                                              _carry_str(rb.reply[1])]]}
+        yield json.dumps(row, ensure_ascii=False).encode("utf-8", "surrogateescape")
+
+
+def _carry_out(certdir, skip=None) -> int:
+    """Send `_carry_lines` to the successor listening on
+    `<certdir>/.carry-*.sock` (not ``skip``, this process's own) and return how
+    many bodies went. The whole send stops at `_CARRY_OUT_S`; what has not gone
+    by then, or to a socket nobody listens on, is dropped."""
+    end, sent = time.monotonic() + _CARRY_OUT_S, 0
+    for path in sorted(Path(certdir).glob(f"{_CARRY_SOCK_PREFIX}*.sock")):
+        if path == skip:
+            continue
+        with socket.socket(socket.AF_UNIX) as s:
+            try:
+                s.settimeout(_CARRY_OUT_S)
+                s.connect(str(path))
+            except OSError:
+                continue  # a socket nobody listens on
+            try:
+                for line in _carry_lines():
+                    if (left := end - time.monotonic()) <= 0:
+                        break
+                    s.settimeout(left)
+                    s.sendall(line + b"\n")
+                    sent += 1
+            except OSError:
+                pass  # too slow, or gone: the rest is dropped
+        break
+    if sent:
+        with _affinity_lock:
+            _affinity_carry["sent"] += sent
+        _log_lifecycle(
+            f"session affinity: carried {sent} kept body(ies) out to the successor")
+    return sent
+
+
+def _carry_land(rows: list) -> int:
+    """Land the rows a predecessor sent (`_carry_lines`) as kept bodies and
+    return how many landed. A row lands only for a session bound here to the
+    slot it was sent on, that holds no body of its own (its own capture wins),
+    on a slot this snapshot keeps, and not past its TTL. The bearer is this
+    process's token for the slot; the idle clock converts back from wall time.
+    A malformed row lands nothing."""
+    now, wall, landed = time.monotonic(), time.time(), 0
+    with _affinity_lock:
+        for r in rows:
+            try:
+                session, ident = r["s"], tuple(r["i"])
+                bound, kept = _affinity.get(session), _affinity_kept.get(ident)
+                idle = max(0.0, wall - r["w"])
+                if (session in _affinity_last or bound is None or kept is None
+                        or _affinity_idents.get(bound[0]) != ident
+                        or idle >= r["t"]):
+                    continue
+                rb = None
+                if r["r"]:
+                    static, top, msgs, reply = r["r"]
+                    rb = _Rebuild(_carry_bytes(static), top, _carry_bytes(msgs))
+                    rb.reply = reply and (reply[0], _carry_bytes(reply[1]))
+                _affinity_last[session] = [
+                    [tuple(h) for h in r["h"]], _carry_bytes(r["b"]), r["t"],
+                    r["p"], now - idle, r["n"], None, r["u"], kept[0], r["f"],
+                    rb, None]
+                landed += 1
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        _affinity_trim()
+        _affinity_carry["landed"] += landed
+    return landed
+
+
 def _rebuild_stage(prior, parts, body, why, at):
     """Under `_affinity_lock`: take the held request ``body`` into its
     session's rebuild and return the one it leaves, awaiting its reply, or
@@ -4582,6 +4704,25 @@ def _keepalive_refuse(session: str, why: str, entry,
     return why
 
 
+def _keepalive_not_kept_line(ident, now: float) -> None:
+    """Say why a session that is otherwise due was refused for its slot not
+    being kept: one `daemon.log` line per slot and reason per
+    `_BUSY_REPORT_COOLDOWN_S`, the slot and the reason and no session."""
+    with _affinity_lock:
+        slot = ident[0] if ident else "?"
+        why = ("no slot stores its token" if ident is None else
+               "resting after a refusal" if _affinity_rest.get(ident, 0.0) > now
+               else "its stored token is in its expiry buffer"
+               if ident in _affinity_kept
+               else _affinity_why.get(ident) or "it is in no snapshot")
+        more = _affinity_due(_affinity_declined,
+                             f"keep-alive slot {slot}: {why}", now)
+    if more is not None:
+        _log_lifecycle(
+            f"session affinity: a due keep-alive was refused, slot {slot} is "
+            f"not kept ({why})" + (f"; {more} more" if more else ""))
+
+
 def _sent_on_binding(entry, bound) -> bool:
     """Under `_affinity_lock`: whether ``entry``'s request went out on the
     account its session is bound to (``bound``, its `_affinity` row): the same
@@ -4613,8 +4754,9 @@ def _cache_aware_report(certdir) -> dict:
     `captures`: main-thread bodies kept, and dropped by reason. `pings` also
     splits its counts by `forms` (sent, hit, refused by reason, cost), and
     `rebuilds` counts the held requests a `_Rebuild` took in and the rebuilds
-    lost, by reason. Never a session id or a byte of a conversation. Empty
-    `slots` when not armed."""
+    lost, by reason, and `carry` the kept bodies sent to a successor and landed
+    from a predecessor (`sent`, `landed`). Never a session id or a byte of a
+    conversation. Empty `slots` when not armed."""
     cfg = session_affinity_config(certdir)
     now = time.monotonic()
     slots: dict = {}
@@ -4646,9 +4788,10 @@ def _cache_aware_report(certdir) -> dict:
                     "dropped": dict(_affinity_captures["dropped"])}
         rebuilds = {**_rebuild_counts,
                     "dropped": dict(_rebuild_counts["dropped"])}
+        carry = dict(_affinity_carry)
     at = _affinity_snap["at"]
     return {"armed": cfg is not None, "slots": slots, "pings": pings,
-            "captures": captures, "rebuilds": rebuilds,
+            "captures": captures, "rebuilds": rebuilds, "carry": carry,
             "since": _iso_utc(_AFFINITY_SINCE),
             "snapshot": {
                 "age_s": None if at == -math.inf else round(now - at, 1),
@@ -18422,6 +18565,7 @@ class PinProxy:
         self._trace_tick_thread = threading.Thread(
             target=self._trace_tick_loop, daemon=True)
         self._trace_tick_thread.start()
+        self._carry_in_held_start()
         _provider = getattr(self, "_pin_token_provider", None)
         if getattr(_provider, "can_pin_cached", None) is not None:
             threading.Thread(target=self._warm_mint_cache, daemon=True).start()
@@ -18669,6 +18813,78 @@ class PinProxy:
             _log_lifecycle(f"session affinity: carried {len(got)} warm "
                            f"binding(s) in from the predecessor")
             _affinity_kick(cfg[1], cfg[2])
+
+    def _carry_in_held_start(self) -> None:
+        """When armed, listen on `<certdir>/.carry-<pid>.sock` (0600) for the
+        kept bodies a predecessor sends as it releases its listener
+        (`_carry_out`), on a thread that gives up after `_CARRY_IN_S`. A path
+        the OS refuses (over 107 bytes, a read-only directory) carries nothing
+        in, and the bodies are dropped as they always were."""
+        t = getattr(self, "_carry_in_thread", None)
+        if (t is not None and t.is_alive()
+                or session_affinity_config(self._certdir) is None):
+            return
+        path = Path(self._certdir) / f"{_CARRY_SOCK_PREFIX}{os.getpid()}.sock"
+        srv = socket.socket(socket.AF_UNIX)
+        try:
+            path.unlink(missing_ok=True)
+            srv.bind(str(path))
+            os.chmod(path, 0o600)
+            srv.listen(1)
+            ino = path.stat().st_ino
+        except OSError:
+            srv.close()
+            return
+        self._carry_in_path = path
+        self._carry_in_thread = threading.Thread(
+            target=self._carry_in_held, args=(srv, path, ino), daemon=True)
+        self._carry_in_thread.start()
+
+    def _carry_in_held(self, srv, path, ino) -> None:
+        """Take the predecessor's connection, read its lines, and land them
+        (`_carry_land`) once the first snapshot has landed the bindings they
+        hang on; the sender starts if any landed. Every step is bounded."""
+        conn = None
+        try:
+            srv.settimeout(0.5)
+            end = time.monotonic() + _CARRY_IN_S
+            while (conn is None and time.monotonic() < end
+                   and not self._trace_tick_stop.is_set()):
+                with contextlib.suppress(socket.timeout):
+                    conn = srv.accept()[0]
+        except OSError:
+            pass
+        finally:
+            srv.close()
+            with contextlib.suppress(OSError):
+                if path.stat().st_ino == ino:  # not a later start's own
+                    path.unlink()
+        if conn is None:
+            return
+        rows, size = [], 0
+        try:
+            conn.settimeout(_CARRY_OUT_S)
+            end = time.monotonic() + 2 * _CARRY_OUT_S
+            with conn, conn.makefile("rb") as f:
+                while size < 2 * _AFFINITY_BODY_TOTAL and time.monotonic() < end:
+                    if not (line := f.readline(64 << 20)):
+                        break
+                    size += len(line)
+                    with contextlib.suppress(ValueError):
+                        rows.append(json.loads(_carry_str(line)))
+        except OSError:
+            pass
+        end = time.monotonic() + _AFFINITY_STALE_S
+        while (_affinity_snap["at"] == -math.inf and time.monotonic() < end
+               and not self._trace_tick_stop.wait(0.2)):
+            pass
+        landed = (_carry_land(rows) if rows and not self._stop
+                  and session_affinity_config(self._certdir) is not None else 0)
+        if rows:
+            _log_lifecycle(f"session affinity: {len(rows)} kept body(ies) came "
+                           f"from the predecessor, {landed} landed")
+        if landed:
+            self._keepalive_ensure()
 
     def _carry_affinity_tick(self) -> None:
         """Write the warm bindings where a successor reads them, when armed,
@@ -19399,7 +19615,16 @@ class PinProxy:
         Either way this returns only once our accept loop has ENDED. A
         signalled-but-running loop would keep winning connections from a
         socket it no longer serves.
+
+        THE KEPT BODIES GO FIRST, to a successor already listening for them
+        (`_carry_out`): this generation forgets them once `_stop` is set, and
+        the successor of a holder or of a relocation has published by now.
+        Still accepting meanwhile, so the short send stalls no one; with no
+        successor on a carry socket it costs nothing.
         """
+        if not self._stop and _affinity_last:
+            with contextlib.suppress(Exception):  # a carry never costs the release
+                _carry_out(self._certdir, getattr(self, "_carry_in_path", None))
         self._stop = True
         srv, self._srv = self._srv, None
         # JOIN, do not merely set the flag. The loop polls with a 0.5s
@@ -23844,20 +24069,24 @@ class PinProxy:
             for session, e in _affinity_last.items():
                 bound = _affinity.get(session)
                 if bound is not None:
+                    ident = _affinity_idents.get(bound[0])
                     rows.append((
                         session, e, now - e[4], e[2], e[3], e[5],
                         _ping_form(e) in _KEEPALIVE_FORMS,
-                        _affinity_slot_kept(_affinity_idents.get(bound[0]), now),
+                        _affinity_slot_kept(ident, now),
                         _sent_on_binding(e, bound),
-                        e[10] is not None and e[10].ready()))
+                        e[10] is not None and e[10].ready(), ident))
         due, stale = [], False
         for (session, e, idle_s, ttl_s, prefix, pings, measured, kept, on,
-             rebuilt) in rows:
+             rebuilt, ident) in rows:
             ok, why = _keepalive_due(
                 idle_s=idle_s, pings_since_request=pings, ttl_s=ttl_s,
                 # unknown (a held body's): ping 1 measures it, ping 2 needs it
                 prefix_est=prefix or (0 if pings else _KEEPALIVE_MIN_PREFIX),
-                slot_kept=kept or not fresh)
+                # cswap asks `slot_kept` before idle: only a session that is
+                # idle long enough may be refused for its slot, or the counter
+                # holds every tick of one that needs no ping
+                slot_kept=kept or not fresh or idle_s < _KEEPALIVE_IDLE_S)
             if not on:  # its cache is on an account the binding is not
                 ok, why = False, _KEEPALIVE_ELSEWHERE
             elif ok and idle_s >= ttl_s:  # cold already: a ping would WRITE it
@@ -23871,6 +24100,8 @@ class PinProxy:
                 ok, why = False, _KEEPALIVE_NO_REBUILD
             if not ok:
                 if why != _KEEPALIVE_NOT_YET:
+                    if why == "its slot is not kept" and e[6] != why:
+                        _keepalive_not_kept_line(ident, now)
                     _keepalive_refuse(session, why, e, not on or why in (
                         _KEEPALIVE_HEADLESS, _KEEPALIVE_NO_REBUILD))
             elif fresh:
