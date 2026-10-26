@@ -35621,6 +35621,10 @@ else:
         pid = gone.pid          # a number this namespace cannot see
         pp.write_daemon_state(tmp_path, 4321, pid, "fp")
         health = {"pid": pid, "code_watch_age_s": 1.0, "relocated": False}
+        # On a Mac a due pull also reads the Keychain (`security`, which the
+        # Popen stub below would swallow); this case is about the arm's clauses.
+        monkeypatch.setattr(
+            pp, "_keychain_denied_here", lambda confirm=True: False)
 
         def due(h=health):
             return pp._relocation_is_due(tmp_path, h, confirm=False)
