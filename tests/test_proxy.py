@@ -34826,10 +34826,14 @@ else:
         reads the recorded daemon's `/health` and, only for one that says it is
         denied, runs the relocation. A lock it cannot take in
         `_HEAL_LOCK_WAIT_S` ends it quietly (another spawn or relocation is
-        running), and so does a daemon that is not denied."""
+        running), and so does a daemon that is not denied, and one whose
+        recorded fingerprint is not this code's (a redeploy since the launch
+        that started the helper: every launch arm required the match, and the
+        launch recycles that daemon instead)."""
         from cswap_pin import proxy as pp
 
-        pp.write_daemon_state(tmp_path, 4321, os.getpid(), "fp")
+        pp.write_daemon_state(
+            tmp_path, 4321, os.getpid(), pp.daemon_fingerprint())
         moved, stamped = [], []
         # THE HELPER STAMPS ITS OWN ENVIRONMENT, which every process of the
         # lineage it starts inherits. `setenv` first only so the stamp is
@@ -34855,6 +34859,10 @@ else:
             "the control: a denied daemon under a free lock is moved")
         assert stamped == ["1"], (
             f"the helper moved a lineage without marking it as moved: {stamped}")
+        moved.clear()
+        pp.write_daemon_state(tmp_path, 4321, os.getpid(), "stale")
+        pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [], "the helper moved a daemon of other code"
 
     def case_ensure_returns_at_once_while_the_move_is_in_progress(
             self, tmp_path, monkeypatch):

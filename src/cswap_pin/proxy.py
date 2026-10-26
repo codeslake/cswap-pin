@@ -10029,7 +10029,12 @@ def relocate_main(certdir: Path, account_num: str, email: str) -> None:
     try:
         with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             st = read_daemon_state(certdir)
-            health = st and _health_body(int(st["port"]))
+            # THE RECORD IS RE-READ UNDER THE LOCK, so it may be another
+            # daemon's than the launch saw: every arm that starts this helper
+            # required the fingerprint (`/health` carries none), and a daemon
+            # of other code is the launch's to recycle, not to move.
+            health = (st and st.get("fingerprint") == daemon_fingerprint()
+                      and _health_body(int(st["port"])))
             if health and (os.environ.get(_RELOCATE_ENV) == "1"
                            or health.get("keychain_denied") is True):
                 _take_the_socket_over(certdir, account_num, email, health)
