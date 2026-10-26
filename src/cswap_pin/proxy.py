@@ -10108,7 +10108,7 @@ def _take_the_socket_over(certdir: Path, account_num: str, email: str,
     try:
         path.unlink(missing_ok=True)
         srv.bind(str(path))
-        srv.listen(1)
+        srv.listen(8)  # a tick connects up to three times (probes, then the send)
         _log_lifecycle(
             f"daemon {pid} is to be moved into this process's lineage -- "
             "waiting for it to hand the listening socket over")
@@ -14084,15 +14084,25 @@ class PortHolder:
         namespace reads dead to `_pid_alive`, so the port's own `/health` can
         name it instead (`_health_pid`, the `_read_alive_port` pattern): else
         this holder keeps its respawn duty beside it, two acceptors on one
-        socket."""
+        socket.
+
+        A SLOW ANSWER IS NOT "NOBODY" (the port watch's rule, T1935): that read
+        decides a respawn beside the successor (`_supervise_locked`) or undoes
+        a confirmed hand-off (`_on_replace_request`), so the probe waits
+        `_PORT_WATCH_PROBE_S` and a miss is asked once more,
+        `_PORT_WATCH_CONFIRM_S`. Another pid's answer is no miss."""
         certdir = getattr(self, "_certdir", None)
         if not (self._handed_off and certdir is not None):
             return 0
         rec = read_daemon_state(certdir)
         other = int(rec.get("pid") or 0) if rec else 0
-        return (other if other not in (0, proc.pid)
-                and (_pid_alive(other) or _health_pid(self.port) == other)
-                else 0)
+        if other in (0, proc.pid):
+            return 0
+        if _pid_alive(other):
+            return other
+        answered = (_health_pid(self.port, _PORT_WATCH_PROBE_S)
+                    or _health_pid(self.port, _PORT_WATCH_CONFIRM_S))
+        return other if answered == other else 0
 
     def _on_replace_request(self, signum, frame) -> None:
         # THE SAME LOCK `_supervise` TAKES BEFORE ITS OWN DECISION. `_spawn()`

@@ -35793,6 +35793,44 @@ else:
             assert _Holder()._hand_off_served_by(exited) == want, (
                 f"/health answering {answering}")
 
+    def case_a_slow_health_answer_does_not_flip_the_holders_stand_down(
+            self, tmp_path, monkeypatch):
+        """The `/health` that names a successor in another pid namespace is
+        asked with the port watch's budget, not the 1.0 s default (a reply
+        took 1007 ms on a loaded host), and a miss is asked once more before
+        it reads "nobody". A flipped verdict spawns a second daemon beside the
+        successor (`_supervise_locked`) or undoes a confirmed hand-off
+        (`_on_replace_request`)."""
+        from cswap_pin import proxy as pp
+
+        class _Holder(pp.PortHolder):
+            def __init__(self):
+                self._certdir = tmp_path
+                self.port = 1
+                self._handed_off = True
+
+        pp.write_daemon_state(tmp_path, 1, 777777, "fp")
+        monkeypatch.setattr(pp, "_pid_alive", lambda pid: False)
+        exited = types.SimpleNamespace(pid=111)
+        asked, answers = [], []
+
+        def health(port, timeout=1.0):
+            asked.append(timeout)
+            return answers.pop(0)
+
+        monkeypatch.setattr(pp, "_health_pid", health)
+        probe, confirm = pp._PORT_WATCH_PROBE_S, pp._PORT_WATCH_CONFIRM_S
+        for label, script, want, budgets in (
+                ("answers at once", [777777], 777777, [probe]),
+                ("misses once, then answers", [None, 777777], 777777,
+                 [probe, confirm]),
+                ("misses twice: nobody", [None, None], 0, [probe, confirm]),
+                ("another daemon answers: not retried", [111], 0, [probe])):
+            asked.clear()
+            answers[:] = script
+            assert _Holder()._hand_off_served_by(exited) == want, label
+            assert asked == budgets, f"{label}: probed with {asked}"
+
     def case_health_says_whether_the_lineage_moved_only_under_a_holder_that_can_hand_it_across(
             self, tmp_path, monkeypatch):
         """One field, two jobs: ABSENT is a holder whose code cannot hand a
