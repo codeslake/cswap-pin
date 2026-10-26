@@ -9911,7 +9911,10 @@ def _waiting_caller(certdir: Path) -> "Path | None":
     `_RENDEZVOUS_FRESH_S` is never connected to: nobody may be accepting on it.
     ONLY AGE REMOVES A FILE. A pid this namespace cannot see reads dead, and a
     daemon in another pid namespace sharing the certdir must not delete a live
-    helper's file for it: such a file is left and not acted on."""
+    helper's file for it: such a file is left. It IS acted on when it answers a
+    connect (T2939): the pid in the name is the helper's own namespace's number,
+    so `_pid_alive` can say no for a live helper, and a refusal (a listener that
+    is gone, a file that vanished) is the only dead."""
     prefix = _SUCCESSOR_SOCK_PREFIX
     try:
         paths = list(Path(certdir).glob(f"{prefix}*.sock"))
@@ -9931,6 +9934,14 @@ def _waiting_caller(certdir: Path) -> "Path | None":
                 path.unlink()
         elif _pid_alive(pid):
             return path
+        else:
+            # The helper accepts until a descriptor arrives, so this probe
+            # is not the hand-off (`_take_the_socket_over`).
+            with contextlib.suppress(OSError), socket.socket(
+                    socket.AF_UNIX) as probe:
+                probe.settimeout(1.0)
+                probe.connect(str(path))
+                return path
     return None
 
 
@@ -9963,12 +9974,16 @@ def _move_into_this_lineage(certdir: Path, account_num: str, email: str,
     daemon's own `/health`; then the spawn lock, which a relocation or a spawn
     in flight holds (one at a time: a busy lock starts nothing), unless
     ``locked``, the caller holds it itself and its helper waits for it.
+    THE OPT-IN (`_RELOCATE_ENV`) IS THE EXCEPTION: set, this asks `/health`
+    on any platform, and `_relocation_is_due` decides on the daemon's own word
+    whether a holder this namespace cannot see should hand its socket over.
     Never raises: a repair never fails a launch."""
-    if sys.platform != "darwin":
+    pull = os.environ.get(_RELOCATE_ENV) == "1"
+    if sys.platform != "darwin" and not pull:
         return port
     try:
         health = _health_body(port)
-        if not (health and health.get("keychain_denied") is True):
+        if not (health and (pull or health.get("keychain_denied") is True)):
             return port
         if not locked:
             with _spawn_lock(certdir, timeout=0):
@@ -10000,8 +10015,9 @@ def _move_into_this_lineage(certdir: Path, account_num: str, email: str,
 def relocate_main(certdir: Path, account_num: str, email: str) -> None:
     """The detached helper's whole body (``-m cswap_pin.proxy --relocate``,
     started by `_move_into_this_lineage`): under the spawn lock, ask the
-    recorded daemon's `/health` and, only for one that says it is denied, run
-    the relocation. A lock it cannot take in `_HEAL_LOCK_WAIT_S` ends it
+    recorded daemon's `/health` and, only for one that says it is denied (or
+    on the caller's opt-in, `_RELOCATE_ENV`), run the relocation. A lock it
+    cannot take in `_HEAL_LOCK_WAIT_S` ends it
     quietly: another spawn or relocation is running (or the launching caller,
     in the `locked` arm, has not returned yet).
 
@@ -10014,7 +10030,8 @@ def relocate_main(certdir: Path, account_num: str, email: str) -> None:
         with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             st = read_daemon_state(certdir)
             health = st and _health_body(int(st["port"]))
-            if health and health.get("keychain_denied") is True:
+            if health and (os.environ.get(_RELOCATE_ENV) == "1"
+                           or health.get("keychain_denied") is True):
                 _take_the_socket_over(certdir, account_num, email, health)
     except SpawnLockBusy:
         _log_lifecycle("another spawn or relocation is running -- the denied "
@@ -10038,21 +10055,36 @@ def _relocation_is_due(certdir: Path, health: dict,
     stays where it is instead of being moved by every launch, and its own
     `/health` `keychain_denied` is the measurement. And THIS process is not
     itself refused, or the socket would only go to another denied lineage
-    (read last: it can take seconds)."""
+    (read last: it can take seconds).
+
+    THE OPT-IN ARM (T2939), instead of the clauses from "its holder can be
+    asked" to "visible in THIS pid namespace": the caller set `_RELOCATE_ENV`
+    and the recorded pid is NOT alive here, so it is a holder in another
+    namespace and every ps and /proc clause would read "not mine". The daemon's
+    `/health` (it answered as the recorded pid, above) is the witness, through
+    the one field `relocated`: absent is a holder that cannot hand across
+    namespaces, True is a lineage that already moved once (the ping-pong
+    backstop), and only False is a pull allowed. A daemon the caller CAN see
+    takes the clauses above, and only if it says it is denied."""
     st = read_daemon_state(certdir)
     pid = int(st["pid"]) if st else 0
     beat = health.get("code_watch_age_s")
-    holder = _wedged_parent_holder(pid, certdir) if pid else None
-    return pid if (st and not st.get("handover") and health.get("pid") == pid
-                   and isinstance(beat, (int, float))
-                   and beat <= _CODE_WATCH_BEAT_MAX_AGE_S
-                   and holder is not None
-                   and _wedged_daemon_can_be_asked(pid, holder)
-                   and (_daemon_env_value(pid, _SELF_HEAL_ENV) or "").lower()
-                   not in ("off", "0", "no")
-                   and not _daemon_env_value(pid, _RELOCATED_ENV)
-                   and pid in _pin_daemon_pids(certdir)
-                   and not _keychain_denied_here(confirm)) else 0
+    if not (st and not st.get("handover") and health.get("pid") == pid
+            and isinstance(beat, (int, float))
+            and beat <= _CODE_WATCH_BEAT_MAX_AGE_S):
+        return 0
+    if os.environ.get(_RELOCATE_ENV) == "1" and not _pid_alive(pid):
+        asked = health.get("relocated") is False
+    else:
+        holder = (_wedged_parent_holder(pid, certdir)
+                  if health.get("keychain_denied") is True else None)
+        asked = (holder is not None
+                 and _wedged_daemon_can_be_asked(pid, holder)
+                 and (_daemon_env_value(pid, _SELF_HEAL_ENV) or "").lower()
+                 not in ("off", "0", "no")
+                 and not _daemon_env_value(pid, _RELOCATED_ENV)
+                 and pid in _pin_daemon_pids(certdir))
+    return pid if asked and not _keychain_denied_here(confirm) else 0
 
 
 def _take_the_socket_over(certdir: Path, account_num: str, email: str,
@@ -10077,15 +10109,23 @@ def _take_the_socket_over(certdir: Path, account_num: str, email: str,
         path.unlink(missing_ok=True)
         srv.bind(str(path))
         srv.listen(1)
-        srv.settimeout(_RELOCATE_ASK_WAIT_S)
         _log_lifecycle(
-            f"daemon {pid} is refused the Keychain and this process is not -- "
+            f"daemon {pid} is to be moved into this process's lineage -- "
             "waiting for it to hand the listening socket over")
-        conn, _ = srv.accept()
-        with conn:
-            conn.settimeout(5.0)
-            fd = socket.recv_fds(conn, 16, 1)[1][0]
-    except (OSError, IndexError) as exc:
+        # ACCEPT UNTIL A DESCRIPTOR ARRIVES, under ONE deadline: a daemon that
+        # cannot see this pid probes the rendezvous with a connect that sends
+        # nothing (`_waiting_caller`), and the first accept must not be spent
+        # on it. A timeout here ends the wait like any other OSError.
+        deadline = time.monotonic() + _RELOCATE_ASK_WAIT_S
+        fds = []
+        while not fds:
+            srv.settimeout(max(deadline - time.monotonic(), 0.001))
+            conn, _ = srv.accept()
+            with conn:
+                conn.settimeout(5.0)
+                fds = socket.recv_fds(conn, 16, 1)[1]
+        fd = fds[0]
+    except OSError as exc:
         _log_lifecycle(f"no socket was handed over ({exc!r}) -- the daemon "
                        "stays where it is")
         return None
@@ -13766,6 +13806,7 @@ class PortHolder:
         # dead holder.
         if self._replace_channel:
             env[_HOLDER_REPLACE_ENV] = "1"
+            env[_HOLDER_HANDS_ACROSS_ENV] = str(os.getpid())
         # WHAT THIS HOLDER IS RUNNING — see `_HOLDER_SHA_ENV`. The child never
         # reads it; a checker does, to answer the one question the daemon's own
         # fingerprint cannot.
@@ -14039,13 +14080,19 @@ class PortHolder:
         caller's lineage (`_hand_to_the_caller`), else 0. A hand-off that
         failed leaves the record naming ``proc`` itself, so it reads 0 and this
         holder keeps its respawn duty. Read, never carried: it is proof the
-        successor published and still lives."""
+        successor published and still lives. A successor in another pid
+        namespace reads dead to `_pid_alive`, so the port's own `/health` can
+        name it instead (`_health_pid`, the `_read_alive_port` pattern): else
+        this holder keeps its respawn duty beside it, two acceptors on one
+        socket."""
         certdir = getattr(self, "_certdir", None)
         if not (self._handed_off and certdir is not None):
             return 0
         rec = read_daemon_state(certdir)
         other = int(rec.get("pid") or 0) if rec else 0
-        return other if other not in (0, proc.pid) and _pid_alive(other) else 0
+        return (other if other not in (0, proc.pid)
+                and (_pid_alive(other) or _health_pid(self.port) == other)
+                else 0)
 
     def _on_replace_request(self, signum, frame) -> None:
         # THE SAME LOCK `_supervise` TAKES BEFORE ITS OWN DECISION. `_spawn()`
@@ -15596,6 +15643,14 @@ _RENDEZVOUS_FRESH_S = _RELOCATE_ASK_WAIT_S - 10.0
 # STAMPED INTO THE ENVIRONMENT BY THE HELPER, so every process of the lineage it
 # starts carries it (`relocate_main`): ONE MOVE PER LINEAGE (`_relocation_is_due`).
 _RELOCATED_ENV = "CSWAP_PIN_RELOCATED"
+# THE CALLER'S OPT-IN TO PULL A DAEMON IT CANNOT SEE (T2939), "1" only. The pin
+# holder and its caller can sit in different pid namespaces (a host and a
+# container sharing $HOME, the certdir and the network), where every ps and
+# /proc clause of `_relocation_is_due` reads "not mine". A caller that sets this
+# asks for the socket on `/health`'s word instead, and only that caller:
+# DIRECTIONAL, so the side without the knob never pulls anything back. An env
+# var and not a setting, because both sides read the one $HOME.
+_RELOCATE_ENV = "CSWAP_PIN_RELOCATE"
 # HOW LONG THE OLD DAEMON AND THE HELPER WAIT FOR THE NEW DAEMON TO SERVE.
 # `_SPAWN_WAIT_S` (10 s) is the wrong bound here: on a loaded Mac a successor
 # took 56-85 s to publish (wmac, load 8.72, T1935), and the old daemon's
@@ -16520,6 +16575,14 @@ _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
 # a long-lived process still running the PREVIOUS release — with no handler,
 # forever. The gap this whole mechanism exists to remove is 2 s.
 _HOLDER_REPLACE_ENV = "CSWAP_PIN_HOLDER_TAKES_REPLACE"
+# Set by the same holder, to ITS OWN PID, for the same reason: whether the code
+# above a daemon can hand a socket across pid namespaces (T2939) is the HOLDER's
+# to claim, and a new daemon under an old holder (a code-watch handover replaced
+# the daemon, `_retire_stale_holder` has not yet replaced the holder) must not
+# claim it. `/health` publishes `relocated` only when this names the daemon's
+# own parent, so a mark that reached a descendant, or outlived its holder, is
+# not believed (`held_by_a_holder`'s guard).
+_HOLDER_HANDS_ACROSS_ENV = "CSWAP_PIN_HOLDER_HANDS_ACROSS"
 # The bytes the HOLDER loaded, published into its child's environment. A
 # DAEMON'S FRESHNESS SAYS NOTHING ABOUT THE HOLDER ABOVE IT. The holder execs a
 # fresh interpreter for every spawn, so a holder running months-old code starts
@@ -22345,6 +22408,15 @@ class PinProxy:
              # session can move the socket into its own.
              **({"keychain_denied": True}
                 if getattr(self, "_keychain_denied", False) else {}),
+             # ADDITIVE (T2939), PRESENT ONLY UNDER A HOLDER THAT CAN HAND A
+             # SOCKET ACROSS PID NAMESPACES (its mark names our parent, see
+             # `_HOLDER_HANDS_ACROSS_ENV`): whether this lineage was already
+             # moved by a caller (`_RELOCATED_ENV`). One field, two jobs for
+             # `_relocation_is_due`'s opt-in arm: absent refuses (old holder
+             # code), True refuses (one move per lineage), False allows.
+             **({"relocated": os.environ.get(_RELOCATED_ENV) == "1"}
+                if os.environ.get(_HOLDER_HANDS_ACROSS_ENV)
+                == str(os.getppid()) else {}),
              # ADDITIVE: the cache-aware session affinity, armed or not (see
              # `_cache_aware_report`); per slot, never per session.
              "cache_aware": _cache_aware_report(

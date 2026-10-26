@@ -1367,6 +1367,22 @@ tunnels, so the **socket** moves instead.
 - **Off macOS nothing changes**: the refusal does not exist there, so a launch
   asks the daemon nothing extra (not even `/health`) and a daemon starts no
   thread to read it.
+- **Opt-in: pull a daemon from another pid namespace.** A caller that sets
+  `CSWAP_PIN_RELOCATE=1` (an env var, because host and container read one
+  `$HOME`) and cannot see the recorded daemon's pid asks for its socket on
+  `/health`'s word instead of the ps and `/proc` clauses (which read "not
+  mine" across namespaces): the same successor-first move, on any platform.
+  It is **directional**: only the side with the knob pulls, and only a pid it
+  cannot see. One `/health` field, `"relocated"`, decides. It is published
+  only by a daemon whose own holder runs this code (the holder marks the
+  daemons it starts with its pid, and a daemon under an older holder carries
+  no mark), so ABSENT refuses (the holder cannot hand across namespaces),
+  `true` refuses (this lineage was already moved, the ping-pong backstop) and
+  `false` allows the pull. A daemon outside the helper's namespace cannot
+  see its pid either, so it finds the rendezvous by a connect instead of
+  `kill 0` (the helper accepts until a descriptor arrives, under one
+  deadline), and the old holder reads the successor from the port's `/health`
+  when its pid reads dead, so it stands down instead of respawning beside it.
 - **Nothing is cut and nothing is stranded if it fails.** If the helper dies
   or the successor never publishes, the old daemon keeps serving past its
   bound (no capped drain, no exit 75) and its holder keeps its respawn duty.
