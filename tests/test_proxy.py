@@ -29862,6 +29862,83 @@ class TestASlowRequestSaysSo:
         assert "0ms waiting" not in lines[0], lines[0]
         assert "unknown" in lines[0], lines[0]
 
+    def case_a_slow_probe_is_named_in_the_line(self, monkeypatch):
+        """T2945. "8451ms of it inside the pin" on a heartbeat could not say
+        whether it was the identity probe, the refresh_lock wait, the store
+        read or the refresh. THE REAL PROVIDER stamps its own stages (a hand
+        built dict would pass with the stamp missing), on a fake clock so the
+        probe's 8.4s is exact and costs no wall time."""
+        from cswap_pin import proxy as pin_proxy
+
+        clock = [1000.0]
+        monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: clock[0])
+
+        def slow_profile(token):
+            clock[0] += 8.4
+            return {"emailAddress": "pin@example.com"}
+
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", slow_profile)
+        sw = _FakeSwitcher(active_num="1", backups={"2": json.dumps({
+            "claudeAiOauth": {"accessToken": "live-tok",
+                              "expiresAt": 10_000_000_000_000,
+                              "refreshToken": "rt"}})})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+        monkeypatch.setattr(pin_proxy._PIN_STAGES, "d", {}, raising=False)
+        assert provider() == "live-tok"
+        stages = pin_proxy._PIN_STAGES.d
+
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/code/sessions/x/worker/heartbeat",
+                             8600.0, 8451.0, wait_ms=100.0, stages=stages)
+        assert ("8451ms of it inside the pin (probe 8400ms, other 51ms); "
+                "100ms waiting for the answer") in lines[0], lines[0]
+
+    def case_no_stage_data_leaves_the_line_as_it_was(self, monkeypatch):
+        """The beat thread and a request nobody stamped have no stage data,
+        and a reader written against the old text must see the old text."""
+        P, lines = self._proxy(monkeypatch)
+        for stages in (None, {}):
+            P._last_slow_report = None
+            P._note_slow_request("POST", "/v1/code/sessions/x/worker/events",
+                                 5000.0, 12.0, wait_ms=4900.0, stages=stages)
+        assert lines[0] == lines[1], lines
+        assert ("(12ms of it inside the pin; 4900ms waiting for the answer, "
+                "88ms getting it out) ") in lines[0], lines[0]
+        assert lines[0].endswith("a live view times out on stalls like this")
+
+    def case_a_stage_that_rounds_to_zero_is_not_printed(self, monkeypatch):
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/a", 5000.0, 3.0, wait_ms=4900.0,
+                             stages={"target": 0.2, "probe": 2.6})
+        assert "inside the pin (probe 3ms); " in lines[0], lines[0]
+
+    def case_the_stage_text_still_reads_for_the_gate(self, monkeypatch):
+        """The gate (in the manager checkout) and `chain_split_probe` read
+        this line with four regexes, so a stage name that holds `took`, or
+        lands between the total and the pin share, blinds them silently."""
+        import re
+
+        P, lines = self._proxy(monkeypatch)
+        stages = {"target": 1.0, "probe": 8400.0, "lock": 3.0, "store": 2.0,
+                  "refresh": 4.0, "bridge": 5.0, "retry": 6.0}
+        P._note_slow_request("POST", "/v1/code/sessions/cse_AB/worker/events",
+                             9000.0, 8451.0, wait_ms=100.0, stages=stages)
+        P._last_slow_report -= 61.0
+        P._slow_suppressed = 7
+        P._note_slow_request("POST", "/v1/code/sessions/cse_AB/worker/events",
+                             9100.0, 8452.0, wait_ms=100.0, stages=stages)
+        line = f"[2026-10-26T00:00:00Z] {lines[1]}"
+        assert re.search(r"took (\d+)ms", lines[1]).group(1) == "9100"
+        assert re.search(r"(\d+)ms of it inside the pin", lines[1]).group(1) == "8452"
+        assert re.search(r"; (\d+) more in the last minute", lines[1]).group(1) == "7"
+        assert re.search(r"^\[([0-9T:-]+)Z\].*took (\d+)ms", line).group(2) == "9100"
+        assert "a live view times out on stalls like this" in lines[1]
+        for word in ("took", "server", "waiting", "more in"):
+            assert word not in lines[1].split("inside the pin", 1)[1].split(
+                "; ", 1)[0], (word, lines[1])
+        for stage in stages:
+            assert stage in lines[1], (stage, lines[1])
+
     def case_inference_taking_seconds_is_not_a_stall(self, monkeypatch):
         """/v1/messages IS the model answering, and seconds are its healthy
         range. Measured on one mac inside four minutes: 4715, 6040, 2369 and

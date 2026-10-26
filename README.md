@@ -1053,8 +1053,11 @@ a deployment that would rather set it in the environment.
 
 Each line splits the round trip three ways — inside the pin, waiting for the
 server, and getting the request out through the chain — because the total
-alone cannot say whose problem a stall is. The route is logged without its
-query string or session id.
+alone cannot say whose problem a stall is. The pin's own share names the
+stage the time went to (`probe`, `lock`, `store`, `refresh`, `bridge`, `retry`,
+`target`, largest first, and `other` for what no stage covers), as in
+`8451ms of it inside the pin (probe 8400ms, other 51ms)`. The route is logged
+without its query string or session id.
 
 **Session affinity (off by default).** When cswap switches the live account,
 Claude Code's next request goes out on the new account's token and the prompt
