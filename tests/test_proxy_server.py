@@ -12642,6 +12642,57 @@ class TestDrainReportsWhatItCut:
             "timed around the relay instead: an SSE stream that lived for "
             "hours would be reported as a stall of that length")
 
+    def case_a_slow_request_names_the_stage_its_pin_time_went_to(
+            self, certdir, monkeypatch):
+        """T2945. "8451ms of it inside the pin" on a heartbeat could not say
+        whether the seconds were the identity probe, the `refresh_lock` wait,
+        the store read or the refresh. A REAL round trip with the lock held
+        by another thread for 0.5s, because the wiring is three places (the
+        stage dict is reset where the window opens, copied where it closes,
+        and handed to the line at the status hook) and no one of them can
+        be read to tie the other two."""
+        import json as _json
+        import re
+
+        from cswap_pin import proxy as pp
+
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pp, "slow_report_ms", lambda _certdir: 200.0)
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live-token", "expiresAt": 4102444800000,
+            "refreshToken": "rt"}})
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return live
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Switcher(), "2", "pin@example.com")
+        provider.refresh_lock.acquire()
+        release = threading.Timer(0.5, provider.refresh_lock.release)
+        release.start()
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=provider,
+                            upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/SID123/bridge", bearer="client-own-token")
+            assert status == 200
+        finally:
+            release.join()
+            proxy.stop()
+            upstream.stop()
+        slow = [m for m in lines if "of it inside the pin" in m]
+        assert len(slow) == 1, lines
+        held = re.search(r"inside the pin \(lock (\d+)ms", slow[0])
+        assert held and int(held.group(1)) >= 400, slow[0]
+
     def case_nothing_deaf_locally_costs_no_process_spawn(self, certdir):
         """THE HOT PATH. `_report_deaf_bridges` runs on every bridge CREATE,
         and the union I added made it shell out to `ps -ww -axo` there —

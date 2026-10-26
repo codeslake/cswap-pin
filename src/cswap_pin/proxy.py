@@ -3282,6 +3282,30 @@ _STREAM_END_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
+# WHERE A REQUEST'S TIME INSIDE THE PIN WENT, for `_note_slow_request`. The MITM
+# opens a dict on its own thread where its pin window opens and takes it where
+# the window closes; the provider and the bridge bookkeeping add into it while
+# it stands. With no dict open (the beat thread, anything outside the window)
+# a stamp records nothing, so those callers pay two clock reads and no more.
+_PIN_STAGES = threading.local()
+
+
+class _stage:
+    """`with _stage("probe"):` adds the block's milliseconds to the open dict."""
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __enter__(self) -> None:
+        self.t0 = time.monotonic()
+
+    def __exit__(self, *_exc) -> None:
+        d = getattr(_PIN_STAGES, "d", None)
+        if d is not None:
+            d[self.name] = d.get(self.name, 0.0) + (
+                time.monotonic() - self.t0) * 1000
+
 
 def slow_report_ms(certdir) -> "float | None":
     """Milliseconds above which a request takes a log line, or None for off.
@@ -9209,7 +9233,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         else:
             verdict, bearer_ref = "unknown", None
             try:
-                fresh = pin_profile_for(token)
+                with _stage("probe"):
+                    fresh = pin_profile_for(token)
             except Exception:  # noqa: BLE001 — a flaky probe must not crash a mint
                 fresh = None
             # COMPARE EMAIL, THE ONLY FIELD THIS SCOPE HAS GROUND TRUTH FOR.
@@ -9290,11 +9315,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # a foreign verdict this same provider gave on some earlier call.
         provider._tls.foreign = False
         provider._tls.quiet = freshen
-        target = _current_target()
+        with _stage("target"):
+            target = _current_target()
+            is_login = target is not None and _pin_is_the_live_login(target[0])
         if target is None:
             return None
         num, mail = target
-        if _pin_is_the_live_login(num):
+        if is_login:
             # NOTHING TO MINT, SO NO REASON: one carried over a handover (see
             # `_carry_in_blind_reason`) would otherwise stand for good.
             _blind("")
@@ -9392,7 +9419,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # unkillable from here, so the holder of the lock stays blocked in
         # that call. Everyone else must not queue behind it: they fail this
         # one request instead. See `_MINT_LOCK_BOUND_S`.
-        if not refresh_lock.acquire(timeout=_MINT_LOCK_BOUND_S):
+        with _stage("lock"):
+            got_lock = refresh_lock.acquire(timeout=_MINT_LOCK_BOUND_S)
+        if not got_lock:
             _stalled.flag = True
             _blind(
                 f"mint stalled: the refresh lock has been held over "
@@ -9445,7 +9474,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # Someone may have rotated it while we waited, or this is the
                 # cold-cache case above and this IS the first read — either way
                 # the read happens here, under the lock.
-                creds = switcher.read_account_credentials(num, mail) or creds
+                with _stage("store"):
+                    creds = switcher.read_account_credentials(num, mail) or creds
                 # ONE LOOK AT THE CLOCK PER BLOB: a second one can disagree
                 # with the guard below and overwrite the held copy.
                 token = _live_token(creds) if creds else None
@@ -9511,7 +9541,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                                 f"refresh {err} for slot {num} ({mail})")
                         return out
 
-                    token, rotated = resolve_pin_token(creds, _consume_recording)
+                    with _stage("refresh"):
+                        token, rotated = resolve_pin_token(
+                            creds, _consume_recording)
                     if token:
                         # THE REFRESH WORKED: the reason a failure left stood
                         # all through it, so `/health` never read a clear one.
@@ -19601,7 +19633,8 @@ class PinProxy:
 
     def _note_slow_request(self, method: str, path: str,
                            total_ms: float, pin_ms: float,
-                           wait_ms: float | None = None) -> None:
+                           wait_ms: float | None = None,
+                           stages: "dict | None" = None) -> None:
         """Record a request that took seconds, because nothing else does.
 
         `daemon.log` carries lifecycle events, so a slow request leaves no
@@ -19618,6 +19651,12 @@ class PinProxy:
         pin's own work is ours to make cheaper (the credential read alone is
         0.02ms on linux and 19.8ms on a mac, where it goes through the
         keychain), the remainder belongs to the chain below us.
+
+        `stages` says where `pin_ms` went (probe, lock, store, refresh,
+        bridge, retry, target), largest first, "other" being what no stamp
+        covers. Without it a heartbeat that spent 8451ms inside the pin could
+        not say whether that was the identity probe or the `refresh_lock`
+        wait. None (the beat thread, an unstamped request) prints today's text.
 
         `wait_ms` SPLITS THAT REMAINDER, and it is the number that decides
         whose problem this is. It runs from the moment the whole request was
@@ -19681,6 +19720,14 @@ class PinProxy:
             ours = max(0.0, total_ms - pin_ms - wait_ms)
             split = (f"{wait_ms:.0f}ms waiting for the answer, "
                      f"{ours:.0f}ms getting it out")
+        stage_txt = ""
+        if stages:
+            parts = {**stages, "other": pin_ms - sum(stages.values())}
+            shown = sorted(((n, ms) for n, ms in parts.items() if round(ms) > 0),
+                           key=lambda p: -p[1])
+            if shown:
+                stage_txt = " (" + ", ".join(
+                    f"{n} {ms:.0f}ms" for n, ms in shown) + ")"
         more = ""
         if suppressed:
             # THE CADENCE IN THE LOG IS THIS COOLDOWN, NOT THE PHENOMENON.
@@ -19690,7 +19737,7 @@ class PinProxy:
             more = f"; {suppressed} more in the last minute"
         _log_lifecycle(
             f"a {method} to {route} took {total_ms:.0f}ms "
-            f"({pin_ms:.0f}ms of it inside the pin; {split}{more}) — a live "
+            f"({pin_ms:.0f}ms of it inside the pin{stage_txt}; {split}{more}) — a live "
             f"view times out on stalls like this"
         )
 
@@ -22079,7 +22126,8 @@ class PinProxy:
                 or _pin_is_noop(self._pin_token_provider):
             return token
         for _ in range(_PIN_WAIT_TRIES):
-            time.sleep(_PIN_WAIT_S)
+            with _stage("retry"):
+                time.sleep(_PIN_WAIT_S)
             token = self._pin_token_provider()
             if token:
                 return token
@@ -23054,6 +23102,7 @@ class PinProxy:
         # TWO CLOCKS, because the total alone cannot say who was slow — see
         # `_note_slow_request`. `_t_pin` closes where the request leaves us.
         _t_req = _t_pin = time.monotonic()
+        _PIN_STAGES.d = {}
         # OUTSIDE THE BEARER GATE, deliberately. Sweeping superseded bridges is
         # our own bookkeeping and has nothing to do with whose token a request
         # carries. Inside `if pinned:` the presence trigger was UNREACHABLE,
@@ -23079,9 +23128,10 @@ class PinProxy:
             # this same config field to decide whose pointers to restamp, so a
             # sweep run against a drifted field stamps the wrong owner — the
             # veto this exists to prevent. Same ordering as `heal`.
-            if path == "/v1/code/sessions":
-                self._reassert_pin_identity()
-            self._report_deaf_bridges()
+            with _stage("bridge"):
+                if path == "/v1/code/sessions":
+                    self._reassert_pin_identity()
+                self._report_deaf_bridges()
             _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
                 self._sweep_bridges_after_connect(_tok)
@@ -23238,6 +23288,7 @@ class PinProxy:
         # inside `_forward`'s status hook, and it takes no arguments from
         # here. One MITM connection is one thread, so there is no sharing.
         self._local.pin_ms = (time.monotonic() - _t_pin) * 1000
+        self._local.pin_stages, _PIN_STAGES.d = _PIN_STAGES.d, None
         self._local.t_req = _t_req
         # CLEARED PER REQUEST. One MITM connection serves many requests on the
         # same thread, so a stale stamp would time this request's wait from
@@ -23780,6 +23831,7 @@ class PinProxy:
                         (time.monotonic() - getattr(
                             self._local, "t_req", time.monotonic())) * 1000,
                         getattr(self._local, "pin_ms", 0.0),
+                        stages=getattr(self._local, "pin_stages", None),
                         wait_ms=(
                             (time.monotonic() - self._local.t_sent) * 1000
                             if getattr(self._local, "t_sent", None) is not None
