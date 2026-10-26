@@ -15700,9 +15700,7 @@ class TestOptimisticConnectIsDetected:
         """
         import cswap_pin.proxy as pp
 
-        # The chain's FIN trails its 200 by a scheduling gap. The pin's EOF
-        # window (a named 5 ms shortcut, T2157) is not this case's to race:
-        # it waits for the FIN, which ends the poll the moment it lands.
+        # The pin's 5 ms EOF window is a named shortcut (T2157); wait for the FIN.
         monkeypatch.setattr(pp, "_TUNNEL_EOF_WINDOW_MS", 2000)
         chain = self._optimistic_chain()
 
