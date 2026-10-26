@@ -10064,8 +10064,10 @@ def _relocation_is_due(certdir: Path, health: dict,
 
     THE OPT-IN ARM (T2939), instead of the clauses from "its holder can be
     asked" to "visible in THIS pid namespace": the caller set `_RELOCATE_ENV`
-    and the recorded pid is NOT alive here, so it is a holder in another
-    namespace and every ps and /proc clause would read "not mine". The daemon's
+    and the recorded pid is NOT a pin daemon of this certdir here (not alive,
+    or a live pid that is not one: a host pid can collide with an unrelated
+    one in this namespace), so it is a holder in another namespace and every
+    ps and /proc clause would read "not mine". The daemon's
     `/health` (it answered as the recorded pid, above) is the witness, through
     the one field `relocated`: absent is a holder that cannot hand across
     namespaces, True is a lineage that already moved once (the ping-pong
@@ -10078,7 +10080,11 @@ def _relocation_is_due(certdir: Path, health: dict,
             and isinstance(beat, (int, float))
             and beat <= _CODE_WATCH_BEAT_MAX_AGE_S):
         return 0
-    if os.environ.get(_RELOCATE_ENV) == "1" and not _pid_alive(pid):
+    # shortcut: a failed ps returns [] and reads the recorded daemon as
+    # invisible here, upgrade if that ever pulls a daemon this caller can see
+    # (the arm still needs its `/health` to say `relocated` False).
+    if os.environ.get(_RELOCATE_ENV) == "1" and (
+            not _pid_alive(pid) or pid not in _pin_daemon_pids(certdir)):
         asked = health.get("relocated") is False
     else:
         holder = (_wedged_parent_holder(pid, certdir)
@@ -14095,19 +14101,33 @@ class PortHolder:
         decides a respawn beside the successor (`_supervise_locked`) or undoes
         a confirmed hand-off (`_on_replace_request`), so the probe waits
         `_PORT_WATCH_PROBE_S` and a miss is asked once more,
-        `_PORT_WATCH_CONFIRM_S`. Another pid's answer is no miss."""
+        `_PORT_WATCH_CONFIRM_S`. Another pid's answer is no miss: while the
+        successor lineage hands over to its own successor both accept, and the
+        new one serves before it publishes (T2942), so the record and the
+        answer can name different live daemons in either order. Both are read
+        again until they agree, within the two probes' total."""
         certdir = getattr(self, "_certdir", None)
         if not (self._handed_off and certdir is not None):
             return 0
-        rec = read_daemon_state(certdir)
-        other = int(rec.get("pid") or 0) if rec else 0
-        if other in (0, proc.pid):
-            return 0
-        if _pid_alive(other):
-            return other
-        answered = (_health_pid(self.port, _PORT_WATCH_PROBE_S)
-                    or _health_pid(self.port, _PORT_WATCH_CONFIRM_S))
-        return other if answered == other else 0
+        end = time.monotonic() + _PORT_WATCH_PROBE_S + _PORT_WATCH_CONFIRM_S
+        timeout, missed = _PORT_WATCH_PROBE_S, False
+        while (left := end - time.monotonic()) > 0:
+            rec = read_daemon_state(certdir)
+            other = int(rec.get("pid") or 0) if rec else 0
+            if other in (0, proc.pid):
+                return 0
+            if _pid_alive(other):
+                return other
+            answered = _health_pid(self.port, min(timeout, left))
+            if answered == other:
+                return other
+            if answered is None:
+                if missed:
+                    return 0
+                timeout, missed = _PORT_WATCH_CONFIRM_S, True
+            else:
+                time.sleep(0.1)         # `_await_successor_state`'s own tick
+        return 0
 
     def _on_replace_request(self, signum, frame) -> None:
         # THE SAME LOCK `_supervise` TAKES BEFORE ITS OWN DECISION. `_spawn()`
