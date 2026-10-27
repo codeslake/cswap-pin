@@ -9942,6 +9942,11 @@ def _can_mint(provider) -> "bool | None":
         return None
     if _mint_lock_busy(provider) is not None:
         return None
+    # `mint_raised` is THIS CALL's own: `blind_reason` persists across calls
+    # (and handovers), so a raise it never saw would read as an older cause.
+    # A bare function, or a provider that rejects attributes, just has none.
+    with contextlib.suppress(AttributeError):
+        provider.mint_raised = ""
     try:
         token = provider()
         if token:
@@ -9955,7 +9960,9 @@ def _can_mint(provider) -> "bool | None":
         if getattr(getattr(provider, "_tls", None), "foreign", False):
             return True
         return _pin_is_noop(provider)
-    except Exception:  # noqa: BLE001 — a health question is never fatal
+    except Exception as e:  # noqa: BLE001 -- a health question is never fatal
+        with contextlib.suppress(AttributeError):
+            provider.mint_raised = f"{type(e).__name__}: {e}"
         return False
 
 
@@ -12889,9 +12896,11 @@ def blind_recycle_due(certdir: Path, now: float) -> bool:
     return (now - last) >= wait
 
 
-def note_blind_recycle(certdir: Path, now: float) -> None:
+def note_blind_recycle(certdir: Path, now: float) -> int:
     """Record that we are replacing ourselves, so the successor waits longer
-    if it turns out to be blind too."""
+    if it turns out to be blind too. Returns the step of the backoff. When the
+    note cannot be written the step is still n+1 while the file keeps n, so
+    consecutive replaces on an unwritable certdir repeat the same "#k"."""
     import json
 
     try:
@@ -12904,6 +12913,7 @@ def note_blind_recycle(certdir: Path, now: float) -> None:
             json.dumps({"at": now, "n": n + 1}))
     except OSError:
         pass  # advisory; a recycle that cannot be recorded still happens
+    return n + 1
 
 
 def clear_blind_recycle(certdir: Path) -> None:
@@ -16198,11 +16208,19 @@ def _watch_own_code(
             # nothing. Both wrong answers share one cause: treat busy as its
             # own case, not as either verdict.
             _busy_s = _mint_lock_busy(_mint_provider) if _mint_provider else None
-            blind = _can_mint(_mint_provider) is False
+            mint = _can_mint(_mint_provider)
+            blind = mint is False
+            # THE CAUSE, TAKEN WITH THE VERDICT: a request thread rewrites
+            # `blind_reason` before the log line below reads it.
+            blind_cause = (getattr(_mint_provider, "mint_raised", "")
+                           or getattr(_mint_provider, "blind_reason", "")
+                           or "no reason recorded")
             now = time.time()
             if _busy_s is not None:
                 _note_mint_busy(_busy_s)
-            elif not blind:
+            # `mint is None` with a provider is a lock taken between the two
+            # looks: a tick that tested nothing ends no episode.
+            elif mint is True or _mint_provider is None:
                 clear_blind_recycle(certdir)
                 setattr(server, "_dead_lineage_noted", False)
                 # AND TAKE THE MARK BACK. Recovery is not only "stop trying to
@@ -16325,10 +16343,11 @@ def _watch_own_code(
                    else "cannot mint the pinned token" if replace_for_blind
                    else "code on disk changed")
             if replace_for_blind:
-                note_blind_recycle(certdir, now)
+                n = note_blind_recycle(certdir, now)
                 _log_lifecycle(
-                    "cannot mint the pinned token — replacing ourselves so a "
-                    "successor can, while this one keeps serving"
+                    f"cannot mint the pinned token ({blind_cause}; blind "
+                    f"replace #{n}) — replacing ourselves so a successor can, "
+                    "while this one keeps serving"
                 )
             if starved:
                 _log_lifecycle(
