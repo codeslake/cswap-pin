@@ -14124,10 +14124,10 @@ class PortHolder:
         failed leaves the record naming ``proc`` itself, so it reads 0 and this
         holder keeps its respawn duty. Read, never carried: it is proof the
         successor published and still lives. A successor in another pid
-        namespace reads dead to `_pid_alive`, so the port's own `/health` can
-        name it instead (`_health_pid`, the `_read_alive_port` pattern): else
-        this holder keeps its respawn duty beside it, two acceptors on one
-        socket.
+        namespace is no pin daemon of this certdir in this ps, so the port's
+        own `/health` can name it instead (`_health_pid`, the
+        `_read_alive_port` pattern): else this holder keeps its respawn duty
+        beside it, two acceptors on one socket.
 
         A SLOW ANSWER IS NOT "NOBODY" (the port watch's rule, T1935): that read
         decides a respawn beside the successor (`_supervise_locked`) or undoes
@@ -14148,7 +14148,14 @@ class PortHolder:
             other = int(rec.get("pid") or 0) if rec else 0
             if other in (0, proc.pid):
                 return 0
-            if _pid_alive(other):
+            # A PID THAT ANSWERS `kill 0` IS NOT THE SUCCESSOR (T2948): from
+            # another pid namespace its number can be an unrelated live
+            # process here while the successor is dead, and standing down then
+            # leaves the port unserved. Proof is a pin daemon of this certdir
+            # in THIS ps; else the port is asked. A failed ps reads [] and
+            # falls to the probe. It runs only for a pid that signals: 28 ms
+            # on 579 processes, bounded by its own 5 s.
+            if _pid_alive(other) and other in _pin_daemon_pids(certdir):
                 return other
             answered = _health_pid(self.port, min(timeout, left))
             if answered == other:

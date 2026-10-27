@@ -1386,7 +1386,9 @@ tunnels, so the **socket** moves instead.
   see its pid either, so it finds the rendezvous by a connect instead of
   `kill 0` (the helper accepts until a descriptor arrives, under one
   deadline), and the old holder reads the successor from the port's `/health`
-  when its pid reads dead, so it stands down instead of respawning beside it.
+  unless its pid is a pin daemon of this certdir in the holder's own ps (a pid
+  that merely answers `kill 0` may be an unrelated process here, T2948), so it
+  stands down for a live successor and not for a dead one.
 - **Nothing is cut and nothing is stranded if it fails.** If the helper dies
   or the successor never publishes, the old daemon keeps serving past its
   bound (no capped drain, no exit 75) and its holder keeps its respawn duty.
