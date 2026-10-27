@@ -27905,9 +27905,9 @@ class TestChromeBridgeCarriesThePinnedToken:
         loop spun on it for ever (an unclean one raised, which ended it)."""
         bridge = _FakeBridgeOtherTraffic(certdir, "post")
         tls = ssl.create_default_context(cafile=str(certdir / "ca.pem")) \
-            .wrap_socket(socket.create_connection(("127.0.0.1", bridge.port)),
+            .wrap_socket(socket.create_connection(("127.0.0.1", bridge.port),
+                                                  timeout=1),
                          server_hostname="bridge.claudeusercontent.com")
-        tls.settimeout(1)
         tls.sendall(self.POST[:-5])
         try:
             tls.unwrap()  # sends close_notify, then waits for the reply
