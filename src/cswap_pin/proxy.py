@@ -12737,9 +12737,9 @@ def blind_recycle_due(certdir: Path, now: float) -> bool:
     return (now - last) >= wait
 
 
-def note_blind_recycle(certdir: Path, now: float) -> None:
+def note_blind_recycle(certdir: Path, now: float) -> int:
     """Record that we are replacing ourselves, so the successor waits longer
-    if it turns out to be blind too."""
+    if it turns out to be blind too. Returns the step of the backoff."""
     import json
 
     try:
@@ -12752,6 +12752,7 @@ def note_blind_recycle(certdir: Path, now: float) -> None:
             json.dumps({"at": now, "n": n + 1}))
     except OSError:
         pass  # advisory; a recycle that cannot be recorded still happens
+    return n + 1
 
 
 def clear_blind_recycle(certdir: Path) -> None:
@@ -16173,10 +16174,13 @@ def _watch_own_code(
                    else "cannot mint the pinned token" if replace_for_blind
                    else "code on disk changed")
             if replace_for_blind:
-                note_blind_recycle(certdir, now)
+                n = note_blind_recycle(certdir, now)
+                reason = (getattr(_mint_provider, "blind_reason", "")
+                          or "no reason recorded")
                 _log_lifecycle(
-                    "cannot mint the pinned token — replacing ourselves so a "
-                    "successor can, while this one keeps serving"
+                    f"cannot mint the pinned token ({reason}; blind replace "
+                    f"#{n}) — replacing ourselves so a successor can, while "
+                    "this one keeps serving"
                 )
             if starved:
                 _log_lifecycle(

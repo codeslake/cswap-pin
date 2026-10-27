@@ -32033,7 +32033,8 @@ class TestABlindDaemonRepairsItself:
         from cswap_pin import proxy as pin_proxy
 
         self._own_record(tmp_path)
-        marks = self._count_marks(monkeypatch)
+        marks, said = self._count_marks(monkeypatch), []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
 
         signalled, exited = self._drive(
             monkeypatch, tmp_path, self._CannotMint(reason))
@@ -32041,6 +32042,35 @@ class TestABlindDaemonRepairsItself:
         assert any(sig == pin_proxy._REPLACE_ME_SIGNAL for _p, sig in signalled)
         assert exited == [0]
         assert marks == []
+        # THE LINE NAMES ITS CAUSE AND ITS STEP: a replace line with neither
+        # left a fleet host's two replaces 35 s apart unexplainable.
+        lines = [m for m in said if "replacing ourselves so a successor" in m]
+        assert len(lines) == 1, said
+        assert f"({reason or 'no reason recorded'}; blind replace #1)" in lines[0], (
+            lines)
+
+    def test_a_blind_daemon_inside_its_backoff_does_not_replace_itself(
+            self, monkeypatch, tmp_path):
+        """THE WIRING of `blind_recycle_due`, which the helper tests above do
+        not reach: dropping it from the watchdog's condition left every one of
+        them green while a blind daemon replaced itself on every tick."""
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.note_blind_recycle(tmp_path, time.time())     # not yet due
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+
+        signalled, exited = self._drive(
+            monkeypatch, tmp_path,
+            self._CannotMint("refresh transient for slot 2 (x)"))
+
+        assert signalled == [] and exited == [], (
+            f"a blind daemon inside its backoff replaced itself: {signalled}")
+        assert not [m for m in said if "replacing ourselves" in m], said
+        assert json.loads(pin_proxy._blind_recycle_path(tmp_path).read_text())[
+            "n"] == 1, "the backoff advanced without a replace"
 
     def test_a_dead_lineage_mark_is_cleared_when_minting_works_again(
             self, monkeypatch, tmp_path):
@@ -32136,11 +32166,13 @@ class TestABlindDaemonRepairsItself:
         from cswap_pin import proxy as pin_proxy
 
         t = 1000.0
-        pin_proxy.note_blind_recycle(tmp_path, t)
+        # THE COUNT IS RETURNED, so the replace line can say which step of the
+        # backoff it is (#1 twice means a good tick reset it in between).
+        assert pin_proxy.note_blind_recycle(tmp_path, t) == 1
         assert pin_proxy.blind_recycle_due(tmp_path, t + 59) is False
         assert pin_proxy.blind_recycle_due(tmp_path, t + 61) is True
 
-        pin_proxy.note_blind_recycle(tmp_path, t)          # second attempt
+        assert pin_proxy.note_blind_recycle(tmp_path, t) == 2   # second attempt
         assert pin_proxy.blind_recycle_due(tmp_path, t + 119) is False
         assert pin_proxy.blind_recycle_due(tmp_path, t + 121) is True
 
