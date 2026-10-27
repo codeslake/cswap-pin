@@ -11183,7 +11183,9 @@ def _host_head() -> str:
     Read from `.git` directly rather than through a subprocess: this runs at
     import in a proxy that must not spawn, and a detached HEAD or a missing
     ref simply yields no suffix. A wheel install has no `.git` and is silent,
-    which is correct -- there its version IS the whole provenance.
+    which is correct -- there its version IS the whole provenance. The walk
+    ends at the wheel's environment (a `pyvenv.cfg`, or `site-packages`): a
+    repo above it is where the venv or uv's cache happens to live (T2958).
     """
     try:
         import pathlib
@@ -11192,6 +11194,8 @@ def _host_head() -> str:
         for root in (d, *d.parents):
             g = root / ".git"
             if not g.is_dir():
+                if root.name == "site-packages" or (root / "pyvenv.cfg").exists():
+                    return ""
                 continue
             head = (g / "HEAD").read_text().strip()
             if head.startswith("ref: "):

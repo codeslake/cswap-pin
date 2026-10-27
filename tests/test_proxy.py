@@ -33621,10 +33621,11 @@ class TestTheLogLineNamesTheHostCheckoutToo:
     decide whether a behaviour was fixed needs both halves.
     """
 
-    def _fake_host(self, tmp_path, monkeypatch, head=None, ref=None):
+    def _fake_host(self, tmp_path, monkeypatch, head=None, ref=None,
+                   pkg="src/claude_swap"):
         """A package on disk, optionally inside a git checkout."""
         root = tmp_path / "cswap_fork"
-        pkg = root / "src" / "claude_swap"
+        pkg = root / pkg
         pkg.mkdir(parents=True)
         (pkg / "__init__.py").write_text("")
         if head is not None:
@@ -33680,6 +33681,35 @@ class TestTheLogLineNamesTheHostCheckoutToo:
         tag = pp._component_tag()
         assert tag.startswith("cswap-pin/"), tag
         assert "+cswap_fork@5b552e15" in tag, tag
+
+    _REPO = {"head": "ref: refs/heads/integration\n",
+             "ref": ("refs/heads/integration", "5b552e15deadbeef\n")}
+
+    @pytest.mark.parametrize("pkg, cfg", [
+        ("env/lib/python3.12/site-packages/claude_swap", "env"),
+        ("env/lib/python3.12/site-packages/claude_swap", None),
+        ("env/lib/claude_swap", "env"),
+    ])
+    def test_CONTROL_a_wheel_in_an_environment_never_reads_the_repo_above_it(
+            self, tmp_path, monkeypatch, pkg, cfg):
+        """T2958: a PyPI wheel whose environment sits under a checkout (uv's
+        cache under a HOME inside a repo) took that repo's sha as its host.
+        The walk ends at the environment: a `pyvenv.cfg`, or `site-packages`."""
+        root = self._fake_host(tmp_path, monkeypatch, pkg=pkg, **self._REPO)
+        if cfg:
+            (root / cfg / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        import cswap_pin.proxy as pp
+        from cswap_pin import __version__
+        assert pp._host_head() == ""
+        assert pp._component_tag() == f"cswap-pin/{__version__}"
+
+    def test_a_checkout_with_its_own_venv_beside_the_source_still_names_it(
+            self, tmp_path, monkeypatch):
+        root = self._fake_host(tmp_path, monkeypatch, **self._REPO)
+        (root / ".venv").mkdir()
+        (root / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+cswap_fork@5b552e15"
 
 
 class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
