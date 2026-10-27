@@ -1451,10 +1451,12 @@ any settings `env` entry naming a variable the host set at spawn, so no
 configuration reaches it. Desktop bills the account the app is signed into,
 and after a rotation it is the one client left on "Weekly limit reached".
 
-Its traffic still comes through this proxy, and its User-Agent names the
-entrypoint (`claude-cli/<ver> (external, claude-desktop)`). So, opt-in, the
-proxy can re-bill it: turn on cswap's `pin.desktopFollows` setting (a bool,
-default `false`). Any of the three flips it:
+Its traffic comes through this proxy when the Code tab's `HTTPS_PROXY` names it
+([not every Desktop does](#when-the-code-tab-does-not-reach-this-proxy)), and
+its User-Agent names the entrypoint (`claude-cli/<ver> (external,
+claude-desktop)`). So, opt-in, the proxy can re-bill it: turn on cswap's
+`pin.desktopFollows` setting (a bool, default `false`). Any of the three flips
+it:
 
 ```bash
 cswap config set pin.desktopFollows true      # or false
@@ -1502,6 +1504,40 @@ status code; `passthrough` by reason (`no-token`, `stale`, `expiring`,
 `same-token`); `snapshot` (`age_s`, `failures`); and `since`, when this process
 started counting. Counts only, and nothing is written to a file. `daemon.log`
 records a refusal (at most one line per status code a minute).
+
+### When the Code tab does not reach this proxy
+
+Desktop builds the Code-session environment from its own environment plus the
+session's environment variables, then fills `HTTPS_PROXY`, `HTTP_PROXY` and
+`NO_PROXY` only where they are missing, from what its Chromium proxy settings
+resolve for the API host. A Desktop started with `--proxy-server=<another
+proxy>` (or behind a system proxy) therefore sends the Code tab around this
+proxy, and the settings `env` this proxy writes cannot override that: under
+the desktop entrypoint the launch environment wins. The symptom is `/health`'s
+`inference_follow.swapped` staying 0 with an empty `passthrough`.
+
+The remedy is a local environment in Desktop's Code tab (environment menu,
+"Edit environment": Name, Folders, Environment variables) holding two of the
+values this proxy writes into the CLI's config `env`, with `<port>` from
+`cswap pin --get_port` and `<ca>` the file `NODE_EXTRA_CA_CERTS` names there
+(`<certdir>/ca.pem`, or `<certdir>/ca-bundle.pem` when a hop's CA is merged in;
+`<certdir>` is what `cswap pin --get_certdir` prints):
+
+```
+HTTPS_PROXY=http://127.0.0.1:<port>
+NODE_EXTRA_CA_CERTS=<ca>
+```
+
+Start Code sessions from it. A new session takes it without a Desktop relaunch;
+a running one keeps its proxy, and Desktop's chat keeps its own. Conditions:
+
+- Fix the port first (`cswap pin --set_port <port>`): a version handover keeps
+  the port, and a cold start rebinds the fixed one.
+- An environment with no folder applies only to sessions started without a
+  folder; otherwise its Folders must match the session's exactly.
+- A Remote Control environment session does not take these variables.
+- While this proxy is down, a new session from it fails rather than falling
+  back to the other proxy.
 
 ## Falling through a dead hop
 
