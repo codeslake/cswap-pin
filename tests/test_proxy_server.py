@@ -28,7 +28,7 @@ import pytest
 
 from cswap_pin.proxy import ensure_ca
 
-from conftest import PIN_STAMP, run_cases
+from conftest import PIN_STAMP, run_cases, short_root
 
 
 @pytest.fixture(autouse=True)
@@ -409,6 +409,27 @@ def _mkdir(p):
 @pytest.fixture
 def certdir(tmp_path):
     return _make_certdir(tmp_path)
+
+
+@pytest.fixture
+def short_certdir():
+    """A factory for a certdir short enough to bind `.carry-<pid>.sock` in: an
+    AF_UNIX path holds 103 bytes on macOS (107 on Linux) and the CI runner's
+    pytest tree is 82 before `/c<n>0/.carry-<pid>.sock`. Rooted at `/tmp/r*`
+    like the other cases that bind one (`short_root`), removed with the test.
+    Ask for the case's own `certdir` too: it is built first and fills the CA
+    cache."""
+    import shutil
+
+    made = []
+
+    def make():
+        made.append(short_root().resolve())
+        return _make_certdir(made[-1])
+
+    yield make
+    for root in made:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 class _StallableBridgeUpstream:
@@ -27414,7 +27435,7 @@ class TestSessionAffinityOnMessages:
             assert not pp._affinity_last, "it kept the bodies it no longer serves"
 
     def case_a_handover_carries_the_kept_bodies_memory_to_memory(
-            self, monkeypatch, certdir):
+            self, monkeypatch, certdir, short_certdir):
         """A session idle across a handover kept no body in the successor: a
         held one was refused `a held thread with no rebuild`, a full one had
         no entry. The predecessor sends its `full` bodies and its held ones
@@ -27426,6 +27447,7 @@ class TestSessionAffinityOnMessages:
         import stat
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
+        tree, certdir = certdir.parent, short_certdir()
         marker = "BODY-MARKER-9c1e7f"
         seen = self._wire(monkeypatch, certdir)
         monkeypatch.setattr(pp, "_KEEPALIVE_FORMS",
@@ -27452,7 +27474,7 @@ class TestSessionAffinityOnMessages:
             assert os.umask(umask) == 0o022, "the bind left the umask changed"
             sock = succ._carry_in_path
             assert stat.S_IMODE(sock.stat().st_mode) == 0o600, sock.stat()
-            assert len(str(sock)) < 107, sock
+            assert len(str(sock)) < 104, sock
             # the successor's first snapshot has not landed: the bodies wait
             pp._affinity_snap["at"] = float("-inf")
             started = time.monotonic()
@@ -27502,7 +27524,7 @@ class TestSessionAffinityOnMessages:
             assert self._health(certdir)["carry"] == {"sent": 3, "landed": 2}
             succ._trace_tick_stop.set()
             succ._keepalive_thread.join(5)
-        roots = {certdir.parent}
+        roots = {tree, certdir}
         if str(Path.home()).startswith(tempfile.gettempdir()):
             roots.add(Path.home())  # the suite runs under a scratch HOME
         for root in roots:
@@ -27533,9 +27555,10 @@ class TestSessionAffinityOnMessages:
         assert pp._affinity_last["S"][8] == "tok-A"
 
     def case_an_unreachable_or_stalled_successor_does_not_hold_up_the_release(
-            self, monkeypatch, certdir):
+            self, monkeypatch, certdir, short_certdir):
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
+        certdir = short_certdir()
         self._armed(monkeypatch, certdir, forms=("full",),
                     body=self._body(pad=1500000))
         monkeypatch.setattr(pp, "_CARRY_OUT_S", 0.5)
@@ -27587,7 +27610,7 @@ class TestSessionAffinityOnMessages:
         return srv, got, t
 
     def case_a_deploy_carries_the_bodies_across_both_handovers(
-            self, monkeypatch, certdir):
+            self, monkeypatch, certdir, short_certdir):
         """A fleet deploy is two handovers. The holder ask: gen1 releases its
         listener to gen2, which the holder spawned and which has bound its carry
         socket. Then gen2's watchdog finds the holder on old code, retires it,
@@ -27597,6 +27620,7 @@ class TestSessionAffinityOnMessages:
         spawn's wait (a minute apart) must not drop the bodies first."""
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
+        certdir = short_certdir()
         self._armed(monkeypatch, certdir, forms=("full",))
         for env in (pp._HELD_BY_ENV, pp._SELF_HEAL_ENV):
             monkeypatch.delenv(env, raising=False)
@@ -27667,13 +27691,14 @@ class TestSessionAffinityOnMessages:
             assert not pp._affinity_last, "a stale debt kept the bodies up"
 
     def case_a_released_process_takes_no_carry_and_a_sender_picks_its_target(
-            self, monkeypatch, certdir):
+            self, monkeypatch, certdir, short_certdir):
         """A process that released its listener is no longer the server, and
         one that listened for five minutes on its carry socket was a target a
         later handover could hand the bodies to. The sender goes to the
         process `proxy.json` names, else the newest socket, never the first
         of the sorted names."""
         from cswap_pin import proxy as pp
+        certdir = short_certdir()
         self._armed(monkeypatch, certdir, forms=("full",))
         with self._pair(certdir, started=True) as (draining, _):
             sock = draining._carry_in_path

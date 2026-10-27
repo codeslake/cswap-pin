@@ -18897,8 +18897,9 @@ class PinProxy:
         """When armed, listen on `<certdir>/.carry-<pid>.sock` (0600) for the
         kept bodies a predecessor sends (`_carry_out`), on a thread that gives
         up after `_CARRY_IN_S` or when `release_listener` closes the socket. A
-        path the OS refuses (over 107 bytes, a read-only directory) carries
-        nothing in, and the bodies are dropped as they always were."""
+        path the OS refuses (over 107 bytes on Linux, 103 on macOS; a
+        read-only directory) carries nothing in, and the bodies are dropped as
+        they always were."""
         t = getattr(self, "_carry_in_thread", None)
         certdir = getattr(self, "_certdir", None)  # a stub proxy has none
         if (t is not None and t.is_alive()
