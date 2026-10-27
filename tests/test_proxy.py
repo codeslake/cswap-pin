@@ -33824,6 +33824,82 @@ class TestTheLogLineNamesTheHostCheckoutToo:
         import cswap_pin.proxy as pp
         assert pp._host_head() == "+cswap_fork@5b552e15"
 
+    #: what `git pack-refs` leaves: a header, other refs, a peeled `^` line.
+    _PACKED = ("# pack-refs with: peeled fully-peeled sorted \n"
+               "1111111111111111111111111111111111111111 refs/heads/feature\n"
+               "^2222222222222222222222222222222222222222\n"
+               "c0ffee11deadbeefc0ffee11deadbeefc0ffee11 refs/heads/feat\n")
+
+    def _worktree(self, tmp_path, monkeypatch, head, loose=None, packed=False,
+                  rel=False):
+        """T2965: a linked worktree nested in its main checkout, as agents run
+        them. There `.git` is a FILE naming a per-worktree gitdir, which holds
+        that worktree's own HEAD; the branch refs live in the main `.git`."""
+        main = self._fake_host(tmp_path, monkeypatch,
+                               pkg=".claude/worktrees/wt/src/claude_swap",
+                               **self._REPO)
+        gd = main / ".git" / "worktrees" / "wt"
+        gd.mkdir(parents=True)
+        (gd / "HEAD").write_text(head)
+        (gd / "commondir").write_text("../..\n")
+        link = "../../../.git/worktrees/wt" if rel else str(gd)
+        (main / ".claude/worktrees/wt/.git").write_text(f"gitdir: {link}\n")
+        if loose:
+            (main / ".git/refs/heads/feat").write_text(loose)
+        if packed:
+            (main / ".git/packed-refs").write_text(self._PACKED)
+
+    @pytest.mark.parametrize("rel, packed", [
+        (False, False), (True, False), (False, True)])
+    def test_a_worktree_stamps_its_own_branch_head_not_the_main_checkouts(
+            self, tmp_path, monkeypatch, rel, packed):
+        self._worktree(tmp_path, monkeypatch, "ref: refs/heads/feat\n",
+                       loose=None if packed else "c0ffee11deadbeef\n",
+                       packed=packed, rel=rel)
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+wt@c0ffee11"
+
+    def test_a_detached_worktree_stamps_its_raw_sha_and_its_own_name(
+            self, tmp_path, monkeypatch):
+        self._worktree(tmp_path, monkeypatch, "abcdef1234567890\n")
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+wt@abcdef12"
+
+    def test_a_packed_ref_still_stamps_in_a_plain_checkout(
+            self, tmp_path, monkeypatch):
+        """`git gc` packs the refs and deletes the loose file; the stamp must
+        not vanish with it."""
+        root = self._fake_host(tmp_path, monkeypatch,
+                               head="ref: refs/heads/feat\n")
+        (root / ".git" / "packed-refs").write_text(self._PACKED)
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+cswap_fork@c0ffee11"
+
+    def test_CONTROL_a_ref_in_neither_place_is_silent(
+            self, tmp_path, monkeypatch):
+        root = self._fake_host(tmp_path, monkeypatch,
+                               head="ref: refs/heads/nope\n")
+        (root / ".git" / "packed-refs").write_text(self._PACKED)
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == ""
+
+    def test_CONTROL_a_symlinked_wheel_never_reads_the_repo_its_cache_is_in(
+            self, tmp_path, monkeypatch):
+        """uv `--link-mode=symlink` links each installed file into its cache,
+        so the RESOLVED path leaves `site-packages` and can reach a repo above
+        the cache; the unresolved path still passes through it."""
+        root = self._fake_host(tmp_path, monkeypatch,
+                               pkg="cache/archive-v0/h/claude_swap",
+                               **self._REPO)
+        real = root / "cache/archive-v0/h/claude_swap/__init__.py"
+        link = root / "venv/lib/python3.12/site-packages/claude_swap/__init__.py"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real)
+        import sys
+        monkeypatch.setattr(sys.modules["claude_swap"], "__file__", str(link))
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == ""
+
 
 class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
     """`<data>/settings.json` is often a symlink into a repo several machines
