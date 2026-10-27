@@ -9808,7 +9808,7 @@ def _can_mint(provider) -> "bool | None":
         if getattr(getattr(provider, "_tls", None), "foreign", False):
             return True
         return _pin_is_noop(provider)
-    except Exception as e:  # noqa: BLE001 — a health question is never fatal
+    except Exception as e:  # noqa: BLE001 -- a health question is never fatal
         with contextlib.suppress(AttributeError):
             provider.mint_raised = f"{type(e).__name__}: {e}"
         return False
