@@ -2261,7 +2261,10 @@ class _LoopbackConnectProxy:
             self.connects += 1
             buf = b""
             while b"\r\n\r\n" not in buf:
-                buf += conn.recv(1)
+                d = conn.recv(1)
+                if not d:
+                    return
+                buf += d
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             # blind-pipe both directions
@@ -2293,6 +2296,17 @@ class TestLoopbackChainTrust:
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
+
+    def case_a_chain_stopped_before_any_connect_ends_its_thread(self):
+        """`stop()` wakes the accept with a connect that closes at once. The
+        helper's head read took that EOF for "more later" and spun on `recv`
+        for the rest of the process, a core each (T2951: two of them burnt 55.6
+        s and 24.8 s of CPU in one file run, starving every real-socket timing
+        case after them)."""
+        chain = _LoopbackConnectProxy(("127.0.0.1", 9))
+        chain.stop()
+        assert not chain._thr.is_alive(), (
+            "the stopped chain's thread is still running")
 
     def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
@@ -2394,7 +2408,9 @@ class _StallingHop:
     seconds and then serves, a CONNECT blind-piped to ``target`` and anything
     else a canned 200. ``reached`` is set when the request head arrived;
     ``cut`` when the pin's side of that leg ended (EOF or reset), which is how
-    a case sees the hop leg closed. ``reply`` (with ``delay=None``) is sent
+    a case sees the hop leg closed; a connection that ends before its head is
+    not that leg (T2951: something on the host connects to loopback listeners
+    and closes at once). ``reply`` (with ``delay=None``) is sent
     first and then nothing: a reply head and part of a body, then silence.
     ``max_conns`` makes it a hop out of fds: past that many live connections a
     request is answered 502. ``hold_rest``: a CONNECT for anything but
@@ -2429,7 +2445,7 @@ class _StallingHop:
     def _serve(self, conn):
         import select
 
-        counted = False
+        counted = served = False
         try:
             head = b""
             while b"\r\n\r\n" not in head:
@@ -2437,6 +2453,7 @@ class _StallingHop:
                 if not chunk:
                     return
                 head += chunk
+            served = True
             self.reached.set()
             if self._budget:
                 counted = self._budget.acquire(blocking=False)
@@ -2475,7 +2492,8 @@ class _StallingHop:
         finally:
             if counted:
                 self._budget.release()
-            self.cut.set()
+            if served:
+                self.cut.set()
 
     def stop(self):
         self._srv.close()
@@ -2764,6 +2782,12 @@ class TestAClientThatHangsUpOnASilentHop:
                     proxy, (lambda: conn.fileno() < 0) if plain
                     else (lambda: served[0].fileno() < 0), far)
             else:
+                if plain:
+                    # Not the request leg: something on the host connects to a
+                    # loopback listener and closes at once (T2951: measured on
+                    # a bare hop with no pin, 4 in 60 s).
+                    socket.create_connection(("127.0.0.1", far.port),
+                                             timeout=5).close()
                 client.sendall(b"G")
                 assert not far.cut.wait(2.0), (
                     "a connected client's reply was cut mid-body")
@@ -4985,6 +5009,7 @@ class TestChainRediscovery:
         this). That path also fell through to `egress REFUSED` with no hop
         reason above it.
         """
+        monkeypatch.setattr("cswap_pin.proxy._TUNNEL_EOF_WINDOW_MS", 2000)
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
@@ -5005,6 +5030,7 @@ class TestChainRediscovery:
                             break
                         seen += d
                     c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    time.sleep(0.05)  # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -6167,7 +6193,10 @@ class TestChainRediscovery:
                 c1, _ = srv.accept()
                 data = b""
                 while b"\r\n\r\n" not in data:
-                    data += c1.recv(4096)
+                    chunk = c1.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
                 c1.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 c1.close()
 
@@ -6176,7 +6205,10 @@ class TestChainRediscovery:
                 c2, _ = srv.accept()
                 data = b""
                 while b"\r\n\r\n" not in data:
-                    data += c2.recv(4096)
+                    chunk = c2.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
                 c2.sendall(
                     b"HTTP/1.1 101 Switching Protocols\r\n"
                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
@@ -6261,7 +6293,10 @@ class TestChainRediscovery:
                 c, _ = srv.accept()
                 data = b""
                 while b"\r\n\r\n" not in data:
-                    data += c.recv(4096)
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
                 reached_hold.set()
                 release.wait(10)
                 c.sendall(
@@ -8001,7 +8036,10 @@ class TestAbsoluteFormPassthrough:
                 c, _ = srv.accept()
                 data = b""
                 while b"\r\n\r\n" not in data:
-                    data += c.recv(4096)
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
                 origin_seen["req"] = data.decode("latin1").splitlines()[0]
                 c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
                 c.close()
@@ -15659,6 +15697,7 @@ class TestOptimisticConnectIsDetected:
                             break
                         buf += d
                     c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    time.sleep(0.05)   # a chain thread descheduled here (T2951)
                 except OSError:
                     pass
                 finally:
@@ -15683,6 +15722,8 @@ class TestOptimisticConnectIsDetected:
         """
         import cswap_pin.proxy as pp
 
+        # The pin's 5 ms EOF window is a named shortcut (T2157); wait for the FIN.
+        monkeypatch.setattr(pp, "_TUNNEL_EOF_WINDOW_MS", 2000)
         chain = self._optimistic_chain()
 
         peer = socket.socket()
