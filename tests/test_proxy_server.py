@@ -14827,7 +14827,8 @@ class TestDrainReportsWhatItCut:
         _PUMP.reset_for_tests()
         peer = socket.socket()
         peer.bind(("127.0.0.1", 0))
-        peer.listen(1)
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        peer.listen(4)
         port = peer.getsockname()[1]
         _stray(port)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
@@ -28212,7 +28213,8 @@ class TestChromeBridgeCarriesThePinnedToken:
         monkeypatch.setattr(px, "_CHROME_HANDSHAKE_S", 1.0)
         silent = socket.socket()
         silent.bind(("127.0.0.1", 0))
-        silent.listen(1)
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        silent.listen(4)
         silent.settimeout(10)
         _stray(silent.getsockname()[1])
         proxy = px.PinProxy(certdir=certdir, pin_token_provider=lambda: "P")
