@@ -20211,7 +20211,16 @@ class PinProxy:
             certdir = getattr(self, "_certdir", None)
             elsewhere: set = set()
             mute = []
-            for p in (_pin_daemon_pids(certdir) if certdir else ()):
+            # THE MARKERS, NOT `ps` (T2975): `ps` sees this pid namespace only,
+            # and a relocated pin shares its certdir with host drainers it
+            # cannot see (22 bridges called deaf, 19 held). A marker crosses
+            # the namespace; its mtime (`is_draining`) is the liveness test.
+            for m in (Path(certdir).glob(f"{_DRAINING_PREFIX}*")
+                      if certdir else ()):
+                try:
+                    p = int(m.name[len(_DRAINING_PREFIX):])
+                except ValueError:      # a beat's `.<pid>.cswap-tmp`
+                    continue
                 if p == os.getpid() or not is_draining(certdir, p):
                     continue
                 ids, said = draining_bridges(certdir, p)

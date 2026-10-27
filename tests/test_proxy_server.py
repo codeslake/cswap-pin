@@ -12080,16 +12080,12 @@ class TestDrainReportsWhatItCut:
         reads empty here is exactly as unearned a CLEAR as the cheap
         branch's.
         """
-        import os
         import threading
 
         import cswap_pin.proxy as pp
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
-        real_draining = pp.is_draining
-        real_held = pp.draining_bridges
         pp._log_lifecycle = lines.append
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -12111,9 +12107,8 @@ class TestDrainReportsWhatItCut:
                 "/v1/code/sessions/cse_B/worker/messages", now=200.0)
             srv._connected_bridges = {"cse_A", "cse_B"}
 
-            pp._pin_daemon_pids = lambda _c: [os.getpid(), 4242]
-            pp.is_draining = lambda _c, pid: pid == 4242
-            pp.draining_bridges = lambda _c, pid: ({"cse_A"}, True)
+            pp.draining_marker_path(certdir, 4242).write_text(
+                f"{time.time()}\n0\n0\n0.0\n1\ncse_A")
 
             monkeypatch.setattr(pp.time, "monotonic", lambda: 205.0)
             srv._report_deaf_bridges()
@@ -12123,9 +12118,6 @@ class TestDrainReportsWhatItCut:
                 f"not: {lines}")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
-            pp.is_draining = real_draining
-            pp.draining_bridges = real_held
 
     def case_both_counts_come_from_ONE_snapshot(self):
         """A NUMERATOR LARGER THAN ITS DENOMINATOR, measured in the wild:
@@ -12788,14 +12780,16 @@ class TestDrainReportsWhatItCut:
 
         calls = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
+        real_draining = pp.is_draining
         pp._log_lifecycle = lambda *_a: None
 
-        def counting(certdir_arg):
+        def counting(certdir_arg, pid):
             calls.append(1)
-            return real_pids(certdir_arg)
+            return real_draining(certdir_arg, pid)
 
-        pp._pin_daemon_pids = counting
+        pp.is_draining = counting
+        # A predecessor to walk, or the count below is zero for want of one.
+        pp.draining_marker_path(certdir, 4242).write_text("")
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -12814,12 +12808,12 @@ class TestDrainReportsWhatItCut:
 
             srv._report_deaf_bridges()
             assert calls == [], (
-                "it enumerated daemons with `ps` although nothing was deaf "
+                "it walked the predecessors although nothing was deaf "
                 "locally — that runs on every bridge create, in the request "
                 "handler")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
+            pp.is_draining = real_draining
 
     def case_a_draining_predecessor_hides_the_streams_from_this_one(
             self, certdir, monkeypatch):
@@ -12850,7 +12844,6 @@ class TestDrainReportsWhatItCut:
         denominator, only quieter. So a predecessor that CAN say what it
         holds is asked, and only one that predates the record is refused.
         """
-        import os
         import threading
 
         import cswap_pin.proxy as pp
@@ -12861,8 +12854,6 @@ class TestDrainReportsWhatItCut:
                             lambda: real_mono() + skew[0])
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
-        real_draining = pp.is_draining
         pp._log_lifecycle = lines.append
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -12876,9 +12867,10 @@ class TestDrainReportsWhatItCut:
             srv._connected_bridges = {"cse_LIVE"}
 
             # A PREDECESSOR IS STILL DRAINING, so the stream for cse_LIVE may
-            # be held by it. This process cannot see it either way.
-            pp._pin_daemon_pids = lambda _c: [os.getpid(), 4242]
-            pp.is_draining = lambda _c, pid: pid == 4242
+            # be held by it. This process cannot see it either way, and its
+            # marker stops at five lines: it predates the held-bridge record.
+            pp.draining_marker_path(certdir, 4242).write_text(
+                f"{time.time()}\n0\n0\n0.0\n1")
             srv._report_deaf_bridges()
             assert lines, (
                 "it went silent; a reader cannot tell a suppressed report "
@@ -12918,7 +12910,6 @@ class TestDrainReportsWhatItCut:
             # PAST THE GRACE (T1592): the predecessor has just left, and a
             # bridge it held is shielded for `_DEAF_STARTUP_GRACE_S` from the
             # report that saw it go (see the next case).
-            pp._pin_daemon_pids = lambda _c: [os.getpid()]
             pp.draining_marker_path(certdir, 4242).unlink()
             srv._report_deaf_bridges()
             skew[0] += pp._DEAF_STARTUP_GRACE_S + 1
@@ -12931,8 +12922,70 @@ class TestDrainReportsWhatItCut:
             assert "only a NEW PROCESS" not in lines[-1], lines[-1]
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
-            pp.is_draining = real_draining
+
+    def _posting_bridge_beside_a_drainer_ps_cannot_see(
+            self, certdir, monkeypatch, *, marker_age=0.0):
+        """T2975: a pin relocated into a container pid namespace shares
+        `$HOME` and its certdir with the host drainers, not their pids, so
+        its `ps` names no predecessor. Returns (daemon, log lines): cse_B
+        posts here with no stream, and a `.draining-4242` marker
+        ``marker_age`` seconds old names it on line 6."""
+        import os
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda _c: [os.getpid()])
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+        srv._certdir = certdir
+        srv._note_bridge_traffic("/v1/code/sessions/cse_B/worker/messages")
+        srv._connected_bridges = {"cse_B"}
+        marker = pp.draining_marker_path(certdir, 4242)
+        marker.write_text(f"{time.time()}\n0\n0\n0.0\n1\ncse_B")
+        then = time.time() - marker_age
+        os.utime(marker, (then, then))
+        return srv, lines
+
+    def case_a_drainer_in_another_pid_namespace_still_holds_its_bridge(
+            self, certdir, monkeypatch):
+        """T2975 (lmd42): `_pin_daemon_pids` is a `ps` view of the CALLER's
+        pid namespace, so the relocated pin logged "22 of 22 bridge(s) post
+        but hold no inbound stream" while host drainers held 19 of them and
+        said so on their markers. The marker is certdir-scoped and crosses
+        the namespace; the predecessor set is read from it."""
+        import cswap_pin.proxy as pp
+
+        srv, lines = self._posting_bridge_beside_a_drainer_ps_cannot_see(
+            certdir, monkeypatch)
+        srv._report_deaf_bridges()
+        assert lines and lines[-1].startswith(pp.DEAF_REPORT_CLEAR), (
+            "a bridge a fresh marker says a drainer holds was called deaf "
+            f"because that drainer's pid is not in this namespace: {lines!r}")
+
+    def case_a_marker_nothing_beats_or_a_half_written_one_holds_nothing(
+            self, certdir, monkeypatch):
+        """THE CONTROL for the case above: reading the markers must not turn
+        into "any file under `.draining-` hides a bridge". A SIGKILLed
+        drainer's marker expires after `_DRAINING_MARKER_TTL` (5973e5d), and
+        the beat's `.draining-<pid>.<pid>.cswap-tmp` is neither a marker nor
+        a pid, so it is skipped rather than raised on or believed."""
+        import cswap_pin.proxy as pp
+
+        srv, lines = self._posting_bridge_beside_a_drainer_ps_cannot_see(
+            certdir, monkeypatch, marker_age=pp._DRAINING_MARKER_TTL + 1)
+        pp.draining_marker_path(certdir, 4343).with_name(
+            ".draining-4343.4343.cswap-tmp").write_text(
+            f"{time.time()}\n0\n0\n0.0\n1\ncse_B")
+        srv._report_deaf_bridges()
+        assert lines and pp.DEAF_REPORT_MARK in lines[-1] \
+            and "cse_B" in lines[-1], (
+            "a silent marker and a beat's temp file hid a deaf bridge: "
+            f"{lines!r}")
 
     def case_a_predecessor_that_has_just_exited_does_not_leave_its_bridge_deaf(
             self, certdir, monkeypatch):
@@ -12950,7 +13003,6 @@ class TestDrainReportsWhatItCut:
         the bridge, and does not clear it either (nothing was judged).
         (b) a report after the grace with still no stream marks it: the
         shield is a dwell, not an amnesty (1f8bcbe, e489cba)."""
-        import os
         import threading
 
         import cswap_pin.proxy as pp
@@ -12961,11 +13013,8 @@ class TestDrainReportsWhatItCut:
                             lambda: real_mono() + skew[0])
         lines = []
         monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
-        pids = [os.getpid(), 4242]
-        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda _c: list(pids))
-        monkeypatch.setattr(pp, "is_draining", lambda _c, pid: pid == 4242)
-        monkeypatch.setattr(pp, "draining_bridges",
-                            lambda _c, _pid: ({"cse_HELD"}, True))
+        marker = pp.draining_marker_path(certdir, 4242)
+        marker.write_text(f"{time.time()}\n0\n0\n0.0\n1\ncse_HELD")
         srv = pp.PinProxy.__new__(pp.PinProxy)
         srv._reset_bridge_traffic()
         srv._live_lock = threading.Lock()
@@ -12980,7 +13029,7 @@ class TestDrainReportsWhatItCut:
             f"the draining predecessor's stream was not counted: {lines!r}")
 
         # THE PREDECESSOR EXITS: its marker is gone, its bridges leave.
-        pids.remove(4242)
+        marker.unlink()
         skew[0] += 5.0
         before = list(lines)
         srv._report_deaf_bridges()
@@ -13015,9 +13064,7 @@ class TestDrainReportsWhatItCut:
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
         pp._log_lifecycle = lines.append
-        pp._pin_daemon_pids = lambda _c: [os.getpid()]
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -13070,7 +13117,6 @@ class TestDrainReportsWhatItCut:
                 f"draining, must still get the ordinary MARK: {lines[-1]!r}")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
 
     def case_a_drain_that_aborts_does_not_silence_the_bridge_forever(
             self, certdir):
@@ -13094,9 +13140,7 @@ class TestDrainReportsWhatItCut:
 
         lines = []
         real_log = pp._log_lifecycle
-        real_pids = pp._pin_daemon_pids
         pp._log_lifecycle = lines.append
-        pp._pin_daemon_pids = lambda _c: [os.getpid()]
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -13152,7 +13196,6 @@ class TestDrainReportsWhatItCut:
                 "stale-BLIND case must not defeat the dedupe generally")
         finally:
             pp._log_lifecycle = real_log
-            pp._pin_daemon_pids = real_pids
 
     def case_a_deaf_verdict_inside_a_refusal_window_is_blind_not_a_mark(
             self, monkeypatch):
