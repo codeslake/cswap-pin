@@ -1517,13 +1517,15 @@ the desktop entrypoint the launch environment wins. The symptom is `/health`'s
 `inference_follow.swapped` staying 0 with an empty `passthrough`.
 
 The remedy is a local environment in Desktop's Code tab (environment menu,
-"Edit environment": Name, Folders, Environment variables) holding the two
+"Edit environment": Name, Folders, Environment variables) holding two of the
 values this proxy writes into the CLI's config `env`, with `<port>` from
-`cswap pin --get_port` and `<certdir>` from `cswap pin --get_certdir`:
+`cswap pin --get_port` and `<ca>` the file `NODE_EXTRA_CA_CERTS` names there
+(`<certdir>/ca.pem`, or `<certdir>/ca-bundle.pem` when a hop's CA is merged in;
+`<certdir>` is what `cswap pin --get_certdir` prints):
 
 ```
 HTTPS_PROXY=http://127.0.0.1:<port>
-NODE_EXTRA_CA_CERTS=<certdir>/ca-bundle.pem
+NODE_EXTRA_CA_CERTS=<ca>
 ```
 
 Start Code sessions from it. A new session takes it without a Desktop relaunch;
