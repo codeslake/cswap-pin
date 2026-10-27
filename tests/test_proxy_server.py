@@ -233,6 +233,8 @@ class _RecordingChain:
                     if not d:
                         break
                     buf += d
+                if not buf:  # a stray sends nothing (T2954)
+                    continue
                 self.seen.append(buf)
                 c.sendall(self.answer(buf))
             except OSError:
@@ -2526,6 +2528,35 @@ class _StallingHop:
                 pass
 
 
+def _stray(port: int) -> None:
+    """What something on the host sends to loopback listeners: a connect that
+    closes at once (T2951: 4 in 60 s on a bare listener). A fixture's only
+    accept must not be spent on one (T2954); a connect that fails fails the
+    case, so a row that calls this proves the stray arrived."""
+    socket.create_connection(("127.0.0.1", port), timeout=5).close()
+
+
+def _accept_head(srv, ctx=None, timeout=None):
+    """Accept until a connection delivers a request head: ``(conn, head)``.
+    A connect that closes first is a stray and is dropped, as `_StallingHop`
+    drops it, so a fixture's only accept is not spent on one (T2954). ``ctx``
+    makes each connection a TLS server's before the head is read."""
+    from cswap_pin.proxy import _read_head
+
+    while True:
+        conn, _ = srv.accept()
+        conn.settimeout(timeout)
+        try:
+            if ctx:
+                conn = ctx.wrap_socket(conn, server_side=True)
+            head = _read_head(conn)
+        except OSError:  # a stray fails its handshake (ssl.SSLError is one)
+            head = None
+        if head:
+            return conn, head
+        conn.close()
+
+
 class _MidBodyOrigin:
     """A TLS origin that answers its one request with ``reply`` (a head and
     part of a body) and then says nothing. ``cut`` is set when the pin's side
@@ -2545,15 +2576,7 @@ class _MidBodyOrigin:
 
     def _serve(self):
         try:
-            conn, _ = self._srv.accept()
-            tls = self._ctx.wrap_socket(conn, server_side=True)
-            tls.settimeout(15)
-            head = b""
-            while b"\r\n\r\n" not in head:
-                chunk = tls.recv(4096)
-                if not chunk:
-                    return
-                head += chunk
+            tls, _ = _accept_head(self._srv, self._ctx, 15)
             tls.sendall(self._reply)
             while tls.recv(4096):
                 pass
@@ -2776,6 +2799,7 @@ class TestAClientThatHangsUpOnASilentHop:
             served = self._served_tls(proxy)
         proxy.start()
         try:
+            _stray(far.port)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
             if plain:
                 client = raw
@@ -2808,8 +2832,7 @@ class TestAClientThatHangsUpOnASilentHop:
                     # Not the request leg: something on the host connects to a
                     # loopback listener and closes at once (T2951: measured on
                     # a bare hop with no pin, 4 in 60 s).
-                    socket.create_connection(("127.0.0.1", far.port),
-                                             timeout=5).close()
+                    _stray(far.port)
                 client.sendall(b"G")
                 assert not far.cut.wait(2.0), (
                     "a connected client's reply was cut mid-body")
@@ -4474,7 +4497,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                seen.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -4482,6 +4504,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    seen.append(1)
                     c.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 except OSError:
                     pass
@@ -4943,6 +4968,7 @@ class TestChainRediscovery:
         egress refused. It must now be answered 400 before any hop is asked.
         """
         refusing, refusing_port, seen = self._refusing_chain()
+        _stray(refusing_port)
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
@@ -5661,6 +5687,7 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
+            _stray(chain_port)
 
             def ask(url, host):
                 c = socket.create_connection(("127.0.0.1", proxy.port),
@@ -6212,25 +6239,13 @@ class TestChainRediscovery:
         def origin():
             try:
                 # First (plain) request, on its own fresh dial.
-                c1, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    chunk = c1.recv(4096)
-                    if not chunk:
-                        return
-                    data += chunk
+                c1, _ = _accept_head(srv)
                 c1.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 c1.close()
 
                 # Second (upgrade) request -- CHANGE 1 dials fresh per
                 # request, so this is a NEW connection to the origin.
-                c2, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    chunk = c2.recv(4096)
-                    if not chunk:
-                        return
-                    data += chunk
+                c2, _ = _accept_head(srv)
                 c2.sendall(
                     b"HTTP/1.1 101 Switching Protocols\r\n"
                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
@@ -6246,6 +6261,7 @@ class TestChainRediscovery:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/first HTTP/1.1\r\n"
@@ -6312,13 +6328,7 @@ class TestChainRediscovery:
 
         def origin():
             try:
-                c, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    chunk = c.recv(4096)
-                    if not chunk:
-                        return
-                    data += chunk
+                c, _ = _accept_head(srv)
                 reached_hold.set()
                 release.wait(10)
                 c.sendall(
@@ -6333,6 +6343,7 @@ class TestChainRediscovery:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/ws HTTP/1.1\r\n"
@@ -7309,7 +7320,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -7317,6 +7327,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Error: invalid request"
                     c.sendall(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
@@ -7331,6 +7344,7 @@ class TestChainRediscovery:
         threading.Thread(target=serve, daemon=True).start()
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
+            _stray(srv.getsockname()[1])
             url = f"http://{address}"
             # A baseline record on disk, written BEFORE either probe, so the
             # read below sees only what the probes themselves did to it —
@@ -7384,7 +7398,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -7392,6 +7405,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Internal Server Error"
                     c.sendall(
                         b"HTTP/1.1 500 Internal Server Error\r\n"
@@ -7503,7 +7519,6 @@ class TestChainRediscovery:
                         c, _ = srv.accept()
                     except OSError:
                         return
-                    accepted.append(1)
                     try:
                         buf = b""
                         while b"\r\n\r\n" not in buf:
@@ -7511,6 +7526,9 @@ class TestChainRediscovery:
                             if not d:
                                 break
                             buf += d
+                        if not buf:  # a stray sends nothing (T2954)
+                            continue
+                        accepted.append(1)
                         body = json.dumps(
                             {"status": "ok", "https_proxy": next_hop}
                         ).encode()
@@ -7532,6 +7550,7 @@ class TestChainRediscovery:
         try:
             ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
             other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+            _stray(ambient_srv.getsockname()[1])
 
             # The hop asked IS the launch's own ambient proxy: nothing wired
             # this launch over it, so it is never even connected to.
@@ -7578,8 +7597,13 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                accepted.append(1)
-                c.close()
+                try:
+                    if c.recv(4096):  # a stray sends nothing (T2954)
+                        accepted.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
 
         threading.Thread(target=serve, daemon=True).start()
         try:
@@ -8055,13 +8079,7 @@ class TestAbsoluteFormPassthrough:
 
         def origin():
             try:
-                c, _ = srv.accept()
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    chunk = c.recv(4096)
-                    if not chunk:
-                        return
-                    data += chunk
+                c, data = _accept_head(srv)
                 origin_seen["req"] = data.decode("latin1").splitlines()[0]
                 c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
                 c.close()
@@ -8072,6 +8090,7 @@ class TestAbsoluteFormPassthrough:
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
         proxy.start()
         try:
+            _stray(oport)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
                 f"GET http://127.0.0.1:{oport}/releases/latest HTTP/1.1\r\n"
@@ -27962,12 +27981,10 @@ class _FakeChromeBridge:
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
-        from cswap_pin.proxy import _read_head, _read_ws_frame
+        from cswap_pin.proxy import _read_ws_frame
         try:
-            conn, _ = self._srv.accept()
-            conn.settimeout(10)
-            tls = self._ctx.wrap_socket(conn, server_side=True)
-            self.head = _read_head(tls).decode("latin1")
+            tls, head = _accept_head(self._srv, self._ctx, 10)
+            self.head = head.decode("latin1")
             tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
                         b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             for _ in range(2):
@@ -28000,21 +28017,21 @@ class _FakeBridgeOtherTraffic:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(1)
         self.port = self._srv.getsockname()[1]
+        self.done = threading.Event()
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
-        from cswap_pin.proxy import _read_head
         try:
-            conn, _ = self._srv.accept()
-            conn.settimeout(15)
-            tls = self._ctx.wrap_socket(conn, server_side=True)
-            head = _read_head(tls)
+            tls, head = _accept_head(self._srv, self._ctx, 15)
             self.got = head
             if self.mode == "post":
                 n = int(re.search(rb"(?i)content-length: *(\d+)", head)[1])
                 body = b""
                 while len(body) < n:
-                    body += tls.recv(n - len(body))
+                    chunk = tls.recv(n - len(body))
+                    if not chunk:
+                        return
+                    body += chunk
                 self.got += body
                 tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             else:
@@ -28025,6 +28042,7 @@ class _FakeBridgeOtherTraffic:
         except Exception:  # noqa: BLE001 — the asserts report what is missing
             pass
         finally:
+            self.done.set()
             self._srv.close()
 
 
@@ -28064,6 +28082,7 @@ class TestChromeBridgeCarriesThePinnedToken:
             False)
         proxy.start()
         try:
+            _stray(bridge.port)
             tls = self._open(proxy, certdir)
             tls.sendall(
                 b"GET /chrome/pin-uuid HTTP/1.1\r\n"
@@ -28231,6 +28250,7 @@ class TestChromeBridgeCarriesThePinnedToken:
         proxy.start()
         got = b""
         try:
+            _stray(bridge.port)
             tls = self._open(proxy, certdir)
             tls.settimeout(5)
             tls.sendall(req)  # one TLS record: head and body together
@@ -28278,6 +28298,21 @@ class TestChromeBridgeCarriesThePinnedToken:
         got, seen = self._other_traffic(certdir, "server_first", req, b"hello")
         assert b"hello" in got, got
         assert seen == req, "the handshake was altered"
+
+    def case_a_post_fixture_stops_when_the_body_ends_early(self, certdir):
+        """T2954: a clean TLS close mid-body read as b'' and the fixture's body
+        loop spun on it for ever (an unclean one raised, which ended it)."""
+        bridge = _FakeBridgeOtherTraffic(certdir, "post")
+        tls = ssl.create_default_context(cafile=str(certdir / "ca.pem")) \
+            .wrap_socket(socket.create_connection(("127.0.0.1", bridge.port),
+                                                  timeout=1),
+                         server_hostname="bridge.claudeusercontent.com")
+        tls.sendall(self.POST[:-5])
+        try:
+            tls.unwrap()  # sends close_notify, then waits for the reply
+        except (OSError, ssl.SSLError):
+            pass
+        assert bridge.done.wait(5), "the fixture spun on a body that ended"
 
     def case_the_armed_trace_sees_the_bridge_mitm(self, certdir):
         """The MITM replaces a blind tunnel, which writes a trace line (01759e19)
