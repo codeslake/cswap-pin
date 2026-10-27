@@ -32043,11 +32043,92 @@ class TestABlindDaemonRepairsItself:
         assert exited == [0]
         assert marks == []
         # THE LINE NAMES ITS CAUSE AND ITS STEP: a replace line with neither
-        # left a fleet host's two replaces 35 s apart unexplainable.
+        # left a fleet host's two replaces 60 s apart unexplainable.
         lines = [m for m in said if "replacing ourselves so a successor" in m]
         assert len(lines) == 1, said
         assert f"({reason or 'no reason recorded'}; blind replace #1)" in lines[0], (
             lines)
+
+    def test_the_replace_line_names_the_raise_not_an_earlier_reason(
+            self, monkeypatch, tmp_path):
+        """`_can_mint` swallows a provider that RAISES and the provider's
+        `blind_reason` then still holds what an earlier call set, so the line
+        named a stale cause (or none) and lost the exception."""
+        from cswap_pin import proxy as pin_proxy
+
+        class _Raises(self._CannotMint):
+            def __call__(self):
+                raise OSError("keychain read failed")
+
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+
+        signalled, exited = self._drive(
+            monkeypatch, tmp_path,
+            _Raises("refresh transient for slot 2 (a minute ago)"))
+
+        assert exited == [0]
+        lines = [m for m in said if "replacing ourselves so a successor" in m]
+        assert len(lines) == 1, said
+        assert "(OSError: keychain read failed; blind replace #1)" in lines[0], lines
+        assert "a minute ago" not in lines[0], lines
+
+    def test_the_replace_line_keeps_the_reason_the_mint_check_saw(
+            self, monkeypatch, tmp_path):
+        """A request thread can rewrite `blind_reason` between the watchdog's
+        mint check and its log line; the line names what the check saw."""
+        from cswap_pin import proxy as pin_proxy
+
+        provider = self._CannotMint("refresh transient for slot 2 (x)")
+        real = pin_proxy.note_blind_recycle
+
+        def _request_rewrites_it(certdir, now):
+            provider.blind_reason = "a request's later reason"
+            return real(certdir, now)
+
+        monkeypatch.setattr(pin_proxy, "note_blind_recycle", _request_rewrites_it)
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+
+        self._drive(monkeypatch, tmp_path, provider)
+
+        lines = [m for m in said if "replacing ourselves so a successor" in m]
+        assert len(lines) == 1, said
+        assert "(refresh transient for slot 2 (x); blind replace #1)" in lines[0], (
+            lines)
+
+    def test_can_mint_records_a_raise_for_that_call_only(self):
+        from cswap_pin import proxy as pin_proxy
+
+        class _P:
+            raises = True
+
+            def __call__(self):
+                if self.raises:
+                    raise OSError("keychain read failed")
+
+        p = _P()
+        assert pin_proxy._can_mint(p) is False
+        assert p.mint_raised == "OSError: keychain read failed"
+        p.raises = False
+        assert pin_proxy._can_mint(p) is False
+        assert p.mint_raised == "", "the last call's raise was read as this one's"
+
+    def test_a_tick_that_tested_nothing_does_not_reset_the_backoff(
+            self, monkeypatch, tmp_path):
+        """`_mint_lock_busy` reads free, then the lock is taken before
+        `_can_mint` looks: it answers None. That tick tested nothing, so it
+        must not clear the note a blind episode's backoff lives in."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_mint_lock_busy", lambda p: None)
+        monkeypatch.setattr(pin_proxy, "_can_mint", lambda p: None)
+        pin_proxy.note_blind_recycle(tmp_path, 1000.0)
+
+        self._drive(monkeypatch, tmp_path, self._CannotMint("x"))
+
+        assert pin_proxy._blind_recycle_path(tmp_path).exists(), (
+            "a tick that asked nothing ended the blind episode")
 
     def test_a_blind_daemon_inside_its_backoff_does_not_replace_itself(
             self, monkeypatch, tmp_path):
