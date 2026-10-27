@@ -11340,28 +11340,48 @@ def _host_head() -> str:
     The version answers "which pin"; this answers "which of everything else".
 
     Read from `.git` directly rather than through a subprocess: this runs at
-    import in a proxy that must not spawn, and a detached HEAD or a missing
-    ref simply yields no suffix. A wheel install has no `.git` and is silent,
-    which is correct -- there its version IS the whole provenance. The walk
-    ends at the wheel's environment (a `pyvenv.cfg`, or `site-packages`): a
-    repo above it is where the venv or uv's cache happens to live (T2958).
+    import in a proxy that must not spawn, and a missing ref simply yields no
+    suffix; a detached HEAD stamps its raw sha. A wheel install has no `.git`
+    and is silent, which is correct -- there its version IS the whole
+    provenance. The walk ends at the wheel's environment (a `pyvenv.cfg`, or
+    `site-packages`): a repo above it is where the venv or uv's cache happens
+    to live (T2958). That is judged on the unresolved path too, because uv's
+    symlink link-mode resolves out of `site-packages` into its cache.
+
+    A linked worktree's `.git` is a file naming its own gitdir (the HEAD) while
+    the branch refs live in the common dir; a packed ref has no loose file
+    (T2965).
     """
     try:
         import pathlib
         host = __import__("claude_swap")
-        d = pathlib.Path(host.__file__).resolve().parent
-        for root in (d, *d.parents):
-            g = root / ".git"
-            if not g.is_dir():
+
+        def git_root(p):  # "" at the environment's edge, None if neither
+            for root in (p, *p.parents):
+                if (root / ".git").exists():
+                    return root
                 if root.name == "site-packages" or (root / "pyvenv.cfg").exists():
                     return ""
-                continue
-            head = (g / "HEAD").read_text().strip()
-            if head.startswith("ref: "):
-                ref = g / head[5:]
-                head = ref.read_text().strip() if ref.exists() else ""
-            return f"+{root.name}@{head[:8]}" if head else ""
-        return ""
+
+        host_file = pathlib.Path(host.__file__)
+        root = git_root(host_file.resolve().parent)
+        if not root or git_root(host_file.absolute().parent) == "":
+            return ""
+        g = root / ".git"
+        if g.is_file():
+            g = root / g.read_text().strip().removeprefix("gitdir: ")
+        cd = g / "commondir"
+        common = g / cd.read_text().strip() if cd.exists() else g
+        head = (g / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = common / head[5:]
+            # packed-refs: `<sha> <refname>` lines; its `#` and `^` lines
+            # never end in a refname, so they need no skip
+            head = ref.read_text().strip() if ref.exists() else next(
+                (ln.split()[0] for ln in
+                 (common / "packed-refs").read_text().splitlines()
+                 if ln.endswith(" " + head[5:])), "")
+        return f"+{root.name}@{head[:8]}" if head else ""
     except Exception:  # noqa: BLE001 — provenance must not cost a log line
         return ""
 
