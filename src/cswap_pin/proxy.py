@@ -11356,16 +11356,16 @@ def _host_head() -> str:
         import pathlib
         host = __import__("claude_swap")
 
-        def git_root(p):
+        def git_root(p):  # "" at the environment's edge, None if neither
             for root in (p, *p.parents):
                 if (root / ".git").exists():
                     return root
                 if root.name == "site-packages" or (root / "pyvenv.cfg").exists():
-                    return None
+                    return ""
 
-        root = git_root(pathlib.Path(host.__file__).resolve().parent)
-        if root is None or git_root(
-                pathlib.Path(os.path.abspath(host.__file__)).parent) is None:
+        host_file = pathlib.Path(host.__file__)
+        root = git_root(host_file.resolve().parent)
+        if not root or git_root(host_file.absolute().parent) == "":
             return ""
         g = root / ".git"
         if g.is_file():

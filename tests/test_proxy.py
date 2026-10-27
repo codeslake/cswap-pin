@@ -33900,6 +33900,20 @@ class TestTheLogLineNamesTheHostCheckoutToo:
         import cswap_pin.proxy as pp
         assert pp._host_head() == ""
 
+    def test_a_symlinked_source_dir_outside_any_environment_still_names_it(
+            self, tmp_path, monkeypatch):
+        """The unresolved path ends the walk only AT an environment, not for
+        want of a `.git` along it."""
+        root = self._fake_host(tmp_path, monkeypatch, **self._REPO)
+        link = tmp_path / "lib" / "claude_swap"
+        link.parent.mkdir()
+        link.symlink_to(root / "src/claude_swap")
+        import sys
+        monkeypatch.setattr(sys.modules["claude_swap"], "__file__",
+                            str(link / "__init__.py"))
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+cswap_fork@5b552e15"
+
 
 class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
     """`<data>/settings.json` is often a symlink into a repo several machines
