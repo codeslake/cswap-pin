@@ -1340,19 +1340,13 @@ class _StreamingUpstream:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
+        self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = self._srv.accept()
-            tls = self._ctx.wrap_socket(conn, server_side=True)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = tls.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            tls, _ = _accept_head(self._srv, self._ctx, stop=self._stopped)
             tls.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                 b"Transfer-Encoding: chunked\r\n\r\n"
@@ -1365,6 +1359,7 @@ class _StreamingUpstream:
             pass
 
     def stop(self):
+        self._stopped.set()
         try:
             with socket.create_connection(self._srv.getsockname(),
                                           timeout=0.2):
@@ -1391,6 +1386,7 @@ class TestStreamingRelay:
         )
         proxy.start()
         try:
+            _stray(upstream.port)
             # Raw client through the proxy so we can read incrementally.
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(
@@ -1633,8 +1629,7 @@ class _IdleClosingUpstream(_FakeUpstream):
                 conn, _ = self._srv.accept()
             except OSError:
                 return
-            self.accepted += 1
-            tls = None
+            tls, counted = None, False
             try:
                 tls = self._ctx.wrap_socket(conn, server_side=True)
                 tls.settimeout(self.hold)
@@ -1645,6 +1640,9 @@ class _IdleClosingUpstream(_FakeUpstream):
                         if not chunk:
                             raise OSError("client closed")
                         data += chunk
+                    if not counted:  # a stray sends no head (T2964)
+                        self.accepted += 1
+                        counted = True
                     head, _, rest = data.partition(b"\r\n\r\n")
                     m = [l for l in head.decode("latin1").lower().split("\r\n")
                          if l.startswith("content-length:")]
@@ -2150,6 +2148,8 @@ class TestTheChainsCredentialIsSent:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
                     seen.append(buf.decode("latin1"))
                     conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 finally:
@@ -2175,6 +2175,7 @@ class TestTheChainsCredentialIsSent:
         write_upstream_hint(certdir, f"http://alice:s3cr3t@127.0.0.1:{port}")
         proxy.start()
         try:
+            _stray(port)
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
             raw.sendall(
                 b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
@@ -2276,19 +2277,14 @@ class _LoopbackConnectProxy:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self.connects = 0
+        self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = self._srv.accept()
+            conn, _ = _accept_head(self._srv, stop=self._stopped)
             self.connects += 1
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                d = conn.recv(1)
-                if not d:
-                    return
-                buf += d
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             # blind-pipe both directions
@@ -2306,6 +2302,7 @@ class _LoopbackConnectProxy:
             pass
 
     def stop(self):
+        self._stopped.set()
         try:
             with socket.create_connection(self._srv.getsockname(),
                                           timeout=0.2):
@@ -2350,6 +2347,7 @@ class TestLoopbackChainTrust:
         )
         proxy.start()
         try:
+            _stray(chain.port)
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
             )
@@ -2536,15 +2534,38 @@ def _stray(port: int) -> None:
     socket.create_connection(("127.0.0.1", port), timeout=5).close()
 
 
-def _accept_head(srv, ctx=None, timeout=None):
+def _record_dials(monkeypatch) -> list:
+    """Every address the pin dials, hop or direct, as the pin itself saw it
+    (`_happy_dial` is where all of them go). A peer socket cannot tell a direct
+    dial that is then refused from a stray: both connect and close at once
+    (T2964)."""
+    import cswap_pin.proxy as pp
+
+    dialled, real = [], pp._happy_dial
+
+    def record(address, *a, **k):
+        dialled.append(address)
+        return real(address, *a, **k)
+
+    monkeypatch.setattr(pp, "_happy_dial", record)
+    return dialled
+
+
+def _accept_head(srv, ctx=None, timeout=None, stop=None):
     """Accept until a connection delivers a request head: ``(conn, head)``.
     A connect that closes first is a stray and is dropped, as `_StallingHop`
     drops it, so a fixture's only accept is not spent on one (T2954). ``ctx``
-    makes each connection a TLS server's before the head is read."""
+    makes each connection a TLS server's before the head is read. ``stop`` is
+    the fixture's own Event: its `stop()` wakes the accept with a connect that
+    closes at once, which ends the wait with OSError instead of being dropped
+    as a stray (T2964)."""
     from cswap_pin.proxy import _read_head
 
     while True:
         conn, _ = srv.accept()
+        if stop is not None and stop.is_set():
+            conn.close()
+            raise OSError("stopped")
         conn.settimeout(timeout)
         try:
             if ctx:
@@ -2554,6 +2575,31 @@ def _accept_head(srv, ctx=None, timeout=None):
             head = None
         if head:
             return conn, head
+        conn.close()
+
+
+def _is_stray(conn) -> bool:
+    """Whether ``conn`` is a stray: it closed within 0.1 s having sent nothing.
+    One that sends or stays open is a dial. For a peer that is dialled and not
+    spoken to first, where no request head tells the two apart (T2964). Peeks,
+    so nothing is consumed."""
+    conn.settimeout(0.1)
+    try:
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except socket.timeout:
+        return False
+    except OSError:  # a reset
+        return True
+    finally:
+        conn.settimeout(None)
+
+
+def _accept_held(srv):
+    """Accept until a connection is not a stray (`_is_stray`): ``conn``."""
+    while True:
+        conn, _ = srv.accept()
+        if not _is_stray(conn):
+            return conn
         conn.close()
 
 
@@ -3194,7 +3240,7 @@ class TestPinTimeHopTrust:
         done = threading.Event()
 
         def serve():
-            conn, _ = srv.accept()
+            conn, _ = _accept_head(srv)
             with conn:
                 end = time.monotonic() + 6
                 while time.monotonic() < end and not done.wait(every):
@@ -3216,6 +3262,7 @@ class TestPinTimeHopTrust:
         srv, done, thr = self._slow_hop(chunk, every)
         port = srv.getsockname()[1]
         try:
+            _stray(port)
             proxy.write_upstream_hint(certdir, f"http://127.0.0.1:{port}")
             t0 = time.monotonic()
             msg = proxy.hop_trust_problem(certdir)
@@ -7422,6 +7469,7 @@ class TestChainRediscovery:
         threading.Thread(target=serve, daemon=True).start()
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
+            _stray(srv.getsockname()[1])
             url = f"http://{address}"
             # timeout=10: the assertion below waits on the server thread's
             # own reply, not the network.
@@ -7503,7 +7551,9 @@ class TestChainRediscovery:
 
         The discriminator is connections accepted, not the return value: the
         old code also returns None for a hop that never answers, so a bare
-        `is None` on the result would pass unchanged."""
+        `is None` on the result would pass unchanged. A connection counts when
+        it sends something or stays open past a short window; a stray (a
+        connect that closes at once, T2954) does not."""
         import cswap_pin.proxy as pp
 
         def health_server(next_hop):
@@ -7520,15 +7570,15 @@ class TestChainRediscovery:
                     except OSError:
                         return
                     try:
+                        if _is_stray(c):  # closes at once (T2954)
+                            continue
+                        accepted.append(1)
                         buf = b""
                         while b"\r\n\r\n" not in buf:
                             d = c.recv(4096)
                             if not d:
                                 break
                             buf += d
-                        if not buf:  # a stray sends nothing (T2954)
-                            continue
-                        accepted.append(1)
                         body = json.dumps(
                             {"status": "ok", "https_proxy": next_hop}
                         ).encode()
@@ -7553,7 +7603,7 @@ class TestChainRediscovery:
             _stray(ambient_srv.getsockname()[1])
 
             # The hop asked IS the launch's own ambient proxy: nothing wired
-            # this launch over it, so it is never even connected to.
+            # this launch over it, so it is never asked and never held open.
             nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
             time.sleep(0.2)
             assert nxt is None
@@ -7568,6 +7618,14 @@ class TestChainRediscovery:
             nxt = pp._probe_next_hop(other_url, timeout=10, own_proxy=ambient_url)
             assert nxt == "http://127.0.0.1:2"
             assert other_accepted == [1], other_accepted
+
+            # The counter catches a connection that sends nothing but stays
+            # open (the stray above closed at once and was not counted).
+            with socket.create_connection(ambient_srv.getsockname(), timeout=5):
+                deadline = time.monotonic() + 5
+                while not ambient_accepted and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            assert ambient_accepted == [1], ambient_accepted
         finally:
             ambient_srv.close()
             other_srv.close()
@@ -7598,6 +7656,7 @@ class TestChainRediscovery:
                 except OSError:
                     return
                 try:
+                    c.settimeout(0.5)  # a stray that holds must not park this
                     if c.recv(4096):  # a stray sends nothing (T2954)
                         accepted.append(1)
                 except OSError:
@@ -7623,6 +7682,7 @@ class TestChainRediscovery:
                 def resolve_account(self, email):
                     return "1", email, None
 
+            _stray(srv.getsockname()[1])
             got = pp.ensure_proxy(_SW())
             time.sleep(0.2)
             assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
@@ -7630,6 +7690,16 @@ class TestChainRediscovery:
                 "ensure_proxy asked its own shell's exported proxy for "
                 "/health"
             )
+
+            # A stray that holds open must not park the only serve thread: an
+            # ask behind it is still counted.
+            with socket.create_connection(srv.getsockname(), timeout=5), \
+                    socket.create_connection(srv.getsockname(), timeout=5) as ask:
+                ask.sendall(b"GET /health HTTP/1.1\r\n\r\n")
+                deadline = time.monotonic() + 5
+                while not accepted and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert accepted == [1], accepted
         finally:
             srv.close()
 
@@ -9259,6 +9329,7 @@ class TestAStaleUpstreamIsRedialled:
         up = _FirstConnection502Upstream(certdir, hold=5.0)
         proxy = self._proxy(certdir, up)
         try:
+            _stray(up.port)
             conn = self._keepalive(proxy.port, certdir / "ca.pem")
             got = [self._ask(conn)[0], self._ask(conn)[0]]
             assert got == [502, 200], (
@@ -9425,20 +9496,23 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         reached = threading.Event()
 
         def serve_peer():
-            try:
-                c, _ = peer.accept()
-            except OSError:
-                return
-            reached.set()
-            try:
-                data = c.recv(64)
-                if data:
+            while True:
+                try:
+                    c, _ = peer.accept()
+                except OSError:
+                    return
+                try:
+                    if not c.recv(64):  # a stray sends nothing (T2954)
+                        continue
+                    reached.set()
                     c.sendall(b"PONG")
-            finally:
-                c.close()
+                finally:
+                    c.close()
 
         threading.Thread(target=serve_peer, daemon=True).start()
+        _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -9464,8 +9538,8 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
                     f"a refusing chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "a refusing chain reached the ingress host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "a refusing chain dialled the ingress host directly"
                 )
 
                 # CONTROL: the opt-in restores the old fall-through.
@@ -9499,6 +9573,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the ingress host was never dialled"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         assert "chain refused" in log.read_text(), log.read_text()
 
 
@@ -14795,8 +14870,10 @@ class TestDrainReportsWhatItCut:
         _PUMP.reset_for_tests()
         peer = socket.socket()
         peer.bind(("127.0.0.1", 0))
-        peer.listen(1)
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        peer.listen(4)
         port = peer.getsockname()[1]
+        _stray(port)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
                             upstream=("127.0.0.1", 1))
         proxy.start()
@@ -14812,7 +14889,7 @@ class TestDrainReportsWhatItCut:
                 assert chunk, "the tunnel never answered the CONNECT"
                 head += chunk
             peer.settimeout(5)
-            far, _ = peer.accept()
+            far = _accept_held(peer)
             deadline = time.monotonic() + 5
             while _PUMP.live_pairs() != 1 and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -15817,19 +15894,23 @@ class TestOptimisticConnectIsDetected:
         reached = threading.Event()
 
         def serve_peer():
-            try:
-                c, _ = peer.accept()
-            except OSError:
-                return
-            reached.set()
-            try:
-                if c.recv(64):
+            while True:
+                try:
+                    c, _ = peer.accept()
+                except OSError:
+                    return
+                try:
+                    if not c.recv(64):  # a stray sends nothing (T2954)
+                        continue
+                    reached.set()
                     c.sendall(b"PONG")
-            finally:
-                c.close()
+                finally:
+                    c.close()
 
         threading.Thread(target=serve_peer, daemon=True).start()
+        _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -15854,8 +15935,8 @@ class TestOptimisticConnectIsDetected:
                     f"a dead-tunnel chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "an optimistic chain reached the host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "an optimistic chain dialled the host directly"
                 )
 
                 # CONTROL: the opt-in restores the old re-dial.
@@ -15887,6 +15968,7 @@ class TestOptimisticConnectIsDetected:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the host was never dialled directly"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         # THE CONTRACT, NOT THE BRANCH THAT DELIVERED IT. This used to assert
         # `"already EOF" in log`, which names one internal path. Measured on
         # macOS CI 2026-08-18: the two behavioural assertions above BOTH passed
@@ -28174,8 +28256,10 @@ class TestChromeBridgeCarriesThePinnedToken:
         monkeypatch.setattr(px, "_CHROME_HANDSHAKE_S", 1.0)
         silent = socket.socket()
         silent.bind(("127.0.0.1", 0))
-        silent.listen(1)
+        # Not 1: macOS drops a SYN once a backlog-1 queue holds the stray (T2964).
+        silent.listen(4)
         silent.settimeout(10)
+        _stray(silent.getsockname()[1])
         proxy = px.PinProxy(certdir=certdir, pin_token_provider=lambda: "P")
         proxy._dial_tunnel = lambda target, conn: (
             socket.create_connection(silent.getsockname(), timeout=10), False)
@@ -28184,10 +28268,12 @@ class TestChromeBridgeCarriesThePinnedToken:
             tls = self._open(proxy, certdir)
             tls.sendall(b"GET /chrome/pin-uuid HTTP/1.1\r\n"
                         b"Host: bridge.claudeusercontent.com\r\n\r\n")
-            hop, _ = silent.accept()
+            hop = _accept_held(silent)
             assert proxy.inflight_requests() == 1, "premise: the debt is owed"
             hop.settimeout(4)
+            heard = b""
             try:  # the proxy's ClientHello, then EOF once it gives up
+                heard = hop.recv(4096)
                 while hop.recv(4096):
                     pass
                 cut = True
@@ -28202,6 +28288,7 @@ class TestChromeBridgeCarriesThePinnedToken:
             tls.close()
         finally:
             proxy.stop()
+        assert heard, "premise: the hop never heard the proxy's ClientHello"
         assert cut, "the upstream handshake was never given up on"
         assert released, "the connection was not released after giving up"
 
