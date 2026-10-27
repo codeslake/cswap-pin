@@ -232,6 +232,8 @@ class _RecordingChain:
                     if not d:
                         break
                     buf += d
+                if not buf:  # a stray sends nothing (T2954)
+                    continue
                 self.seen.append(buf)
                 c.sendall(self.answer(buf))
             except OSError:
@@ -4473,7 +4475,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                seen.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -4481,6 +4482,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    seen.append(1)
                     c.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 except OSError:
                     pass
@@ -4942,6 +4946,7 @@ class TestChainRediscovery:
         egress refused. It must now be answered 400 before any hop is asked.
         """
         refusing, refusing_port, seen = self._refusing_chain()
+        _stray(refusing_port)
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
@@ -5660,6 +5665,7 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
+            _stray(chain_port)
 
             def ask(url, host):
                 c = socket.create_connection(("127.0.0.1", proxy.port),
@@ -7292,7 +7298,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -7300,6 +7305,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Error: invalid request"
                     c.sendall(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
@@ -7314,6 +7322,7 @@ class TestChainRediscovery:
         threading.Thread(target=serve, daemon=True).start()
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
+            _stray(srv.getsockname()[1])
             url = f"http://{address}"
             # A baseline record on disk, written BEFORE either probe, so the
             # read below sees only what the probes themselves did to it —
@@ -7367,7 +7376,6 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                handled.append(1)
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -7375,6 +7383,9 @@ class TestChainRediscovery:
                         if not d:
                             break
                         buf += d
+                    if not buf:  # a stray sends nothing (T2954)
+                        continue
+                    handled.append(1)
                     body = b"Internal Server Error"
                     c.sendall(
                         b"HTTP/1.1 500 Internal Server Error\r\n"
@@ -7486,7 +7497,6 @@ class TestChainRediscovery:
                         c, _ = srv.accept()
                     except OSError:
                         return
-                    accepted.append(1)
                     try:
                         buf = b""
                         while b"\r\n\r\n" not in buf:
@@ -7494,6 +7504,9 @@ class TestChainRediscovery:
                             if not d:
                                 break
                             buf += d
+                        if not buf:  # a stray sends nothing (T2954)
+                            continue
+                        accepted.append(1)
                         body = json.dumps(
                             {"status": "ok", "https_proxy": next_hop}
                         ).encode()
@@ -7515,6 +7528,7 @@ class TestChainRediscovery:
         try:
             ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
             other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+            _stray(ambient_srv.getsockname()[1])
 
             # The hop asked IS the launch's own ambient proxy: nothing wired
             # this launch over it, so it is never even connected to.
@@ -7561,8 +7575,13 @@ class TestChainRediscovery:
                     c, _ = srv.accept()
                 except OSError:
                     return
-                accepted.append(1)
-                c.close()
+                try:
+                    if c.recv(4096):  # a stray sends nothing (T2954)
+                        accepted.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
 
         threading.Thread(target=serve, daemon=True).start()
         try:
