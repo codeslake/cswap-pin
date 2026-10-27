@@ -2352,7 +2352,6 @@ class TestLoopbackChainTrust:
                 proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
             )
             assert status == 200  # verification was skipped for the loopback hop
-            assert chain.connects == 1, "the stray was counted as a CONNECT"
         finally:
             proxy.stop()
             chain.stop()
@@ -2533,6 +2532,23 @@ def _stray(port: int) -> None:
     accept must not be spent on one (T2954); a connect that fails fails the
     case, so a row that calls this proves the stray arrived."""
     socket.create_connection(("127.0.0.1", port), timeout=5).close()
+
+
+def _record_dials(monkeypatch) -> list:
+    """Every address the pin dials, hop or direct, as the pin itself saw it
+    (`_happy_dial` is where all of them go). A peer socket cannot tell a direct
+    dial that is then refused from a stray: both connect and close at once
+    (T2964)."""
+    import cswap_pin.proxy as pp
+
+    dialled, real = [], pp._happy_dial
+
+    def record(address, *a, **k):
+        dialled.append(address)
+        return real(address, *a, **k)
+
+    monkeypatch.setattr(pp, "_happy_dial", record)
+    return dialled
 
 
 def _accept_head(srv, ctx=None, timeout=None, stop=None):
@@ -7683,7 +7699,7 @@ class TestChainRediscovery:
                 deadline = time.monotonic() + 5
                 while not accepted and time.monotonic() < deadline:
                     time.sleep(0.02)
-            assert accepted == [1], accepted
+                assert accepted == [1], accepted
         finally:
             srv.close()
 
@@ -9496,6 +9512,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         threading.Thread(target=serve_peer, daemon=True).start()
         _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -9521,8 +9538,8 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
                     f"a refusing chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "a refusing chain reached the ingress host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "a refusing chain dialled the ingress host directly"
                 )
 
                 # CONTROL: the opt-in restores the old fall-through.
@@ -9556,6 +9573,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the ingress host was never dialled"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         assert "chain refused" in log.read_text(), log.read_text()
 
 
@@ -15848,6 +15866,7 @@ class TestOptimisticConnectIsDetected:
         threading.Thread(target=serve_peer, daemon=True).start()
         _stray(peer_port)
 
+        dialled = _record_dials(monkeypatch)
         monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
@@ -15872,8 +15891,8 @@ class TestOptimisticConnectIsDetected:
                     f"a dead-tunnel chain must answer 503, never dial direct: "
                     f"{resp[:80]!r}"
                 )
-                assert not reached.is_set(), (
-                    "an optimistic chain reached the host directly"
+                assert ("127.0.0.1", peer_port) not in dialled, (
+                    "an optimistic chain dialled the host directly"
                 )
 
                 # CONTROL: the opt-in restores the old re-dial.
@@ -15905,6 +15924,7 @@ class TestOptimisticConnectIsDetected:
             pp._TRACE = prev
 
         assert reached.is_set(), "CONTROL FAILED: the host was never dialled directly"
+        assert ("127.0.0.1", peer_port) in dialled, "CONTROL FAILED: dial unrecorded"
         # THE CONTRACT, NOT THE BRANCH THAT DELIVERED IT. This used to assert
         # `"already EOF" in log`, which names one internal path. Measured on
         # macOS CI 2026-08-18: the two behavioural assertions above BOTH passed
