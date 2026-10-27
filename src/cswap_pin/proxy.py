@@ -4839,11 +4839,10 @@ def _cache_aware_report(certdir) -> dict:
 # login in CLAUDE_CODE_OAUTH_TOKEN, and under a desktop entrypoint Claude Code
 # drops any settings `env` entry naming a variable the host set at spawn, so no
 # configuration reaches it. Its traffic arrives here when the Code tab's
-# HTTPS_PROXY names this proxy (a Desktop started behind its own proxy needs the
-# README's local environment), and its User-Agent names the entrypoint, so this
-# proxy can re-bill it: `/v1/messages` only (the wall and grant arms of
-# `_relay_response` match that path exactly, so a refusal on another route could
-# never be converted), never a pinned route.
+# HTTPS_PROXY names this proxy (README), and its User-Agent names the
+# entrypoint, so this proxy can re-bill it: `/v1/messages` only (the wall and
+# grant arms of `_relay_response` match that path exactly, so a refusal on
+# another route could never be converted), never a pinned route.
 _INFERENCE_CACHE: dict = {}
 _UA_ENTRYPOINT = re.compile(r"^\s*claude-cli/\S+\s+\(([^)]*)\)")
 # THE ACTIVE CREDENTIAL IS READ ON A THREAD OF ITS OWN (`_follow_kick`), never

@@ -1513,7 +1513,7 @@ session's environment variables, then fills `HTTPS_PROXY`, `HTTP_PROXY` and
 resolve for the API host. A Desktop started with `--proxy-server=<another
 proxy>` (or behind a system proxy) therefore sends the Code tab around this
 proxy, and the settings `env` this proxy writes cannot override that: under
-the desktop entrypoint the launch environment wins. The symptom is
+the desktop entrypoint the launch environment wins. The symptom is `/health`'s
 `inference_follow.swapped` staying 0 with an empty `passthrough`.
 
 The remedy is a local environment in Desktop's Code tab (environment menu,
