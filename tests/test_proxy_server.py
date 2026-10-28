@@ -24079,15 +24079,42 @@ class TestPumpBackpressure:
     PAYLOAD = (bytes(range(251)) * (8 * 1024 * 1024 // 251 + 1))[:8 * 1024 * 1024]
 
     @staticmethod
-    def _tunnel(loop):
+    def _tunnel(loop, on_close=None, buf=4096):
         """feed -> [pump: src -> dst] -> far, `far` never reading by itself."""
         feed, src = socket.socketpair()
         dst, far = socket.socketpair()
         for s in (dst, far):
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        loop.add(src, dst)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf)
+        loop.add(src, dst, on_close)
         return feed, src, dst, far
+
+    @staticmethod
+    def _closer():
+        """An `on_close` that records which socket ended the pair."""
+        calls = []
+
+        def on_close(closed_by):
+            calls.append(closed_by)
+
+        on_close._wants_closer = True
+        return on_close, calls
+
+    @staticmethod
+    def _read_to_eof(sock, timeout=20) -> bytes:
+        """Every byte until a clean EOF. A reset raises, a stall times out."""
+        sock.settimeout(timeout)
+        got = bytearray()
+        while chunk := sock.recv(1 << 20):
+            got += chunk
+        return bytes(got)
+
+    @staticmethod
+    def _wait(cond, seconds=5) -> bool:
+        deadline = time.monotonic() + seconds
+        while not cond() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return cond()
 
     @staticmethod
     def _backlog(loop, dst) -> int:
@@ -24176,11 +24203,109 @@ class TestPumpBackpressure:
         finally:
             self._close(loop, feed, far)
 
-    @pytest.mark.parametrize("how", ["source_eof", "released_while_held_back"])
-    def test_a_closed_pair_leaves_no_pending_entry(self, how):
+    def test_a_source_that_ends_with_a_backlog_still_delivers_every_byte(self):
         from cswap_pin.proxy import _PumpLoop
 
         loop = _PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        data = self.PAYLOAD[:512 * 1024]
+        try:
+            assert self._blast(feed, data).wait(5)
+            feed.close()
+            got = self._read_to_eof(far)
+            assert len(got) == len(data), (
+                f"the tunnel dropped {len(data) - len(got)} queued bytes at EOF")
+            assert got == data
+            assert self._wait(lambda: not loop.live_pairs())
+            assert calls == [src], "on_close must run once, naming the source"
+            assert not loop._pending and not loop._draining
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_slow_client_receives_the_whole_stream_the_upstream_sent_and_closed(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop, buf=8192)
+        data = (self.PAYLOAD * 3)[:20 * 1024 * 1024]
+
+        def send():
+            feed.sendall(data)
+            feed.close()
+
+        threading.Thread(target=send, daemon=True).start()
+        try:
+            time.sleep(0.3)  # the client lags behind
+            got = self._read_to_eof(far, timeout=30)
+            assert len(got) == len(data), f"short by {len(data) - len(got)} bytes"
+            assert got == data
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_drain_toward_a_source_that_cannot_receive_does_not_end_the_pair(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        data = self.PAYLOAD[:256 * 1024]
+        try:
+            assert self._blast(feed, data).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            far.sendall(b"late")  # forwarded to a closed upstream: EPIPE
+            assert self._read_to_eof(far) == data
+        finally:
+            self._close(loop, feed, far)
+
+    def test_a_peer_that_never_reads_ends_the_drain_at_its_bound(self, monkeypatch):
+        from cswap_pin import proxy
+
+        monkeypatch.setattr(proxy, "_PUMP_DRAIN_IDLE_SECONDS", 0.5)
+        loop = proxy._PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        feed2, in2 = socket.socketpair()
+        out2, sink2 = socket.socketpair()
+        loop.add(in2, out2)
+        try:
+            assert self._blast(feed, self.PAYLOAD[:256 * 1024]).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            assert loop.live_pairs() == 2, "the drain ended before its bound"
+            # a1280ea: the drain does not stall the pump for another tunnel
+            feed2.sendall(b"ping")
+            sink2.settimeout(2)
+            assert sink2.recv(16) == b"ping"
+            assert self._wait(lambda: loop.live_pairs() == 1)
+            assert calls == [src]
+            assert not loop._pending and not loop._draining
+        finally:
+            self._close(loop, feed, far, feed2, sink2, in2, out2)
+
+    def test_a_draining_pair_a_release_lets_go_leaves_no_mark(self):
+        from cswap_pin import proxy
+
+        loop = proxy._PumpLoop()
+        on_close, calls = self._closer()
+        feed, src, dst, far = self._tunnel(loop, on_close)
+        try:
+            assert self._blast(feed, self.PAYLOAD[:256 * 1024]).wait(5)
+            feed.close()
+            assert self._wait(lambda: src in loop._draining)
+            assert loop.release_pairs() == 1
+            assert not loop._draining and not loop._pending
+            assert calls == [proxy._RELEASED_BY_DRAIN]
+        finally:
+            self._close(loop, feed, far)
+
+    @pytest.mark.parametrize("how", ["source_eof", "released_while_held_back"])
+    def test_a_closed_pair_leaves_no_pending_entry(self, how, monkeypatch):
+        from cswap_pin import proxy
+
+        # The far side never reads: a source EOF drains to its bound, not at once.
+        monkeypatch.setattr(proxy, "_PUMP_DRAIN_IDLE_SECONDS", 0.5)
+        loop = proxy._PumpLoop()
         feed, src, dst, far = self._tunnel(loop)
         # Held back needs more than the cap; plain EOF needs a backlog, not a pause.
         data = None if how == "released_while_held_back" else self.PAYLOAD[:256 * 1024]
