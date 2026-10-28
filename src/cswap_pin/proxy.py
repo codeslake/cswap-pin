@@ -27657,6 +27657,11 @@ _RELEASED_BY_DRAIN = object()
 #: it, which starved every other tunnel's heartbeat.
 _PUMP_BACKLOG_CAP = 1 << 20
 
+#: Idle seconds a pair gets to deliver the backlog its ended source left: an
+#: unread drain would hold `live_pairs()`, and with it the handover drain and
+#: the teardown veto.
+_PUMP_DRAIN_IDLE_SECONDS = 30.0
+
 
 class _PumpLoop:
     """ONE selector thread for EVERY tunnel, instead of one thread each.
@@ -27703,6 +27708,10 @@ class _PumpLoop:
         # bytearray per destination so a read or a partial send costs O(chunk),
         # not O(backlog). Only the run thread mutates one; other threads pop.
         self._pending: dict = {}
+        # Sockets whose stream ended while their peer still held a backlog,
+        # each with the time the pair gives up on that peer. The pair closes
+        # once every such backlog is flushed (`_drained`).
+        self._draining: dict = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         # A self-pipe so `add` wakes the selector instead of waiting out its
@@ -27751,6 +27760,7 @@ class _PumpLoop:
         with self._lock:
             self._peer.clear()
             self._pending.clear()
+            self._draining.clear()
             self._last_move = 0.0
         for o in self._siblings:
             o.reset_for_tests()
@@ -27816,6 +27826,7 @@ class _PumpLoop:
                 self._peer.pop(s_, None)
                 self._kind.pop(s_, None)
                 self._pending.pop(s_, None)
+                self._draining.pop(s_, None)
                 try:
                     self._sel.unregister(s_)
                 except (KeyError, ValueError, OSError):
@@ -27874,8 +27885,9 @@ class _PumpLoop:
 
         Writable only while bytes wait for it (an always-writable socket would
         wake the selector on every pass and spin the loop). Readable only while
-        its peer's backlog is under the cap: that is the backpressure. With
-        neither it is unregistered (a selector holds no empty event set).
+        its peer's backlog is under the cap: that is the backpressure, and never
+        once its stream has ended. With neither it is unregistered (a selector
+        holds no empty event set).
 
         shortcut: a held-back source's EOF goes unseen until its peer drains
         under the cap, so a stalled peer pins the pair like an idle tunnel
@@ -27885,7 +27897,8 @@ class _PumpLoop:
         if peer is None:  # released or closed: never put it back
             return
         ev = 0
-        if len(self._pending.get(peer[0], ())) < _PUMP_BACKLOG_CAP:
+        if (s not in self._draining
+                and len(self._pending.get(peer[0], ())) < _PUMP_BACKLOG_CAP):
             ev |= selectors.EVENT_READ
         if self._pending.get(s):
             ev |= selectors.EVENT_WRITE
@@ -27904,6 +27917,7 @@ class _PumpLoop:
         """Send what we can, keep the rest, and watch for writability."""
         with self._lock:
             buf = self._pending.get(dst)
+        moved = False
         while buf:
             try:
                 sent = dst.send(buf)
@@ -27913,10 +27927,14 @@ class _PumpLoop:
                 with self._lock:
                     peer = self._peer.get(dst)
                     self._pending.pop(dst, None)
-                    if peer is not None:
+                    # A source that already ended cannot take the peer's reply:
+                    # drop that direction and keep draining its own.
+                    if peer is not None and dst not in self._draining:
                         self._close_pair(dst, peer[0], peer[1])
-                return
+                        return
+                break
             del buf[:sent]
+            moved = True
         with self._lock:
             if not buf:
                 self._pending.pop(dst, None)
@@ -27926,6 +27944,42 @@ class _PumpLoop:
             peer = self._peer.get(dst)
             if peer is not None:
                 self._arm(peer[0])
+                if peer[0] in self._draining:
+                    if moved:
+                        self._draining[peer[0]] = (
+                            time.monotonic() + _PUMP_DRAIN_IDLE_SECONDS)
+                    if self._drained(dst):
+                        self._end_drain(peer[0])
+
+    def _drained(self, a) -> bool:
+        """Whether every ended stream of `a`'s pair has had its backlog taken.
+
+        CALLER HOLDS THE LOCK. Each ended socket's bytes wait in its peer's
+        entry of `_pending`.
+        """
+        peer = self._peer.get(a)
+        return peer is not None and not any(
+            s in self._draining and self._pending.get(p)
+            for s, p in ((a, peer[0]), (peer[0], a)))
+
+    def _end_drain(self, ended) -> None:
+        """Shut the peer's write side, so it reads EOF and not a reset, and
+        close the pair. CALLER HOLDS THE LOCK."""
+        entry = self._peer.get(ended)
+        if entry is None:
+            return
+        try:
+            entry[0].shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        self._close_pair(ended, entry[0], entry[1], closed_by=ended)
+
+    def _expire_drains(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            for s, due in list(self._draining.items()):
+                if due <= now:
+                    self._end_drain(s)
 
     def _close_pair(self, a, b, on_close, closed_by=None) -> None:
         # CALLER HOLDS THE LOCK. It mutates `_peer`, and the run loop now
@@ -27935,6 +27989,7 @@ class _PumpLoop:
             self._peer.pop(s, None)
             self._kind.pop(s, None)
             self._pending.pop(s, None)
+            self._draining.pop(s, None)
             try:
                 self._sel.unregister(s)
             except (KeyError, ValueError):
@@ -27954,7 +28009,9 @@ class _PumpLoop:
 
     def _run(self) -> None:
         while True:
-            for key, events in self._sel.select(timeout=60):
+            ready = self._sel.select(timeout=1 if self._draining else 60)
+            self._expire_drains()
+            for key, events in ready:
                 src = key.fileobj
                 # A BACKLOG DRAINING is not a read. `_flush` registered this
                 # socket for writability because its peer had bytes waiting;
@@ -27999,7 +28056,15 @@ class _PumpLoop:
                         # `_close_pair` itself, so closing again here would
                         # run `on_close` a second time.
                         if self._peer.get(src) is not None:
-                            self._close_pair(src, dst, on_close, closed_by=src)
+                            self._draining[src] = (
+                                time.monotonic() + _PUMP_DRAIN_IDLE_SECONDS)
+                            if self._drained(src):
+                                self._close_pair(src, dst, on_close,
+                                                 closed_by=src)
+                            else:
+                                # Its peer still holds the stream's tail:
+                                # stop reading, let the flush deliver it.
+                                self._arm(src)
                     continue
                 # NEVER BLOCK THIS THREAD. It carries every tunnel, so a
                 # peer that stops reading would stall all of them — releasing
