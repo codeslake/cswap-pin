@@ -2069,7 +2069,9 @@ def heal(backup_root: Path, identity: dict | None = None,
                 "The next heal retires it if that did not happen")
             return False
         # Past the deferral: this daemon is being retired, so the sighting has
-        # done its job and must not outlive it.
+        # done its job and must not outlive it. READ FIRST: an `asked` mark on
+        # it is the bound on the unconfirmed ask below.
+        sighted = _read_json(Path(certdir) / _HEAL_DEFER_FILE)
         _clear_heal_defer(certdir)
         try:
             # BOUNDED, BECAUSE A DEPLOY CALLS THIS SYNCHRONOUSLY. The holder
@@ -2090,6 +2092,15 @@ def heal(backup_root: Path, identity: dict | None = None,
                 # killing on faith.
                 if stale and int(stale.get("pid") or 0) in _pin_daemon_pids(certdir):
                     stale_pid = int(stale["pid"])
+                    # A DRAINER LEAVES ON ITS OWN. A TERM to a held daemon with
+                    # no successor on the port takes the capped signal drain and
+                    # `release_pairs` cuts every tunnel; its marker expires on
+                    # silence, so a drainer that stops beating is retired later.
+                    if is_draining(certdir, stale_pid):
+                        _log_lifecycle(
+                            f"{stale_pid} is draining and leaves on its own "
+                            f"-- leaving it")
+                        return False
                     # A DAEMON CARRYING LIVE WORKER TRAFFIC IS NOT WEDGED,
                     # whatever `/health` just said -- `_worker_alive_age`
                     # reads evidence written from the REQUEST path, which a
@@ -2172,6 +2183,30 @@ def heal(backup_root: Path, identity: dict | None = None,
                             f"{stale_pid} was wedged under a holder — "
                             f"asked the holder for a successor before "
                             f"terminating it")
+                    # A DELIVERED ASK NOBODY CONFIRMED IS NOT GROUNDS TO TERM A
+                    # SERVING DAEMON: its successor may be slow (56-85 s on a
+                    # loaded host) and with none on the port the TERM cuts every
+                    # tunnel. STALE FINGERPRINT ONLY (a wedge's TERM is its only
+                    # repair). BOUNDED: the first time, leave an `asked` mark on
+                    # this pid AND fingerprint (else `_watchdog_had_its_turn`
+                    # rewrites it and the bound is lost); the next heal TERMs as
+                    # before, so a holder that never publishes cannot make the
+                    # stale daemon immortal.
+                    ask_mark = {"pid": stale_pid, "fingerprint": stale_fp,
+                                "asked": True}
+                    if (not wedged and asked_holder and not confirmed
+                            and sighted != ask_mark):
+                        try:
+                            (Path(certdir) / _HEAL_DEFER_FILE).write_text(
+                                json.dumps(ask_mark))
+                        except OSError:
+                            pass  # cannot record the bound, so no deferral
+                        else:
+                            _log_lifecycle(
+                                f"asked the holder to replace {stale_pid} "
+                                f"and no successor published yet -- leaving "
+                                f"it; the next heal retires it if none does")
+                            return False
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
                     # a missed /health already said it was not moving -- on

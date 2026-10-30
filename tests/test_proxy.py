@@ -22804,6 +22804,102 @@ class TestAWedgeIsNotTrustedForever:
             "successor -- exactly the double-bind `_recycle_daemon` exists "
             "to avoid")
 
+    def _stale_fp_daemon_under_a_holder_that_never_publishes(
+            self, tmp_path, monkeypatch):
+        """Shared setup for the T3108 cases: a daemon serving on a STALE
+        fingerprint under a holder that hears the ask and never publishes a
+        successor. Every `os.kill` is RECORDED, never raised on -- `heal`
+        swallows an exception, so an assertion raised inside it would pass
+        vacuously. Returns (proxy, root, certdir, stale_pid, holder_pid,
+        kills, spawn_calls)."""
+        from cswap_pin import proxy
+
+        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        stale_pid, holder_pid = 55541, 55542
+        proxy.write_daemon_state(certdir, 4100, stale_pid, "STALE-FP")
+
+        def _fake_read_alive_port(cd, fingerprint=None):
+            st = proxy.read_daemon_state(cd)
+            if not st or (fingerprint is not None
+                          and st.get("fingerprint") != fingerprint):
+                return None
+            return st.get("port")
+
+        monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
+        monkeypatch.setattr(
+            proxy, "_wedged_parent_holder",
+            lambda pid, cd: holder_pid if pid == stale_pid else None)
+        monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked",
+                            lambda pid, hp: True)
+        monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
+        monkeypatch.setattr(proxy, "_SPAWN_WAIT_S", 0.1)
+        kills, spawn_calls = [], []
+        monkeypatch.setattr(
+            proxy.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda *a, **k: spawn_calls.append(a) or 99999)
+        return proxy, root, certdir, stale_pid, holder_pid, kills, spawn_calls
+
+    def case_a_daemon_that_announced_its_drain_is_sent_no_signal(
+            self, tmp_path, monkeypatch):
+        """T3108, root cause unconfirmed-escalation: a daemon that already
+        announced it is draining leaves on its own, and a TERM on a held
+        daemon with no successor on the port takes the capped signal drain and
+        cuts every tunnel. heal must send nothing at all: not the ask, not the
+        TERM, and spawn nothing over it."""
+        (proxy, root, certdir, stale_pid, _holder, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
+        proxy.draining_marker_path(certdir, stale_pid).write_text(
+            str(time.time()))
+        assert proxy.heal(root) is False
+        assert kills == [], (
+            f"heal signalled a daemon that was already draining: {kills!r}")
+        assert not spawn_calls, "heal spawned over a draining daemon"
+
+    def case_an_ask_that_was_delivered_and_not_confirmed_is_not_a_term(
+            self, tmp_path, monkeypatch):
+        """T3108: the ask reached the holder (SIGUSR1 sent) but no successor
+        published inside `_SPAWN_WAIT_S` (a slow one, 56-85 s measured on a
+        loaded host). The daemon is serving: TERMing it now is the
+        unconfirmed escalation. heal sends the ask only, spawns nothing,
+        and records `asked` on the SAME pid AND fingerprint so the next heal
+        can tell it already gave the holder a window."""
+        (proxy, root, certdir, stale_pid, holder_pid, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
+        assert proxy.heal(root) is False
+        assert kills == [(holder_pid, proxy._REPLACE_ME_SIGNAL)], (
+            f"expected the ask and no TERM, got {kills!r}")
+        assert not spawn_calls, "heal spawned over a daemon it did not retire"
+        assert proxy._read_json(certdir / proxy._HEAL_DEFER_FILE) == {
+            "pid": stale_pid, "fingerprint": "STALE-FP", "asked": True}
+
+    def case_the_second_unconfirmed_ask_on_the_same_daemon_is_a_term(
+            self, tmp_path, monkeypatch):
+        """T3108: the bound. Without it a holder that never publishes leaves
+        the stale daemon immortal (bae8ae3, 584cba8). A record naming this
+        pid and fingerprint with `asked`, past the watchdog's two intervals
+        (the REAL `_watchdog_had_its_turn`, which must not rewrite it), takes
+        the ordinary ask, wait and TERM."""
+        (proxy, root, certdir, stale_pid, holder_pid, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        sighting = certdir / proxy._HEAL_DEFER_FILE
+        sighting.write_text(json.dumps(
+            {"pid": stale_pid, "fingerprint": "STALE-FP", "asked": True}))
+        old = time.time() - 3 * proxy._CODE_WATCH_INTERVAL_S
+        os.utime(sighting, (old, old))
+        assert proxy.heal(root) is True
+        assert kills == [(holder_pid, proxy._REPLACE_ME_SIGNAL),
+                         (stale_pid, 15)], (
+            f"the bounded second pass did not TERM: {kills!r}")
+        assert not sighting.exists(), "the sighting outlived the retirement"
+
     def _wedge_replaced_through_the_holder(
             self, tmp_path, monkeypatch, *, term_raises_esrch):
         """Shared setup for a wedge on a MATCHING fingerprint, replaced
