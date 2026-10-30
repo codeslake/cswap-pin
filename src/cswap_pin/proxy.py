@@ -14524,12 +14524,13 @@ class PortHolder:
             # window makes it send this very signal, which cannot say who
             # asked. A second successor would sit beside the first with no
             # supervisor, two acceptors on one socket. THE SUCCESSOR'S OWN ASK
-            # IS THE ONE EXCEPTION: it asks once and does not re-ask, and
-            # declining it sends it down the exit-75 fallback (release, a 30 s
-            # drain), so nothing accepts until the supervisor reaps the retired
-            # daemon. It announces draining BEFORE it asks, so a marker for the
-            # current daemon is what separates its ask from the retired one's.
-            # With no certdir that cannot be told, and the ask is declined.
+            # IS THE ONE EXCEPTION: declining it leaves that daemon serving
+            # (T3100: it waits `_RELOCATE_WAIT_S`, then asks again on a later
+            # tick; it used to release and drain capped, so nothing accepted
+            # until the supervisor reaped the retired daemon). It announces
+            # draining BEFORE it asks, so a marker for the current daemon is
+            # what separates its ask from the retired one's. With no certdir
+            # that cannot be told, and the ask is declined.
             retiring = getattr(self, "_retiring", None)
             certdir = getattr(self, "_certdir", None)
             if (getattr(retiring, "returncode", 0) is None
@@ -14582,7 +14583,9 @@ class PortHolder:
                 self._handed_off = handed
                 return
             # THE DAEMON'S WAIT STARTS WITH THIS ASK: it polls `proxy.json` for
-            # `_SPAWN_WAIT_S`, then falls back to exit 75 and a capped drain.
+            # `_RELOCATE_WAIT_S`, then keeps serving and asks again on a later
+            # tick. This watch respawns a successor that dies for only the first
+            # `_SPAWN_WAIT_S` of it; past that the daemon's retry is the repair.
             deadline = time.monotonic() + _SPAWN_WAIT_S
             before = getattr(self, "_proc", None)
             try:
@@ -14600,8 +14603,8 @@ class PortHolder:
                 # RuntimeError IS HOW `Thread.start` REPORTS EAGAIN / RLIMIT_NPROC,
                 # the exhaustion the `_spawn` guard above contains: escaping this
                 # SIGNAL HANDLER it ends the holder with no `stop()`. Unwatched is
-                # what the successor was before T2071, and the daemon's exit-75
-                # path follows.
+                # what the successor was before T2071, and the daemon's own
+                # retry on a later tick follows.
                 try:
                     threading.Thread(
                         target=self._respawn_until_published,
@@ -14616,9 +14619,10 @@ class PortHolder:
         and spawn it again if it dies before `proxy.json` names its pid (T2071).
 
         NOBODY ELSE WATCHES IT. `_supervise` waits on the daemon that asked,
-        which polls for a record until ``deadline``, then releases the
-        listener, drains capped and exits 75 (4397803 chose that over a
-        keep-serving retry, and it stays). A successor that died at once, on
+        which polls for a record for `_RELOCATE_WAIT_S`, then keeps serving and
+        asks again on a later tick (it released the listener, drained capped and
+        exited 75 until T3100: that cap cut held channels for a repair still on
+        its way). A successor that died at once, on
         `ModuleNotFoundError` while `uv tool install --force` rebuilt the venv
         under it, was never retried before that: dkim Mac, 0.1.329 -> 0.1.331,
         "cut 5 in-flight request(s) after 30.0s".
@@ -14632,8 +14636,8 @@ class PortHolder:
         cap would `degrade_now()` beside a daemon that still serves, and the
         ladder starts at the daemon's exit as it always did. `_backoff` paces
         the respawns (0.5 s, 1 s, 2 s, ...) and none starts that could not
-        begin before ``deadline``, so a window longer than the wait still ends
-        on the daemon's own fallback.
+        begin before ``deadline``, so a window longer than it is left to the
+        daemon's own retry on a later tick.
         """
         import subprocess
 
@@ -16038,13 +16042,14 @@ _RELOCATED_ENV = "CSWAP_PIN_RELOCATED"
 _RELOCATE_ENV = "CSWAP_PIN_RELOCATE"
 # HOW LONG THE OLD DAEMON AND THE HELPER WAIT FOR THE NEW DAEMON TO SERVE.
 # `_SPAWN_WAIT_S` (10 s) is the wrong bound here: on a loaded Mac a successor
-# took 56-85 s to publish (wmac, load 8.72, T1935), and the old daemon's
-# exit-75 fallback at the bound is a CAPPED drain that cuts held tunnels. The
-# wait costs the old daemon nothing (it serves until the successor has
-# published); at the bound it keeps serving instead of draining. 180 s is more
-# than twice that figure. The HELPER waits this long, the old daemon 1.25 times
-# it (`_hand_over_to_the_caller`), and a helper that dies sooner is covered by
-# the same bound: the old daemon simply carries on.
+# took 56-85 s to publish (wmac, load 8.72, T1935), and an exit-75 fallback at
+# the bound is a CAPPED drain that cuts held tunnels. The wait costs the old
+# daemon nothing (it serves until the successor has published); at the bound it
+# keeps serving instead of draining. 180 s is more than twice that figure. The
+# HELPER waits this long, the old daemon 1.25 times it
+# (`_hand_over_to_the_caller`), and a helper that dies sooner is covered by the
+# same bound: the old daemon simply carries on. The ordinary held ask of
+# `_watch_own_code` waits this long too, for the same reason (T3100).
 _RELOCATE_WAIT_S = 180.0
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
 # NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly and
@@ -16087,8 +16092,8 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
 
     TAKEN WHATEVER THE CAUSE OF THE TICK, stale code or a blind mint included:
     the holder answers any ask with the socket for a waiting helper, and the
-    ordinary ask's `_SPAWN_WAIT_S` and exit 75 would cut held tunnels for a
-    successor the helper takes far longer to publish.
+    ordinary ask would wait only `_RELOCATE_WAIT_S` for a successor the helper
+    takes longer to publish, then ask again over a socket that has gone.
 
     THIS DAEMON OUTWAITS THE HELPER (1.25 x `_RELOCATE_WAIT_S`): a successor
     the helper can still see publish is one this daemon sees too, so the
@@ -16143,9 +16148,9 @@ def _code_is_current(own: str) -> bool:
     AN ABSENT PACKAGE IS "NOT YET", NOT "CHANGED", FOR `_ABSENT_CODE_GRACE_S`
     (T2890). `uv tool install --force` empties the venv before it downloads
     the wheels. A successor cannot start without this file, so asking inside
-    the window only ends on exit 75 when it outlasts `_SPAWN_WAIT_S` (the
-    holder's respawn loop otherwise rides it out), and the next tick looks
-    again. The wait is bounded because a venv rebuilt under another
+    the window only wastes a wait when it outlasts `_SPAWN_WAIT_S` (the
+    holder's respawn loop otherwise rides it out, and past that the daemon
+    keeps serving and asks on a later tick), and the next tick looks again. The wait is bounded because a venv rebuilt under another
     interpreter (a different Python minor) never brings this path back: the
     new code is elsewhere and the holder's `sys.executable` finds it. The
     clock starts at the first absent read and clears when the file is there
@@ -16248,14 +16253,16 @@ def _watch_own_code(
     # for each one. One shot leaves the machine exactly as it was if it fails,
     # which is the safer of the two ways to be wrong.
     stand_down_asked = False
-    # THE ASK HAPPENS ONCE PER PROCESS, WITH NO LOOP-CARRIED STATE NEEDED.
-    # Every path out of the held-replace branch below exits the process or
-    # ends the watcher — the successor's own publish found (exit 0) or not
-    # found within `_SPAWN_WAIT_S` (exit 75, the fallback the supervisor
-    # already knows how to recover from), or the ask not surviving, which
-    # returns from this function instead of exiting. A second SIGUSR1 is
-    # therefore never reachable: the process asking is gone, or this watcher
-    # is, before a second tick could ask again.
+    # THE ASK MAY BE MADE ON MORE THAN ONE TICK, WITH NO LOOP-CARRIED STATE.
+    # The held-replace branch below exits the process (the successor's record
+    # found, 0; a holder that can never be asked, 75), ends the watcher (the
+    # holder did not survive the ask), or hands the announcement back and goes
+    # round again (the holder died before the ask, or no successor published
+    # within `_RELOCATE_WAIT_S`: this daemon has lost nothing by waiting, so it
+    # keeps serving rather than draining capped). What makes the next ask
+    # harmless is the read that branch opens with: a port a successor already
+    # serves is never asked about, so a late successor is taken through the
+    # uncapped tail on the next tick instead of drawing a second one.
     # THE BEAT `/health` PUBLISHES as `code_watch_age_s`, stamped once here so
     # a daemon younger than one interval passes, and at the top of every tick.
     # A thread that returned or died stops stamping.
@@ -16516,6 +16523,28 @@ def _watch_own_code(
             # takes the port OUT of the holder, and the successor is then one
             # failed bind away from stranding every session.
             if held_by_a_holder():
+                # A SUCCESSOR THAT ALREADY SERVES THE PORT IS NOT ASKED FOR
+                # AGAIN. This tick runs beside a launch's ask (its TERM drain
+                # keeps ticking: three teardown entries on one process, and the
+                # incident's successor came 4 s after the TERM) and after a
+                # wait that ended just before the holder's late handler
+                # finished; `_retiring` is set only by the holder's own port
+                # watch, so a second ask spawns a second successor beside the
+                # first, two acceptors on one socket. Leave through the same
+                # tail as the success arm below: release, drain UNCAPPED, exit
+                # 0 (75 would have the holder spawn another). Beside a TERM
+                # drain this is harmless: `release_listener` tolerates a second
+                # call, and two uncapped drains over the same replies and
+                # tunnels end together.
+                if _superseded_on_the_port(certdir):
+                    _log_lifecycle(
+                        f"{why}: a successor already serves the port, so "
+                        "nothing is asked: leaving it the port while we "
+                        "finish what we hold"
+                    )
+                    server.release_listener()
+                    server.await_inflight(_HANDOVER_DRAIN_SECONDS)
+                    os._exit(0)
                 # ASK WHILE STILL ACCEPTING, then leave. The socket is the
                 # holder's and cannot be handed down from here — that is what
                 # `release_listener(hand_down=True)` refuses, and rightly. But
@@ -16550,8 +16579,8 @@ def _watch_own_code(
                 # THE RECORD THE INSTANT BEFORE THE ASK — so a record that
                 # was already sitting in `proxy.json` is never mistaken
                 # for the successor this ask is about to produce. See
-                # `_await_successor_state`. A LOCAL, not loop-carried: this
-                # whole branch exits before a second pass could need it.
+                # `_await_successor_state`. A LOCAL, not loop-carried: a later
+                # pass reads it afresh.
                 _pre_ask = read_daemon_state(certdir)
                 pre_ask_pid = (
                     int(_pre_ask.get("pid") or 0) if _pre_ask else None
@@ -16561,15 +16590,30 @@ def _watch_own_code(
                     try:
                         os.kill(holder, _REPLACE_ME_SIGNAL)
                     except OSError:
-                        holder = None
+                        # THE HOLDER DIED BETWEEN OUR READ AND OUR KILL, so
+                        # nobody started a successor and nobody is left to
+                        # respawn us. The exit-75 fallback below would drain
+                        # capped (cutting every held channel) to hand the port
+                        # to nobody: keep serving instead. Our parent has
+                        # changed, so the next tick reads `held_by_a_holder()`
+                        # false and the unheld branch hands the socket down.
+                        _log_lifecycle(
+                            f"{why}: the holder is gone, so nobody can be "
+                            "asked: still serving"
+                        )
+                        _asked_done()
+                        continue
                 if not holder:
-                    # FALL BACK TO THE OLD SHAPE, never to nothing. No
-                    # holder pid, or a holder that will not take the
-                    # signal, means nobody has started a successor — so
-                    # we must still exit 75 and let the supervisor do it
-                    # the slow way. A gap is worse than the old behaviour
-                    # only if it is longer; no daemon at all is worse
-                    # than either.
+                    # FALL BACK TO THE OLD SHAPE, never to nothing. A holder
+                    # that can NEVER be asked (it did not claim the channel:
+                    # an older release, whose handler would not exist, so a
+                    # signal kills it) means nothing can start a successor
+                    # before we leave, and the exit-75 replace is the only
+                    # repair there is: its capped drain holds the port dark,
+                    # so cutting is the price. Staying up would leave the
+                    # stale code serving for ever. A gap is worse than the
+                    # old behaviour only if it is longer; no daemon at all is
+                    # worse than either.
                     _log_lifecycle(
                         f"{why} — exiting for the holder to replace"
                     )
@@ -16619,31 +16663,47 @@ def _watch_own_code(
                 # (whatever was on disk before the ask) are what a genuinely
                 # new record cannot be.
                 #
-                # WAITED FOR ONCE, NEVER RETRIED ON A LATER TICK: a retry
-                # needs the ask itself to be idempotent state carried across
-                # ticks, and every path out of this branch already exits —
-                # found means exit 0 below, not found means the exit-75
-                # fallback right here, the same one a holder-less daemon
-                # already takes. A holder whose signal handler runs later
-                # than `_SPAWN_WAIT_S` still spawns a successor after this
-                # process is gone; the supervisor then has two, invisible to
-                # this wait either way.
-                # ponytail: the fallback below assumes the handler runs
-                # within _SPAWN_WAIT_S of the ask; a handler delayed past it
-                # would leave a second successor once the exit-75 respawn
-                # also spawns one (not observed -- every measured successor
-                # published within the same second as the ask).
-                if not _await_successor_state(
+                # WAITED FOR `_RELOCATE_WAIT_S`, THEN RETRIED ON A LATER TICK.
+                # The bound was `_SPAWN_WAIT_S` (10 s) with an exit-75 fallback
+                # after it, while a successor takes 56-85 s to publish on a
+                # loaded host (T1935): a capped drain that cut every held
+                # channel for a repair that was still on its way. This daemon
+                # serves until a successor has published, so waiting costs it
+                # nothing, and at the bound it keeps serving (the shape
+                # `_hand_over_to_the_caller` has). NOT `return`: that ends the
+                # watcher and clears its beat, which is for a holder that
+                # cannot be asked again; this daemon is still its own repair.
+                # The retry is idempotent because this branch opens by reading
+                # the port: a successor that published after the wait is
+                # found there, not asked for again.
+                # shortcut: a handler delayed past `_RELOCATE_WAIT_S` of the
+                # ask still spawns a successor, and the retry's ask then adds a
+                # second (not observed: the slowest measured publish is 85 s);
+                # upgrade to skipping the ask while the holder's own successor
+                # lives, once one is seen.
+                #
+                # THE MARKER IS BEATEN WHILE WAITING, because the wait outlasts
+                # `_DRAINING_MARKER_TTL` and this thread does not beat the code
+                # watch either: after 90 s a launch reads a dead watchdog and
+                # takes the recycle, and `is_draining` is what keeps its ask from
+                # drawing a second successor.
+                waited = 0.0
+                found = False
+                while not found and waited < _RELOCATE_WAIT_S:
+                    step = min(_DRAINING_BEAT_SECONDS, _RELOCATE_WAIT_S - waited)
+                    found = _await_successor_state(
                         certdir, None, os.getpid(),
-                        pre_ask_pid=pre_ask_pid):
+                        pre_ask_pid=pre_ask_pid, wait_s=step)
+                    beat_draining(certdir)
+                    waited += step
+                if not found:
                     _log_lifecycle(
                         "asked the holder to replace us and no successor "
-                        "published within the wait — exiting for the "
-                        "holder to replace us the slow way"
+                        "published within the wait: still serving, asking "
+                        "again on a later tick"
                     )
-                    server.release_listener()
-                    server.await_inflight(_HELD_DRAIN_SECONDS)
-                    os._exit(_RESTART_ME_CODE)
+                    _asked_done()
+                    continue
                 _log_lifecycle(
                     f"{why} — asked the holder to replace us while we keep "
                     "serving"

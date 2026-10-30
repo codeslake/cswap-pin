@@ -15347,12 +15347,13 @@ class TestDrainReportsWhatItCut:
                                      until we are gone, so every second here is
                                      a second with nothing serving the port.
                                      Cutting is the lesser evil
-                                     -> `_HELD_DRAIN_SECONDS`. TWO call sites
-                                     share it: no holder pid to ask at all,
-                                     and a holder that survived the ask but
-                                     whose successor never published within
-                                     the wait -- both leave the supervisor to
-                                     start the next one the slow way.
+                                     -> `_HELD_DRAIN_SECONDS`. ONE call site
+                                     shares it: no holder that can be asked at
+                                     all (one that never claimed the channel),
+                                     which leaves the supervisor to start the
+                                     next one the slow way. A holder that WAS
+                                     asked and whose successor is late is not
+                                     this: the daemon keeps serving (T3100).
 
         AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
         third constant rather than a bigger one: it is also the supervisor's
@@ -15385,18 +15386,19 @@ class TestDrainReportsWhatItCut:
         assert named, (
             "no `await_inflight(<CONSTANT>)` call found at all — the scan is "
             "broken, and a broken scan passes every assertion below it")
-        # THREE HAND OVER: the code watchdog's held and unheld branches, and
-        # the caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
+        # FOUR HAND OVER: the code watchdog's held branch twice (its own ask,
+        # and a port a successor already serves), its unheld branch, and the
+        # caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
         # successor is serving before it drains exactly as the held branch's.
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
+            "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
+            "_HELD_DRAIN_SECONDS",
         ], (
             "the exit paths no longer drain on the ceilings that fit them. "
-            "Three hand over to a successor that is already serving (free to "
-            "wait) and two exit so a holder can start the successor the slow "
-            "way (every second is an unserved port). Got: "
+            "Four hand over to a successor that is already serving (free to "
+            "wait) and one exits so a holder that cannot be asked can start the "
+            "successor the slow way (every second is an unserved port). Got: "
             + ", ".join(sorted(named))
         )
 
