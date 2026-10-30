@@ -2129,49 +2129,10 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # exact damage this recycle exists to avoid.
                     if isinstance(stale.get("port"), int):
                         _write_port_hint(certdir, stale["port"])
-                    # SUCCESSOR FIRST, THROUGH THE HOLDER, WHEN THERE IS ONE.
-                    # A bare TERM-then-spawn races the holder for the port --
-                    # `_recycle_daemon`'s own docstring measures the double
-                    # bind this avoids. Ask the WEDGED DAEMON'S OWN parent
-                    # (not merely "a holder exists somewhere for this
-                    # certdir") to replace it, and wait for a fresh record
-                    # before touching the old pid at all.
-                    # NOT `_holder_owns(certdir) and` -- that matches
-                    # `--hold-port` only, and a standby PROMOTED IN PLACE
-                    # never re-execs (its argv still reads `--standby ...`),
-                    # so `and`-ing it in short-circuited before
-                    # `_wedged_parent_holder` (which DOES recognise a
-                    # promoted standby) was ever reached. `_wedged_parent_holder`
-                    # already proves the STRONGER claim -- that STALE_PID'S OWN
-                    # parent is a holder or a promoted standby for THIS
-                    # certdir -- so the looser "something holds it somewhere"
-                    # check added nothing but a way to refuse the standby row.
-                    asked_holder = (
-                        _REPLACE_ME_SIGNAL is not None
-                        and _wedged_parent_holder(stale_pid, certdir)
-                    )
-                    # THE HOLDER HAS TO HAVE CLAIMED THE CHANNEL. Its argv
-                    # alone (just proven above) says it is A holder for this
-                    # certdir, not that it ever installed the SIGUSR1
-                    # handler -- the default disposition is TERMINATE, so
-                    # asking one that cannot hear it kills it and the
-                    # listening socket with it. See `_wedged_daemon_can_be_asked`.
-                    if asked_holder and not _wedged_daemon_can_be_asked(
-                            stale_pid, asked_holder):
-                        asked_holder = None
-                    if asked_holder:
-                        try:
-                            os.kill(asked_holder, _REPLACE_ME_SIGNAL)
-                        except OSError:
-                            asked_holder = None
-                    confirmed = bool(asked_holder) and _await_successor_state(
+                    # SUCCESSOR FIRST, THROUGH THE HOLDER, WHEN THERE IS ONE,
+                    # before the TERM below: `_ask_holder_for_successor`.
+                    confirmed = _ask_holder_for_successor(
                         certdir, fp, stale_pid)
-                    if confirmed:
-                        _log_carry(
-                            certdir,
-                            f"{stale_pid} was wedged under a holder — "
-                            f"asked the holder for a successor before "
-                            f"terminating it")
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
                     # a missed /health already said it was not moving -- on
@@ -10602,7 +10563,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # handovers) while the daemon keeps serving, and then nothing
             # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
             # absent (an older daemon) reads as dead.
-            # A missing clause takes the path below: a STALL, unmarked or
+            # A missing clause takes the path below (`_recycle_daemon`: it asks
+            # the holder for a successor, then TERMs): a STALL, unmarked or
             # marked (the watchdog never replaces on a busy mint lock, nor
             # clears the mark there), a daemon whose OWN parent is not the
             # holder (`_holder_owns` is only "some holder exists"; an unheld
@@ -10633,7 +10595,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # already wired to the old one.
             if isinstance(stale.get("port"), int):
                 _write_port_hint(certdir, stale["port"])
-            if _recycle_daemon(certdir, int(stale["pid"])):
+            if _recycle_daemon(certdir, int(stale["pid"]), fp):
                 # THE HOLDER OWNS THE REPLACEMENT.
                 for _ in range(int(_SPAWN_WAIT_S * 10)):
                     port = _read_alive_port(certdir)
@@ -10839,7 +10801,57 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
     return True
 
 
-def _recycle_daemon(certdir: Path, pid: int) -> bool:
+def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool:
+    """Ask ``pid``'s own holder for a successor and wait for its record. True
+    when one published, False for every other outcome: nothing asked, nobody
+    answered. The caller's TERM follows either way, and after a True the
+    successor already holds the port, so that TERM's capped drain loses its
+    clock (`_superseded_on_the_port`) instead of cutting a daemon nothing
+    has replaced yet.
+
+    A bare TERM-then-spawn races the holder for the port --
+    `_recycle_daemon`'s own docstring measures the double bind this avoids.
+    Ask ``pid``'s OWN parent (not merely "a holder exists somewhere for this
+    certdir") to replace it, and wait for a fresh record before touching the
+    old pid at all. Both `heal` (a wedge, stale code) and `_recycle_daemon`
+    (the launch) go through here.
+
+    NOT `_holder_owns(certdir) and` -- that matches `--hold-port` only, and a
+    standby PROMOTED IN PLACE never re-execs (its argv still reads
+    `--standby ...`), so `and`-ing it in short-circuited before
+    `_wedged_parent_holder` (which DOES recognise a promoted standby) was ever
+    reached. `_wedged_parent_holder` already proves the STRONGER claim -- that
+    PID'S OWN parent is a holder or a promoted standby for THIS certdir -- so
+    the looser "something holds it somewhere" check added nothing but a way to
+    refuse the standby row.
+    """
+    asked_holder = (
+        _REPLACE_ME_SIGNAL is not None
+        and _wedged_parent_holder(pid, certdir)
+    )
+    # THE HOLDER HAS TO HAVE CLAIMED THE CHANNEL. Its argv alone (just proven
+    # above) says it is A holder for this certdir, not that it ever installed
+    # the SIGUSR1 handler -- the default disposition is TERMINATE, so asking
+    # one that cannot hear it kills it and the listening socket with it. See
+    # `_wedged_daemon_can_be_asked`.
+    if asked_holder and not _wedged_daemon_can_be_asked(pid, asked_holder):
+        asked_holder = None
+    if asked_holder:
+        try:
+            os.kill(asked_holder, _REPLACE_ME_SIGNAL)
+        except OSError:
+            asked_holder = None
+    confirmed = bool(asked_holder) and _await_successor_state(
+        certdir, fp, pid)
+    if confirmed:
+        _log_carry(
+            certdir,
+            f"{pid} is under a holder — asked the holder for a successor "
+            f"before terminating it")
+    return confirmed
+
+
+def _recycle_daemon(certdir: Path, pid: int, fp: "str | None") -> bool:
     """Replace a stale daemon. True when a successor is already on the way.
 
     UNDER A HOLDER THIS IS NOT OURS TO DO, and doing it anyway was two
@@ -10854,11 +10866,15 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
       rewritten to a different port: 44411 -> 41569, with every live session
       still naming 44411.
 
-    So under a holder we TERM and report "handled": the holder puts a
-    successor on the socket it owns, and the code watchdog inside that
-    successor retires it again if the file on disk has moved on. Without a
-    holder this is the old behaviour, unchanged — kill, and let the caller
-    spawn.
+    So under a holder we ASK IT FOR A SUCCESSOR FIRST
+    (`_ask_holder_for_successor`, ``fp`` the successor's fingerprint), so
+    the TERM that follows lands on a daemon already replaced on the port and
+    its capped drain loses its clock, then TERM and report "handled": the
+    holder puts a successor on the socket it owns, and the code watchdog
+    inside that successor retires it again if the file on disk has moved on.
+    An ask nobody hears, or no successor answers, still ends in the TERM: the
+    last resort for a daemon nothing else will replace. Without a holder this
+    is the old behaviour, unchanged — kill, and let the caller spawn.
 
     NOT `_holder_owns` ALONE. That matches `--hold-port` argv only, and a
     standby PROMOTED IN PLACE (`_standby_revive`) never re-execs — its argv
@@ -10871,6 +10887,7 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     branch stopped `and`-ing `_holder_owns` in.
     """
     held = _holder_owns(certdir) or _wedged_parent_holder(pid, certdir) is not None
+    _ask_holder_for_successor(certdir, fp, pid)
     _kill_daemon(pid, certdir)
     return held
 
