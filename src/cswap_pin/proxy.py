@@ -20920,57 +20920,10 @@ class PinProxy:
                       streams=streams, bridges=self.held_bridge_ids())
         beat_at = started
         try:
-            # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to the
-            # ingress host the `/bridge` response names, so it is an opaque
-            # tunnel `_PUMP` drives rather than a reply anyone is owed —
-            # `_mitm` hands the debt back at the 101, correctly, because a
-            # tunnel owes no ANSWER. It is still a live channel that dies with
-            # this process.
-            #
-            # A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
-            # dropping this wait, and the fleet disproved it the same hour: pid
-            # 423760 owed nothing, left at once, and took four open connections
-            # with it, while pid 1452400 — which did owe — stayed and kept
-            # fourteen.
-            #
-            # ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer
-            # keeps its entry for ever. A tunnel quiet for the marker's own TTL
-            # cannot be told from a dead one, which is the same discriminator
-            # the reply wait uses. Uncapped arm only. The signal arm has a
-            # supervisor counting to `_DRAIN_SECONDS + 2`, and the held arm is
-            # holding the port dark.
+            # AND THE TUNNELS: `_wait_for_tunnels`, on the uncapped arm here and
+            # on a capped one a successor superseded, after the loop below.
             if budget == float("inf"):
-                # A LIVE BRIDGE IS SERVED UNTIL IT ENDS, ON NO CLOCK. This
-                # loop once carried a deadline that released the keepalived
-                # Remote Control stream once it passed, on the reasoning that
-                # waiting can never outlast a stream that never goes quiet.
-                # It cannot, and that is the point: while this process holds
-                # the stream the session is RECEIVING through it. Releasing it
-                # turns a working channel into a deaf bridge, and Claude Code
-                # rebuilds the receive side after neither an EOF nor a reset.
-                #
-                # The silence bound is the exit that matters and it is
-                # reachable: a WEDGED peer moves no bytes, so `quiet_for`
-                # crosses the TTL and the loop leaves. Only a peer still
-                # talking holds this open, which is work, not a leak.
-                while (_PUMP.live_pairs()
-                       and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
-                    beat_draining(self._certdir,
-                                  owed=self.inflight_requests(),
-                                  live=self.live_replies(started),
-                                  quiet=self.content_free_seconds(),
-                                  streams=self.live_stream_count()
-                                  + _PUMP.live_pairs(),
-                                  bridges=self.held_bridge_ids())
-                    time.sleep(_DRAINING_BEAT_SECONDS)
-                if _PUMP.live_pairs():
-                    _log_lifecycle(
-                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
-                        f"{int(_PUMP.quiet_for())}s rather than holding this "
-                        f"process open on a wedged peer — releasing them so "
-                        f"each peer sees a clean EOF rather than the reset "
-                        f"this process exiting would give it: "
-                        f"{_PUMP.release_pairs()} released")
+                self._wait_for_tunnels(started)
             if budget > 0:
                 deadline = started + budget
                 # THE BUDGET WAS CHOSEN BEFORE THE HANDOVER EXISTED, and the
@@ -21039,6 +20992,19 @@ class PinProxy:
                             bridges=self.held_bridge_ids())
                         beat_at = now
                     time.sleep(0.05)
+                # A TERM THAT FOUND A SUCCESSOR ALREADY ON THE PORT, or one
+                # that arrived while this drain ran, no longer holds the port
+                # dark, and its supervisor counts the successor, not us
+                # (`_supervise_locked`: `self._proc is not proc`). The loop
+                # above waits on replies owed and ends the moment none moves,
+                # BEFORE its own check of this, so a drain with nothing owed
+                # was never promoted; either way the tunnels it never waited on
+                # were released below, and Claude Code does not rebuild them.
+                # READ AGAIN HERE, not carried from the loop: that one is the
+                # fact at one instant, and this is the one the release acts on.
+                if (budget != float("inf")
+                        and _superseded_on_the_port(self._certdir)):
+                    self._wait_for_tunnels(started)
         finally:
             done_draining()
         elapsed = time.monotonic() - started
@@ -21114,6 +21080,64 @@ class PinProxy:
                 f" (this is the quantity `_owed_still_moving` reads)"
             )
         return cut
+
+    def _wait_for_tunnels(self, started: float) -> None:
+        """Hold this drain open while a CONNECT tunnel `_PUMP` drives is live,
+        on no clock, and leave on the tunnels' silence.
+
+        Remote Control RECEIVES over a WebSocket to the ingress host the
+        `/bridge` response names, so it is an opaque tunnel `_PUMP` drives
+        rather than a reply anyone is owed: `_mitm` hands the debt back at the
+        101, correctly, because a tunnel owes no ANSWER. It is still a live
+        channel that dies with this process.
+
+        A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
+        dropping this wait, and the fleet disproved it the same hour: pid
+        423760 owed nothing, left at once, and took four open connections with
+        it, while pid 1452400 - which did owe - stayed and kept fourteen.
+
+        ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer keeps
+        its entry for ever. A tunnel quiet for the marker's own TTL cannot be
+        told from a dead one, which is the same discriminator the reply wait
+        uses.
+
+        UNCAPPED ARM, AND A CAPPED ONE A SUCCESSOR SUPERSEDED. Where nothing
+        serves the port, the signal arm has a supervisor counting to
+        `_DRAIN_SECONDS + 2` and the held arm is holding the port dark; where
+        one does, nobody counts this process (a holder's `_proc` is the
+        successor; `_kill_daemon` and the sweep spare a marker that beats) and
+        the beat below is what keeps it spared.
+        """
+        # A LIVE BRIDGE IS SERVED UNTIL IT ENDS, ON NO CLOCK. This loop once
+        # carried a deadline that released the keepalived Remote Control stream
+        # once it passed, on the reasoning that waiting can never outlast a
+        # stream that never goes quiet. It cannot, and that is the point: while
+        # this process holds the stream the session is RECEIVING through it.
+        # Releasing it turns a working channel into a deaf bridge, and Claude
+        # Code rebuilds the receive side after neither an EOF nor a reset.
+        #
+        # The silence bound is the exit that matters and it is reachable: a
+        # WEDGED peer moves no bytes, so `quiet_for` crosses the TTL and the
+        # loop leaves. Only a peer still talking holds this open, which is
+        # work, not a leak.
+        while (_PUMP.live_pairs()
+               and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
+            beat_draining(self._certdir,
+                          owed=self.inflight_requests(),
+                          live=self.live_replies(started),
+                          quiet=self.content_free_seconds(),
+                          streams=self.live_stream_count()
+                          + _PUMP.live_pairs(),
+                          bridges=self.held_bridge_ids())
+            time.sleep(_DRAINING_BEAT_SECONDS)
+        if _PUMP.live_pairs():
+            _log_lifecycle(
+                f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
+                f"{int(_PUMP.quiet_for())}s rather than holding this "
+                f"process open on a wedged peer: releasing them so "
+                f"each peer sees a clean EOF rather than the reset "
+                f"this process exiting would give it: "
+                f"{_PUMP.release_pairs()} released")
 
     def stop(self, drain: float = 0.0) -> int:
         """Stop accepting, and optionally let in-flight requests FINISH.

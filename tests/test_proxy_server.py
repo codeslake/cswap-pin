@@ -14649,7 +14649,8 @@ class TestDrainReportsWhatItCut:
         # the convention this file uses for the exit paths.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy.await_inflight)
+        src = (inspect.getsource(pp.PinProxy.await_inflight)
+               + inspect.getsource(pp.PinProxy._wait_for_tunnels))
         beats = src.count("beat_draining(")
         passes = src.count("streams=")
         assert beats > 0 and passes == beats, (
@@ -14728,7 +14729,7 @@ class TestDrainReportsWhatItCut:
         # discriminator the reply wait uses.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy.await_inflight)
+        src = inspect.getsource(pp.PinProxy._wait_for_tunnels)
         assert "while (_PUMP.live_pairs()" in src, (
             "the drain does not wait for live tunnels, so a recycle drops "
             "every Remote Control channel this daemon is pumping")
@@ -14737,10 +14738,21 @@ class TestDrainReportsWhatItCut:
             "the tunnel wait has no exit: a tunnel whose peer wedged holds "
             "this process open for ever, which is the never-ending drain the "
             "removed wall clock used to bound")
-        assert 'budget == float("inf")' in src[:i], (
-            "the tunnel wait is not confined to the uncapped arm. The signal "
-            "arm has a supervisor counting to `_DRAIN_SECONDS + 2`, so waiting "
-            "past it buys a harder kill; the held arm holds the port dark")
+        # WHO CALLS IT: the uncapped arm, and a capped one only once a
+        # successor is on the port (T3100). Anywhere else the signal arm has a
+        # supervisor counting to `_DRAIN_SECONDS + 2`, so waiting past it buys
+        # a harder kill, and the held arm holds the port dark.
+        drain = inspect.getsource(pp.PinProxy.await_inflight)
+        calls = [m.start() for m in re.finditer(r"_wait_for_tunnels\(", drain)]
+        assert len(calls) == 2, (
+            f"{len(calls)} call(s) of the tunnel wait in the drain, wanted the "
+            "uncapped arm and the superseded capped one")
+        assert 'budget == float("inf")' in drain[:calls[0]][-200:], (
+            "the tunnel wait is not confined to the uncapped arm")
+        assert "_superseded_on_the_port(self._certdir)" in drain[
+            :calls[1]][-200:], (
+            "a capped drain waits on tunnels with no successor serving the "
+            "port, past a supervisor counting to `_DRAIN_SECONDS + 2`")
 
         # AND THE PUMP CAN BE ISOLATED, or this suite measures leftovers. The
         # macOS runner is single-process, so without a per-case reset one
@@ -14756,7 +14768,7 @@ class TestDrainReportsWhatItCut:
         # construction for exactly the tunnel it exists to protect. Measured on
         # pmac 2026-08-31: `drained clean in 2240.2s`, holding the two bridges
         # of the greencard and canada_pr sessions, and unbounded in principle.
-        assert "tunnel_deadline" not in src, (
+        assert "tunnel_deadline" not in src + drain, (
             "a wall clock is back on the tunnel wait. A bridge inbound stream "
             "is never silent because the server keepalives it, and while this "
             "process holds that stream THE SESSION IS RECEIVING THROUGH IT. "
@@ -19454,6 +19466,79 @@ class TestAHandoverMidDrainDropsTheClock:
         out = self._drain(tmp_path, monkeypatch, superseded=True,
                           moving_for=25)
         assert out.count("dropping the wall clock") == 1, out
+
+    class _Tunnels:
+        """A pump with one live pair that ends once the tunnel wait has asked
+        about its silence ``life`` times, as a peer closing would. Only that
+        wait asks, so ``polls == 0`` means it never ran."""
+
+        def __init__(self, life=20):
+            self.life, self.polls, self.released = life, 0, 0
+
+        def live_pairs(self, kind=None):
+            return 1 if self.polls < self.life and not self.released else 0
+
+        def quiet_for(self):
+            self.polls += 1
+            return 0.0
+
+        def release_pairs(self, kind=None):
+            live = self.live_pairs()
+            self.released += live
+            return live
+
+    def _drain_a_tunnel(self, tmp_path, monkeypatch, *, superseded, moving_for):
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        return self._drain(tmp_path, monkeypatch, superseded=superseded,
+                           moving_for=moving_for), pump
+
+    def test_a_promoted_drain_waits_for_the_tunnels_it_would_have_released(
+            self, tmp_path, monkeypatch):
+        """T3100: a TERM drains CAPPED, a successor takes the port inside it,
+        and the replies owed are then waited on with no clock. The tunnels are
+        not replies owed, so the owed loop never waited on them: the drain
+        ended and `release_pairs` cut every Remote Control channel, which
+        Claude Code does not rebuild."""
+        out, pump = self._drain_a_tunnel(
+            tmp_path, monkeypatch, superseded=True, moving_for=3)
+        assert "dropping the wall clock" in out, out
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {pump.polls} of "
+            f"{pump.life} checks of a peer still moving: {out}")
+
+    def test_a_successor_already_on_the_port_waits_for_the_tunnels_too(
+            self, tmp_path, monkeypatch):
+        """The same, when nothing is owed: the owed loop breaks on that BEFORE
+        its superseded check, so the drain is never promoted at all, and a TERM
+        that finds a successor already published still cut the tunnels."""
+        out, pump = self._drain_a_tunnel(
+            tmp_path, monkeypatch, superseded=True, moving_for=0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) with a successor "
+            f"serving: {out}")
+
+    def test_CONTROL_with_no_successor_the_tunnels_are_released_at_the_end(
+            self, tmp_path, monkeypatch):
+        """What keeps the two above from being "always wait": nothing serves
+        the port, the capped arm is holding it dark, and a supervisor counts
+        to `_DRAIN_SECONDS + 2` - the tunnels go as they always did."""
+        out, pump = self._drain_a_tunnel(
+            tmp_path, monkeypatch, superseded=False, moving_for=0)
+        assert pump.polls == 0 and pump.released == 1, (
+            f"polls={pump.polls} released={pump.released}: {out}")
+
+    def test_a_tunnel_gone_quiet_still_leaves_a_superseded_drain(
+            self, tmp_path, monkeypatch):
+        """The wait is the uncapped arm's own, silence exit included: a wedged
+        peer is released rather than holding the process open for ever."""
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        pump.quiet_for = lambda: pp._DRAINING_MARKER_TTL + 1.0
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        out = self._drain(tmp_path, monkeypatch, superseded=True, moving_for=0)
+        assert "quiet for" in out and pump.released == 1, out
 
 
 class TestARequestThatArrivesMidDrainIsNotBornStale:
