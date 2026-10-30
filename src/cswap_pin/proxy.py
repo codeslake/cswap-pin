@@ -23785,12 +23785,13 @@ class PinProxy:
             _bridge_hold = (_bridge_cse, _bridge_event)
 
         try:
-            # NOT ARMED FOR A CONNECTOR CALL: the id came from the pinned
-            # account's list, so a resend as the active account is never right,
-            # and the pin's 401 (re-auth) or 404 (re-initialize) is the
-            # client's to read. Relayed untouched, in one request.
+            # NOT ARMED FOR A CONNECTOR ROUTE, THE LIST OR A CALL: the id comes
+            # from the pinned account's list, so a resend as the active account
+            # is never right, and the pin's 401 (re-auth), 403 (scope) or 404
+            # (re-initialize) is the client's to read. Relayed untouched, in
+            # one request.
             keep = self._forward(method, path, headers, body, tls,
-                                 swapped=swapped and up_host == UPSTREAM_HOST,
+                                 swapped=swapped and not connector,
                                  bridge_hold=_bridge_hold,
                                  affinity=inject[1] if inject else None,
                                  follow=followed)

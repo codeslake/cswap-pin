@@ -29521,6 +29521,44 @@ class TestConnectorsFollowPin:
             assert not [ln for ln in lines if ln.startswith("swap refused")], (
                 code, lines)
 
+    def case_a_refused_list_reaches_the_client_as_the_pins_answer(
+            self, certdir, monkeypatch):
+        """A pinned token lacking `user:mcp_servers` gets a 403 on the list.
+        The active account's list names servers the pinned-bearer calls cannot
+        use, so the take-back (4e8fcd3) is no answer here: the pin's status
+        goes out as it came, in ONE upstream request, with no `swap refused`
+        line. Off, the list is unpinned and nothing about it changes."""
+        from cswap_pin import proxy as pp
+
+        for on, code in ((True, 403), (True, 401), (True, 404), (False, 403)):
+            if on:
+                monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+            else:
+                monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN",
+                                   raising=False)
+            seen = "PINNED" if on else "ACTIVE"
+            upstream = _FakeUpstream(certdir, reject_bearer=seen,
+                                     reject_status=code)
+            proxy = self._proxy(certdir, upstream)
+            lines = []
+            real_log = pp._log_lifecycle
+            pp._log_lifecycle = lines.append
+            proxy.start()
+            try:
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem",
+                    "/v1/mcp_servers?limit=1000", bearer="ACTIVE",
+                    method="GET")
+            finally:
+                proxy.stop()
+                upstream.stop()
+                pp._log_lifecycle = real_log
+            assert status == code, (on, code, status)
+            assert upstream.auths_seen == [f"Bearer {seen}"], (
+                on, code, upstream.auths_seen)
+            assert not [ln for ln in lines if ln.startswith("swap refused")], (
+                on, code, lines)
+
     def case_an_mcp_proxy_5xx_is_not_evidence_about_the_pins_hop(
             self, certdir, monkeypatch):
         from cswap_pin import proxy as pp
