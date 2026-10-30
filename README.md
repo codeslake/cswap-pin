@@ -789,8 +789,9 @@ and wss) is relayed byte for byte. On the `/chrome/` socket the handshake and
 every later frame pass through unchanged, and compression is left
 unnegotiated there so the message stays readable. When there is nothing to swap
 (the pin is the active account, or no pinned token can be minted) the host is
-tunnelled blind, as before. The MITM leaf carries both names, so an existing
-install gets a new leaf under the same CA on its next start.
+tunnelled blind, as before. The MITM leaf carries both names (and
+`mcp-proxy.anthropic.com`, [below](#claudeai-connectors-follow-the-pin-opt-in)),
+so an existing install gets a new leaf under the same CA on its next start.
 
 ### Remote Control has two front doors, and they own sessions differently
 
@@ -1538,6 +1539,40 @@ a running one keeps its proxy, and Desktop's chat keeps its own. Conditions:
 - A Remote Control environment session does not take these variables.
 - While this proxy is down, a new session from it fails rather than falling
   back to the other proxy.
+
+## claude.ai connectors follow the pin (opt-in)
+
+Claude Code lists your claude.ai connectors with `GET /v1/mcp_servers` on
+`api.anthropic.com` and calls one at `https://mcp-proxy.anthropic.com/v1/mcp/<server_id>`,
+both on the OAuth bearer, the id coming from the list. Today both go out as the
+active account, so after a rotation the list and the calls name the account you
+rotated to, not the pinned one. With the switch on, the pin sends both as the
+pinned account: `/v1/mcp_servers` (bare or with its query, nothing broader) is
+swapped like the other pinned routes, and `mcp-proxy.anthropic.com` is MITM'd
+so every request under `/v1/mcp/` carries the pinned token, with the rest of
+that host and every response (event streams included) relayed unchanged. A
+request with no pinned token to swap goes out as it came, never as a 503 of the
+pin's own.
+
+It is **off by default**, and while it is off no request changes:
+`mcp-proxy.anthropic.com` stays the blind tunnel it always was. The switch
+puts the pin in the path of a host it has only ever tunnelled, so an upgrade
+does not turn it on for anyone; it ships dark until it is chosen. The
+environment variable works now:
+
+```bash
+CSWAP_PIN_CONNECTORS_FOLLOW_PIN=1    # 1/true/on arms it; empty, 0, false, off force it off
+```
+
+The variable wins over cswap's `pin.connectorsFollowPin` setting (a bool,
+re-read every 2 seconds like `pin.desktopFollows`, so it reaches a daemon that
+is already serving). Once cswap knows that key, `cswap config set
+pin.connectorsFollowPin on` is how it is set; the `cswap pin` flag and the
+Auto view key live in cswap, not here.
+
+When Claude Code's own `disableClaudeAiConnectors` setting is true (or
+`ENABLE_CLAUDEAI_MCP_SERVERS` is off) Claude Code never asks for the list or
+calls mcp-proxy, so the switch has nothing to act on.
 
 ## Falling through a dead hop
 

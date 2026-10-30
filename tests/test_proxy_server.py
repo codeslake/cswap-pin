@@ -262,8 +262,9 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
                            extra_headers: "dict[str, str] | None" = None,
                            method: str = "POST",
                            headers_out: "dict[str, str] | None" = None,
-                           body_out: "list | None" = None):
-    """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
+                           body_out: "list | None" = None,
+                           host: str = "api.anthropic.com"):
+    """Make an HTTPS request to <host><path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status; `headers_out`, when
     given, is filled with the response headers (lower-cased names), and
     `body_out` gets the response body (a chunked one decoded).
@@ -272,11 +273,9 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
     never had one, not one that was cleared. `extra_headers` merges in
     anything else the case needs on the wire, e.g. `x-claude-code-session-id`."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
-    conn = http.client.HTTPSConnection(
-        "api.anthropic.com", context=ctx, timeout=10
-    )
-    conn.set_tunnel("api.anthropic.com", 443)
-    # Point the socket at the proxy instead of resolving api.anthropic.com.
+    conn = http.client.HTTPSConnection(host, context=ctx, timeout=10)
+    conn.set_tunnel(host, 443)
+    # Point the socket at the proxy instead of resolving the host.
     conn._create_connection = lambda *a, **k: socket.create_connection(
         ("127.0.0.1", proxy_port), timeout=10
     )
@@ -4148,7 +4147,7 @@ class TestChainRediscovery:
         sentinel = object()
         attempts = []
 
-        def _walk():
+        def _walk(target=None):
             attempts.append(1)
             return sentinel if len(attempts) >= 3 else None
 
@@ -28489,7 +28488,8 @@ class TestChromeBridgeCarriesThePinnedToken:
             .get_extension_for_class(x509.SubjectAlternativeName).value \
             .get_values_for_type(x509.DNSName)
         assert set(san) == {"api.anthropic.com",
-                            "bridge.claudeusercontent.com"}
+                            "bridge.claudeusercontent.com",
+                            "mcp-proxy.anthropic.com"}
 
 
     def _other_traffic(self, certdir, mode, req, want):
@@ -29325,3 +29325,186 @@ class TestInferenceFollows:
         assert isinstance(health["snapshot"]["age_s"], float)
         assert not list(certdir.glob("inference-follow*")), (
             "a counter was written to a file")
+
+
+# ---------------------------------------------------------------------------
+# claude.ai connectors follow the pin (opt-in): the list on api.anthropic.com
+# and the calls on mcp-proxy.anthropic.com go out as the same account.
+# ---------------------------------------------------------------------------
+
+_MCP_HOST = "mcp-proxy.anthropic.com"
+
+
+class TestConnectorsFollowPin:
+    """Claude Code lists connectors with `GET /v1/mcp_servers` and calls one at
+    `mcp-proxy.anthropic.com/v1/mcp/<server_id>`, both on the OAuth bearer; the
+    id comes from the list, so the two must be one account. Off by default:
+    nothing about either host changes until the switch is turned on."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _proxy(certdir, upstream, token="PINNED"):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: token,
+                        upstream=("127.0.0.1", upstream.port))
+
+    @staticmethod
+    def _via_mcp_proxy(monkeypatch, upstream):
+        """mcp-proxy's dial lands on the fake; what the pin asked to dial is
+        returned, so a case can say it was the real host."""
+        from cswap_pin import proxy as pp
+
+        dialled = []
+        monkeypatch.setattr(
+            pp, "_dial_with_no_chain",
+            lambda target, timeout=15: (
+                dialled.append(target),
+                socket.create_connection(("127.0.0.1", upstream.port),
+                                         timeout=10))[1])
+        return dialled
+
+    def case_off_the_list_keeps_the_active_bearer(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/mcp_servers?limit=1000&include_additional_installs=true",
+                bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 200 and upstream.auths_seen == ["Bearer ACTIVE"]
+
+    def case_on_the_list_goes_out_as_the_pin_and_only_that_path(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        proxy.start()
+        try:
+            for path in ("/v1/mcp_servers", "/v1/mcp_servers?limit=1000",
+                         "/v1/mcp_serversX", "/v1/mcp_server",
+                         "/v1/mcp_servers/abc"):
+                _request_through_proxy(proxy.port, certdir / "ca.pem", path,
+                                       bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert upstream.auths_seen == ["Bearer PINNED"] * 2 + [
+            "Bearer ACTIVE"] * 3
+
+    def case_off_mcp_proxy_is_the_blind_tunnel(self, certdir, monkeypatch):
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        tunnelled = []
+        proxy._capped_tunnel = lambda target, conn: (
+            tunnelled.append(target), conn.close())
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port),
+                                           timeout=10)
+            raw.sendall(f"CONNECT {_MCP_HOST}:443 HTTP/1.1\r\n"
+                        f"Host: {_MCP_HOST}:443\r\n\r\n".encode())
+            assert raw.recv(4096) == b""  # the stub closed it, nothing MITM'd
+            raw.close()
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert tunnelled == [f"{_MCP_HOST}:443"]
+
+    def case_on_mcp_proxy_calls_carry_the_pinned_bearer(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "on")
+        upstream = _FakeUpstream(certdir)
+        proxy = self._proxy(certdir, upstream)
+        dialled = self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            for path in ("/v1/mcp/srv_01", "/v1/mcp/srv_01?x=1",
+                         "/v1/other"):
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="ACTIVE",
+                    host=_MCP_HOST)
+                assert status == 200, path
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert dialled == [(_MCP_HOST, 443)] * 3
+        assert upstream.auths_seen == ["Bearer PINNED"] * 2 + [
+            "Bearer ACTIVE"], "only the calls under /v1/mcp/ are swapped"
+        assert all(f"Host: {_MCP_HOST}" in h for h in upstream.heads_seen)
+        assert upstream.heads_seen[0].startswith("POST /v1/mcp/srv_01 ")
+
+    def case_on_without_a_pin_token_mcp_proxy_relays_untouched(
+            self, certdir, monkeypatch):
+        """No token to swap, a stalled mint included: the call goes out as it
+        came (never a 503 of our own), and nothing marks the pin unpinnable."""
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir)
+        stalled = lambda: None  # noqa: E731
+        stalled.mint_stalled = lambda: True
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            for provider in (stalled, lambda: None):
+                proxy._pin_token_provider = provider
+                assert _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
+                    bearer="ACTIVE", host=_MCP_HOST) == 200
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert upstream.auths_seen == ["Bearer ACTIVE"] * 2
+        assert not getattr(proxy, "_warned_unpinnable", False)
+
+    def case_on_an_event_stream_from_mcp_proxy_passes_through(
+            self, certdir, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        events = b"event: message\ndata: {\"id\":1}\n\nevent: message\ndata: {\"id\":2}\n\n"
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n\r\n" + events))
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        body, hdrs = [], {}
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
+                bearer="ACTIVE", host=_MCP_HOST, body_out=body,
+                headers_out=hdrs)
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 200 and body == [events]
+        assert hdrs["content-type"] == "text/event-stream"
+
+    def case_an_mcp_proxy_5xx_is_not_evidence_about_the_pins_hop(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+        proxy = self._proxy(certdir, upstream)
+        self._via_mcp_proxy(monkeypatch, upstream)
+        proxy.start()
+        try:
+            ask = lambda host, path: _request_through_proxy(  # noqa: E731
+                proxy.port, certdir / "ca.pem", path, bearer="ACTIVE",
+                host=host)
+            assert ask(_MCP_HOST, "/v1/mcp/srv_01") == 502
+            assert pp._hop_trouble_at == 0.0, "mcp-proxy's 5xx marked the hop"
+            assert ask("api.anthropic.com", "/v1/messages") == 502
+            assert pp._hop_trouble_at, "premise: api.anthropic.com's does"
+        finally:
+            proxy.stop()
+            upstream.stop()
