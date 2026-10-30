@@ -29953,6 +29953,22 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("POST", "/v1/messages", 6040.0, 0.0)
         assert lines == []
 
+    def case_a_connector_tool_call_taking_seconds_is_not_a_stall(
+            self, monkeypatch):
+        """A call on mcp-proxy runs as long as the tool does. Its line would
+        also spend the once-a-minute cooldown and hide a real worker stall.
+        The host decides, not the path: the connector LIST, on
+        api.anthropic.com, is no tool call, nor is that path there."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/mcp/srv_01", 6040.0, 0.0,
+                             up_host="mcp-proxy.anthropic.com")
+        assert lines == []
+        P._note_slow_request("GET", "/v1/mcp_servers?limit=1000", 2400.0, 0.0)
+        assert len(lines) == 1
+        P._last_slow_report = None
+        P._note_slow_request("POST", "/v1/mcp/srv_01", 6040.0, 0.0)
+        assert len(lines) == 2
+
     def case_a_slow_token_count_is_still_a_stall(self, monkeypatch):
         """The exemption is for the inference route itself, not everything
         under it. Counting tokens does not call the model."""
@@ -37379,3 +37395,97 @@ class TestTheRebuiltKeepAliveHelpers:
         assert blocks.count('"cache_control"') == 2, "system's and the last's"
         assert blocks.index('"last"') < blocks.rindex('"cache_control"'), (
             "the breakpoint is on the last block of the last message")
+
+
+class TestConnectorRoutes:
+    """claude.ai connectors (opt-in): the list Claude Code asks api.anthropic.com
+    for and the calls it makes at mcp-proxy.anthropic.com, exact and never a
+    broader prefix. `is_pinned_route` itself does not move."""
+
+    API, MCP = "api.anthropic.com", "mcp-proxy.anthropic.com"
+
+    @pytest.mark.parametrize("host,path,connector", [
+        (API, "/v1/mcp_servers", True),
+        (API, "/v1/mcp_servers?limit=1000&include_additional_installs=true",
+         True),
+        (API, "/v1/mcp_serversX", False),
+        (API, "/v1/mcp_server", False),
+        (API, "/v1/mcp_servers/abc", False),  # CC 2.1.312 never calls it
+        (API, "/v1/mcp/srv_01", False),
+        (MCP, "/v1/mcp/srv_01", True),
+        (MCP, "/v1/mcp/srv_01?x=1", True),
+        (MCP, "/v1/mcp", False),
+        (MCP, "/v1/mcpX/srv_01", False),
+        (MCP, "/v1/mcp_servers", False),
+    ])
+    def test_the_route_set(self, host, path, connector):
+        from cswap_pin.proxy import is_connector_route
+
+        assert is_connector_route(path, host) is connector
+        assert is_pinned_route(path) is False, "the default table is untouched"
+
+    @staticmethod
+    def _read(tmp_path, monkeypatch, text=None, env=None):
+        from cswap_pin import proxy as pp
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        settings = tmp_path / "settings.json"
+        settings.unlink(missing_ok=True)
+        if text is not None:
+            settings.write_text(text)
+        if env is None:
+            monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        else:
+            monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", env)
+        pp._CONNECTORS_CACHE.clear()
+        return pp.connectors_follow_pin(certdir)
+
+    def test_the_switch_is_off_unless_cswap_says_true(self, tmp_path,
+                                                      monkeypatch):
+        def on(v):
+            return json.dumps({"pin": {"connectorsFollowPin": v}})
+
+        read = lambda *a, **k: self._read(tmp_path, monkeypatch, *a, **k)
+        assert read() is False                       # no settings file
+        assert read(on(True)) is True
+        assert read(on(False)) is False
+        assert read(on("true")) is False             # only a real true
+        assert read(on(1)) is False
+        assert read(json.dumps({"pin": True})) is False
+        assert read(json.dumps({"pin": {"desktopFollows": True}})) is False
+        assert read("{not json") is False
+
+    def test_the_env_var_wins_both_ways(self, tmp_path, monkeypatch):
+        def on(v):
+            return json.dumps({"pin": {"connectorsFollowPin": v}})
+
+        read = lambda *a, **k: self._read(tmp_path, monkeypatch, *a, **k)
+        for truthy in ("1", "true", "ON", " On "):
+            assert read(on(False), env=truthy) is True, truthy
+        for falsy in ("", "0", "false", "off", "maybe"):
+            assert read(on(True), env=falsy) is False, repr(falsy)
+
+    def test_a_change_reaches_a_serving_daemon_after_the_recheck(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        on = json.dumps({"pin": {"connectorsFollowPin": True}})
+        assert self._read(tmp_path, monkeypatch, on) is True
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"pin": {"connectorsFollowPin": False}}))
+        assert pp.connectors_follow_pin(tmp_path / "pin-proxy") is True  # cached
+        pp._CONNECTORS_CACHE.clear()
+        assert pp.connectors_follow_pin(tmp_path / "pin-proxy") is False
+
+    def test_an_unreadable_setting_never_raises(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        def boom(name):
+            raise RuntimeError("no settings")
+
+        self._read(tmp_path, monkeypatch)
+        monkeypatch.setattr(pp, "require", boom)
+        pp._CONNECTORS_CACHE.clear()
+        assert pp.connectors_follow_pin(tmp_path / "pin-proxy") is False
+        assert pp.connectors_follow_pin(None) is False

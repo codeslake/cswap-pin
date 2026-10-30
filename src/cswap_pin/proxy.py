@@ -4900,6 +4900,40 @@ def inference_follow_entrypoints(certdir) -> "frozenset[str]":
     return value
 
 
+_CONNECTORS_CACHE: dict = {}
+
+
+def connectors_follow_pin(certdir) -> bool:
+    """Whether claude.ai connectors go out as the pinned account.
+
+    ``CSWAP_PIN_CONNECTORS_FOLLOW_PIN`` wins (1/true/on arms it; empty, 0,
+    false, off or anything else forces it off); absent it, cswap's
+    ``pin.connectorsFollowPin`` (a true bool), re-read at most every
+    ``_TRACE_RECHECK_S`` like `inference_follow_entrypoints`. Absent,
+    malformed or unreadable is OFF: this must never be the thing that breaks a
+    request.
+    """
+    env = os.environ.get("CSWAP_PIN_CONNECTORS_FOLLOW_PIN")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "on")
+    if certdir is None:
+        return False
+    key = str(certdir)
+    seen, value = _CONNECTORS_CACHE.get(key, (0.0, False))
+    now = time.time()
+    if now - seen < _TRACE_RECHECK_S:
+        return value
+    try:
+        _settings = require("settings")
+        pin = _settings._read_raw(
+            _settings.settings_path(Path(certdir).parent)).get("pin")
+        value = isinstance(pin, dict) and pin.get("connectorsFollowPin") is True
+    except Exception:  # noqa: BLE001, a switch must not cost a request
+        value = False
+    _CONNECTORS_CACHE[key] = (now, value)
+    return value
+
+
 def ua_entrypoint(ua: str) -> "str | None":
     """The entrypoint a Claude Code User-Agent names, or None.
 
@@ -5327,6 +5361,21 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     )
 
 
+def is_connector_route(path: str, host: str = "api.anthropic.com") -> bool:
+    """A claude.ai connector request, which `connectors_follow_pin` swaps.
+
+    On api.anthropic.com the connector LIST, `/v1/mcp_servers` bare or with its
+    query: Claude Code 2.1.312 asks nothing else of that family (no
+    `/v1/mcp_servers/<id>` is in the binary), so it is exact, never a prefix.
+    On mcp-proxy.anthropic.com every call under `/v1/mcp/`. Kept out of
+    `is_pinned_route`, whose rows are unconditional: a caller that can read
+    the switch asks both.
+    """
+    if host == MCP_PROXY_HOST:
+        return path.startswith("/v1/mcp/")
+    return path == "/v1/mcp_servers" or path.startswith("/v1/mcp_servers?")
+
+
 def is_artifact_route(path: str) -> bool:
     """A pinned route that must never go out as another account (T1592, rc
     requirement 13): a refused swap here relays the pin's own answer instead
@@ -5622,12 +5671,18 @@ def _make_ca() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
 
 
 def _leaf_hosts(host: str) -> list[str]:
-    """The names the MITM leaf must carry: `host`, plus the Chrome bridge.
+    """The names the MITM leaf must carry: `host`, plus the Chrome bridge and
+    mcp-proxy.
 
-    One leaf serves both MITM'd hosts, so the server context needs no SNI
-    callback and the client's trust (the CA) does not change.
+    One leaf serves every MITM'd host, so the server context needs no SNI
+    callback and the client's trust (the CA) does not change. mcp-proxy is
+    named whether or not `connectors_follow_pin` is on: the switch flips on a
+    daemon that is already serving, which a leaf cannot follow. An install
+    that predates the name gets one new leaf under the same CA
+    (`_certs_consistent`).
     """
-    return [host] + [h for h in (CHROME_BRIDGE_HOST,) if h != host]
+    return [host] + [h for h in (CHROME_BRIDGE_HOST, MCP_PROXY_HOST)
+                     if h != host]
 
 
 def _make_leaf(
@@ -17916,6 +17971,11 @@ UPSTREAM_PORT = 443
 # closes with "User mismatch". `_chrome_bridge` MITMs this host to put the
 # pinned token in that one message; nothing else on the socket is touched.
 CHROME_BRIDGE_HOST = "bridge.claudeusercontent.com"
+# claude.ai connectors: Claude Code lists them on api.anthropic.com
+# (`GET /v1/mcp_servers`) and calls one at `https://<this>/v1/mcp/<server_id>`,
+# both on the OAuth bearer, the id coming from the list. MITM'd only while
+# `connectors_follow_pin` is on; otherwise the blind tunnel it always was.
+MCP_PROXY_HOST = "mcp-proxy.anthropic.com"
 
 # ~500 parallel bulk tunnels to other hosts took every fd the hop had and
 # /v1/messages got 502; 256 at 2 fds each leaves a 1024-nofile hop room for the API.
@@ -19951,7 +20011,8 @@ class PinProxy:
     def _note_slow_request(self, method: str, path: str,
                            total_ms: float, pin_ms: float,
                            wait_ms: float | None = None,
-                           stages: "dict | None" = None) -> None:
+                           stages: "dict | None" = None,
+                           up_host: str = UPSTREAM_HOST) -> None:
         """Record a request that took seconds, because nothing else does.
 
         `daemon.log` carries lifecycle events, so a slow request leaves no
@@ -20000,6 +20061,11 @@ class PinProxy:
         # machine in the same window. EXACT, not a prefix: `count_tokens` lives
         # under this route and calls no model, so a slow one is still a stall.
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
+            return
+        # SO IS A CONNECTOR TOOL CALL (it runs as long as the tool does), and
+        # its line would spend the cooldown below that a real stall needs. The
+        # HOST says so: the same path on api.anthropic.com is no tool call.
+        if up_host == MCP_PROXY_HOST:
             return
         now = time.monotonic()
         last = getattr(self, "_last_slow_report", None)
@@ -22389,6 +22455,11 @@ class PinProxy:
                 host = target.rsplit(":", 1)[0]
                 if host == CHROME_BRIDGE_HOST:
                     return self._chrome_bridge(target, conn)
+                # CONNECTORS FOLLOW THE PIN (opt-in): the MITM, with mcp-proxy
+                # as its upstream. Off, it stays the blind tunnel below.
+                if host == MCP_PROXY_HOST and connectors_follow_pin(
+                        self._certdir):
+                    return self._mitm(conn, host)
                 if host != UPSTREAM_HOST:
                     return self._capped_tunnel(target, conn)
                 return self._mitm(conn)
@@ -22985,6 +23056,7 @@ class PinProxy:
         # bearer belongs to the host it was minted for; rewriting one on the
         # way to somebody else's server would hand out the pinned token.
         unswapped = None      # set only when a swap actually happened
+        connector = False     # the opt-in connector list, set where it swaps
         rel = (split.path or "/") + (f"?{split.query}" if split.query else "")
         # `and secure` IS THE HALF THAT KEEPS THE TOKEN OFF THE WIRE. The host
         # guard asks WHO and says nothing about HOW, so an `http://` request to
@@ -22995,7 +23067,9 @@ class PinProxy:
             ua = next((h.split(":", 1)[1].strip() for h in headers
                        if h.split(":", 1)[0].strip().lower() == "user-agent"),
                       "")
-            if is_pinned_route(rel, ua):
+            connector = is_connector_route(rel) and connectors_follow_pin(
+                self._certdir)
+            if connector or is_pinned_route(rel, ua):
                 token = self._pin_token_provider()
                 # THE SAME PRE-CHECK THE MITM PATH MAKES (see its own note
                 # above `_wait_for_pin_token`'s call there). Without it, a
@@ -23152,7 +23226,7 @@ class PinProxy:
             len(rl) > 2 and rl[2] == "HTTP/1.0"
         )
 
-        artifact = is_artifact_route(rel)
+        artifact = connector or is_artifact_route(rel)
 
         def _swap_attempts():
             """Swapped once, refetched once on a refusal, then unswapped --
@@ -23325,13 +23399,23 @@ class PinProxy:
             _release_bridge_hold()
         return False
 
-    def _mitm(self, conn: socket.socket) -> bool:
+    def _up_host(self) -> str:
+        """The origin this MITM connection's requests go to: api.anthropic.com,
+        or mcp-proxy for a connection `_mitm` was given it for."""
+        return getattr(self._local, "upstream_host", None) or UPSTREAM_HOST
+
+    def _mitm(self, conn: socket.socket, host: str = UPSTREAM_HOST) -> bool:
         """Serve requests on this connection. True when it was HANDED OVER.
 
         A 101 turns the connection into an opaque stream that the shared pump
         owns from then on — so this frame must NOT close it, and its caller
         must not run the per-connection teardown that the pump will run at EOF.
+
+        ``host`` is the origin behind it, set on the thread for the Host line,
+        the TLS name and the dial (`_up_host`), on every call so none reads a
+        stale one.
         """
+        self._local.upstream_host = host
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         # STASHED BEFORE THE WRAP, because `wrap_socket` DETACHES: after it,
         # `conn.fileno()` is -1 and the SSLSocket owns the fd. The debt is
@@ -23424,7 +23508,14 @@ class PinProxy:
         body = _read_body(tls, headers)
 
         ua = next((v for k, v in headers if k.lower() == "user-agent"), "")
-        pinned = is_pinned_route(path, ua)
+        up_host = self._up_host()
+        # A CONNECTOR ROW (opt-in) IS PINNED BUT NEVER STRICT: no token, or a
+        # stalled mint, leaves the request as it came (no 503 of our own, no
+        # "unpinnable" mark). Nothing here is owned for good, unlike a create.
+        connector = is_connector_route(path, up_host) and connectors_follow_pin(
+            self._certdir)
+        pinned = connector or (
+            up_host == UPSTREAM_HOST and is_pinned_route(path, ua))
         # TWO CLOCKS, because the total alone cannot say who was slow — see
         # `_note_slow_request`. `_t_pin` closes where the request leaves us.
         _t_req = _t_pin = time.monotonic()
@@ -23473,7 +23564,7 @@ class PinProxy:
             # nothing serving it. Fail THIS request fast instead of joining
             # them; the fail-open path below is for a credential that was
             # actually asked and answered no.
-            if token is None and getattr(
+            if token is None and not connector and getattr(
                     self._pin_token_provider, "mint_stalled", None
             ) and self._pin_token_provider.mint_stalled():
                 return self._refuse_stalled_mint(tls, method, path)
@@ -23583,7 +23674,7 @@ class PinProxy:
                 # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
-                if not _pin_is_noop(self._pin_token_provider):
+                if not connector and not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
         # INFERENCE FOLLOWS THE ACTIVE ACCOUNT (opt-in, `_follow_token`), never on a
         # pinned route, and BEFORE affinity: the host's bearer never changes across
@@ -23782,7 +23873,10 @@ class PinProxy:
                     # refusal reaches the client (`_AuthRejected` sent nothing).
                     # A 401 is answered 403 from here instead (T1596).
                     # Every other pinned route keeps the take-back (4e8fcd3).
-                    artifact = is_artifact_route(clean_path)
+                    # A CONNECTOR ROUTE IS ONE (the list and a call): the id
+                    # comes from the pinned account's list, so a resend as the
+                    # active account is never right. It logs under its own path.
+                    artifact = connector or is_artifact_route(clean_path)
                     as_403 = artifact and keep.code == 401
                     # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
                     # rule as the failed mint above, so the pin's refusal is
@@ -23936,6 +24030,7 @@ class PinProxy:
         """
         _bridge_cse, _bridge_event = bridge_hold or (None, None)
         _bridge_released = False
+        up_host = self._up_host()
 
         def _release_bridge_hold() -> None:
             nonlocal _bridge_released
@@ -24002,7 +24097,7 @@ class PinProxy:
                 if kl == "content-length" and dechunked:
                     continue  # replaced below with the decoded length
                 if kl == "host":
-                    v = UPSTREAM_HOST
+                    v = up_host
                     sent_host = True
                 if kl == "accept-encoding" and tee is not None:
                     # identity: the tee (held or full) reads plain SSE, and
@@ -24013,7 +24108,7 @@ class PinProxy:
             if dechunked:
                 out.append(f"Content-Length: {len(body or b'')}".encode("latin1"))
             if not sent_host:
-                out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
+                out.append(f"Host: {up_host}".encode("latin1"))
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
             # THE INSTANT THE SERVER OWNS IT. Everything after this and before
             # the status line is the server's; everything before it is ours.
@@ -24158,6 +24253,7 @@ class PinProxy:
                             self._local, "t_req", time.monotonic())) * 1000,
                         getattr(self._local, "pin_ms", 0.0),
                         stages=getattr(self._local, "pin_stages", None),
+                        up_host=up_host,
                         wait_ms=(
                             (time.monotonic() - self._local.t_sent) * 1000
                             if getattr(self._local, "t_sent", None) is not None
@@ -24167,6 +24263,8 @@ class PinProxy:
                 # Content-Length included, but no body — only the request
                 # method says so.
                 method=method,
+                # mcp-proxy's own 5xx is no evidence about the pin's hop
+                note_hop=up_host == UPSTREAM_HOST,
                 on_hop_trouble=hop_failed.set,
                 tee=tee,
             )
@@ -24440,13 +24538,15 @@ class PinProxy:
             # re-reading the (still loopback) hint would then hand a
             # CERT_NONE context to a real internet connection carrying
             # account bearers.
-            raw, via_loopback = self._connect_upstream()
+            host = self._up_host()
+            raw, via_loopback = self._connect_upstream(
+                None if host == UPSTREAM_HOST else (host, UPSTREAM_PORT))
             # THE HANDSHAKE IS A HOP WAIT TOO: a hop that answers CONNECT 200
             # and goes silent parks this thread in `do_handshake`, before the
             # head wait that `_relay_response` watches. See `_ClientWatch`.
             with _CLIENT_WATCH.over(getattr(self._local, "tls", None), raw):
                 up = _wrap_upstream(
-                    self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST
+                    self._upstream_ctx(via_loopback), raw, host
                 )
             self._local.up = up
             self._local.up_idle_since = time.monotonic()
@@ -24535,8 +24635,10 @@ class PinProxy:
             return self._chain
         return read_upstream_hint(self._certdir)
 
-    def _connect_upstream(self) -> tuple[socket.socket, bool]:
-        """Dial the upstream (through the chain when there is one).
+    def _connect_upstream(self, target: "tuple[str, int] | None" = None
+                          ) -> tuple[socket.socket, bool]:
+        """Dial the upstream (through the chain when there is one). ``target``
+        is another origin than `self._upstream` (mcp-proxy).
 
         Returns ``(socket, via_loopback)``. The flag says how the socket was
         REALLY obtained, because the chain can be unreachable and the dial
@@ -24575,7 +24677,7 @@ class PinProxy:
         if candidates:
             deadline = time.monotonic() + _CHAIN_HEAL_GRACE_S
             while True:
-                sock = self._walk_chain_once()
+                sock = self._walk_chain_once(target)
                 if sock is not None:
                     return sock
                 if time.monotonic() >= deadline:
@@ -24594,14 +24696,16 @@ class PinProxy:
                 "no chain hop reachable and direct egress is refused on this "
                 f"host ({_ALLOW_DIRECT_ENV}=1 allows it)"
             )
-        sock = _dial_with_no_chain(self._upstream)
+        sock = _dial_with_no_chain(target or self._upstream)
         sock.settimeout(None)
         self._note_egress(direct=True, configured=bool(candidates))
         return sock, False
 
-    def _walk_chain_once(self) -> "tuple[socket.socket, bool] | None":
+    def _walk_chain_once(self, target: "tuple[str, int] | None" = None
+                         ) -> "tuple[socket.socket, bool] | None":
         """One pass over the chain. The socket and its loopback flag, or None
         when no hop was usable this time round."""
+        host, port = target or self._upstream
         candidates = self._chain_candidates()
         for i, chain in enumerate(candidates):
             # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
@@ -24625,8 +24729,8 @@ class PinProxy:
                 continue
             try:
                 raw.sendall(
-                    f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
-                    f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n"
+                    f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
                     f"{chain.connect_headers()}\r\n".encode("latin1")
                 )
                 status = _read_line(raw)
@@ -24639,8 +24743,7 @@ class PinProxy:
             if not _connect_ok(status):
                 self._note_hop_unusable(
                     chain.address,
-                    f"accepted but did not tunnel "
-                    f"{self._upstream[0]}:{self._upstream[1]}: "
+                    f"accepted but did not tunnel {host}:{port}: "
                     + (f"CONNECT -> {status!r}" if status else "no reply"),
                 )
                 try:
