@@ -10277,9 +10277,10 @@ def relocate_main(certdir: Path, account_num: str, email: str) -> None:
         with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             st = read_daemon_state(certdir)
             # THE RECORD IS RE-READ UNDER THE LOCK, so it may be another
-            # daemon's than the launch saw: every arm that starts this helper
-            # required the fingerprint (`/health` carries none), and a daemon
-            # of other code is the launch's to recycle, not to move.
+            # daemon's than the launch saw, and `ensure_proxy`'s held-daemon
+            # arm starts this helper for a daemon of other code too. `/health`
+            # carries no fingerprint, so the record's is the check: a daemon of
+            # other code is its own watchdog's to replace, not to move.
             health = (st and st.get("fingerprint") == daemon_fingerprint()
                       and _health_body(int(st["port"])))
             if health and (os.environ.get(_RELOCATE_ENV) == "1"
@@ -10569,8 +10570,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # wiring is rewritten to it — degraded, but nobody else's process
         # gets killed. The same blind spot already bounds the orphan sweep.
         if stale and int(stale["pid"]) in _pin_daemon_pids(certdir):
-            # A HELD DAEMON ON CURRENT CODE THAT STILL ANSWERS AS ITSELF, WITH
-            # A LIVE WATCHDOG, IS NOT OURS TO SIGNAL. The TERM takes the CAPPED
+            # A HELD DAEMON THAT STILL ANSWERS AS ITSELF, WITH A LIVE
+            # WATCHDOG, IS NOT OURS TO SIGNAL. The TERM takes the CAPPED
             # signal drain, which never waits on tunnels, so every held CONNECT
             # channel is cut (measured: ConnectionResetError on the one held
             # tunnel), and under a holder it gains nothing, the holder
@@ -10579,8 +10580,13 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # holder for a successor and drains UNCAPPED (gapless), or clears a
             # false mark. A current-code daemon reaches this arm only through
             # the `unpinnable` mark or a false `can_pin`, both of which the
-            # watchdog settles, so the mark is not a clause. So wire and leave
-            # it. A holder that never claimed the replace channel
+            # watchdog settles, so the mark is not a clause. NOR IS A STALE
+            # FINGERPRINT: a launch right after an install lands inside the
+            # watchdog's tick, and its TERM drained capped (30 s, 9 live
+            # channels) 4 s before the watchdog would have replaced the daemon
+            # successor-first. The beat below proves that tick is coming; a
+            # dead or old watchdog fails it and takes the recycle. So wire and
+            # leave it. A holder that never claimed the replace channel
             # (`_holder_pid()` None) gets the capped drain and exit 75 instead,
             # and is left alone on purpose: a TERM from here cuts now AND the
             # blind successor's own watchdog cuts again, so leaving it costs one
@@ -10598,14 +10604,13 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # absent (an older daemon) reads as dead.
             # A missing clause takes the path below: a STALL, unmarked or
             # marked (the watchdog never replaces on a busy mint lock, nor
-            # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
-            # parent is not the holder (`_holder_owns` is only "some holder
-            # exists"; an unheld watchdog never repairs current code), one
-            # whose `/health` does not name its pid (wedged), one whose
-            # watchdog beat is stale or absent (an older daemon).
+            # clears the mark there), a daemon whose OWN parent is not the
+            # holder (`_holder_owns` is only "some holder exists"; an unheld
+            # watchdog never repairs current code), one whose `/health` does
+            # not name its pid (wedged), one whose watchdog beat is stale or
+            # absent (an older daemon).
             if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
                  or "").lower() not in ("off", "0", "no")
-                    and stale.get("fingerprint") == fp
                     and isinstance(stale.get("port"), int)
                     and _wedged_parent_holder(
                         int(stale["pid"]), certdir) is not None

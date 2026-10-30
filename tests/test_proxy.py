@@ -11197,7 +11197,7 @@ class TestEnsureProxy:
             f"spawn path: port={port} spawned={spawned}"
         )
 
-    def case_a_held_current_code_daemon_with_a_live_watchdog_is_not_signalled(
+    def case_a_held_daemon_with_a_live_watchdog_is_not_signalled(
             self, tmp_path, monkeypatch):
         """T1598, T1681: `repin_current` -> `ensure_proxy` read a held,
         current-code daemon that reached the stale arm (marked `unpinnable`,
@@ -11206,16 +11206,26 @@ class TestEnsureProxy:
         held CONNECT tunnel, and under a holder the TERM gains nothing (the
         holder respawns on the same socket): the daemon's own watchdog is the
         gapless repair, for the mark and for a false `can_pin` alike, so the
-        mark is NOT a clause. A REAL daemon (`PinProxy`), because `/health`
-        naming the recorded pid and carrying the watchdog's beat is half the
-        condition. ONE ROW PER CLAUSE of the early return: the fingerprint,
-        the daemon's OWN parent being the holder (not merely some holder for
-        the certdir), the ONE `/health` answer naming the recorded pid with no
-        mint stall past `_MINT_STALL_WEDGE_S`, and a watchdog beat no older
-        than `_CODE_WATCH_BEAT_MAX_AGE_S` (a watchdog that died while the
-        daemon kept serving repairs nothing). Each other row must still
-        recycle exactly once; a STALL, unmarked or marked, is one (the
-        watchdog never replaces on a busy mint lock)."""
+        mark is NOT a clause. T3100: nor is the fingerprint. A launch right
+        after an install read the changed module mtime as a stale daemon and
+        TERMed it, 4 s before its own watchdog would have replaced it
+        successor-first (a TERM under a holder drains CAPPED at 30 s, 9 live
+        channels on lmd_dkim); the beat is what makes leaving a STALE daemon
+        safe, since a dead or old watchdog fails it and takes the recycle.
+        A REAL daemon (`PinProxy`), because `/health` naming the recorded pid
+        and carrying the watchdog's beat is half the condition. ONE ROW PER
+        CLAUSE of the early return: the daemon's OWN parent being the holder
+        (not merely some holder for the certdir), the ONE `/health` answer
+        naming the recorded pid with no mint stall past
+        `_MINT_STALL_WEDGE_S`, and a watchdog beat no older than
+        `_CODE_WATCH_BEAT_MAX_AGE_S` (a watchdog that died while the daemon
+        kept serving repairs nothing). Each other row must still recycle
+        exactly once; a STALL, unmarked or marked, is one (the watchdog never
+        replaces on a busy mint lock). The handover a left-alone STALE daemon
+        then makes is the watchdog's own: successor bound before
+        `release_listener`, drain budget `_HANDOVER_DRAIN_SECONDS`, in
+        `case_a_held_exit_does_not_drain_before_letting_the_holder_respawn`
+        and `TestAHandoverMidDrainDropsTheClock`."""
         import json
         import os
 
@@ -11282,8 +11292,17 @@ class TestEnsureProxy:
         try:
             expect("a held current-code unpinnable daemon was replaced from "
                    "here", (live.port, [], []))
-            expect("CONTROL: a stale fingerprint under a holder stopped "
-                   "recycling", (live.port, [me], []), "OTHER-FINGERPRINT")
+            # A STALE FINGERPRINT IS THE WATCHDOG'S TOO (T3100), and a burst of
+            # launches right after an install makes ZERO carries here: the one
+            # carry is the watchdog's own ask. Each launch asserts no TERM and
+            # no spawn, never "at most one".
+            for n in range(5):
+                expect(f"launch {n + 1} of 5 right after an install TERMed "
+                       "the held daemon on stale code", (live.port, [], []),
+                       "OTHER-FINGERPRINT")
+            expect("CONTROL: a stale fingerprint whose watchdog beat is older "
+                   "than the bound stopped recycling", (live.port, [me], []),
+                   "OTHER-FINGERPRINT", beat=max_age + 1)
             expect("CONTROL: an unheld unpinnable daemon stopped recycling",
                    (9955, [me], ["2"]), parent=None)
             # An UNMARKED daemon is the same arm's other entrant (a fresh blind
@@ -11340,6 +11359,72 @@ class TestEnsureProxy:
                    (live.port, [], []))
         finally:
             live.stop(drain=0)
+
+    def case_a_launch_after_a_code_change_hands_over_successor_first_with_no_cut(
+            self, tmp_path, monkeypatch):
+        """T3100, the two legs composed on one certdir: a launch right after
+        an install leaves the held stale daemon alone (no TERM, no spawn), and
+        that daemon's own watchdog tick then asks the holder, sees the
+        successor publish, and only THEN releases the listener and drains for
+        `_HANDOVER_DRAIN_SECONDS` (not the signal arm's 30 s cap)."""
+        import os
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        me, real_kill, events = os.getpid(), os.kill, []
+        live._code_watch_beat = time.monotonic()
+        pin_proxy.write_daemon_state(certdir, live.port, me, "OLD-INSTALL")
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [me])
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: 4242)
+        monkeypatch.setattr(
+            pin_proxy, "_kill_daemon",
+            lambda pid, *a, **k: events.append(("TERM", pid)) or True)
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda *a, **k: events.append(("spawn",)) or 9955)
+
+        def kill(pid, sig):
+            if sig == 0:
+                return real_kill(pid, sig)
+            events.append(("ask", sig))
+            pin_proxy.write_daemon_state(
+                certdir, live.port, me + 1, "NEW-INSTALL")
+        live.release_listener = lambda *a, **k: events.append(("release",))
+        live.await_inflight = lambda budget: events.append(("drain", budget))
+        monkeypatch.setattr(os, "kill", kill)
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: events.append(("exit", code)) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        try:
+            assert pin_proxy.ensure_proxy(self._Sw(tmp_path))[0] == live.port
+            assert events == [], f"the launch signalled or spawned: {events}"
+            try:
+                pin_proxy._watch_own_code(
+                    live, "2", "pin@example.com", certdir, _Ticks(),
+                    lambda *a: None, interval=0.01,
+                    _own_fingerprint="never-matches")
+            except SystemExit:
+                pass
+        finally:
+            seen = list(events)
+            del live.release_listener, live.await_inflight  # the real stop
+            live.stop(drain=0)
+        assert seen == [
+            ("ask", signal.SIGUSR1), ("release",),
+            ("drain", pin_proxy._HANDOVER_DRAIN_SECONDS), ("exit", 0)], seen
 
     def case_a_health_body_that_is_not_an_object_is_no_answer(
             self, monkeypatch):
@@ -35154,8 +35239,8 @@ else:
         `_HEAL_LOCK_WAIT_S` ends it quietly (another spawn or relocation is
         running), and so does a daemon that is not denied, and one whose
         recorded fingerprint is not this code's (a redeploy since the launch
-        that started the helper: every launch arm required the match, and the
-        launch recycles that daemon instead)."""
+        that started the helper, or the held-daemon arm that starts it for a
+        daemon its own watchdog is about to replace)."""
         from cswap_pin import proxy as pp
 
         pp.write_daemon_state(
