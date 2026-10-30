@@ -29487,77 +29487,154 @@ class TestConnectorsFollowPin:
         assert status == 200 and body == [events]
         assert hdrs["content-type"] == "text/event-stream"
 
-    def case_a_refused_mcp_proxy_call_reaches_the_client_as_the_pins_answer(
+    @staticmethod
+    def _stale_then_fresh_provider(certdir, monkeypatch):
+        """The real provider over a store whose first read is a stale token
+        and every later one a fresh one: the rotated-under-the-cache shape
+        `_refetch_swap_token` exists for."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        return pp.make_pin_token_provider(
+            _refetch_switcher(
+                certdir,
+                lambda n: "stale-token" if n == 1 else "fresh-token"),
+            "2", "pin@example.com")
+
+    def case_a_refused_connector_route_never_falls_back_to_the_active_account(
             self, certdir, monkeypatch):
-        """404 is "session expired, start a new one" and 401 is "this connector
-        needs re-auth" in MCP streamable HTTP, and the id came from the pinned
-        account's list: a resend as the active account (the take-back every
-        other pinned route keeps, 4e8fcd3) is never the right answer. The
-        pin's own status goes out as it came, in ONE upstream request, with no
-        `swap refused` line."""
-        from cswap_pin import proxy as pp
+        """THE ARTIFACT SHAPE (T1592, T1596), on the list and on an mcp-proxy
+        call: 404 is "session expired" and 401 "needs re-auth" in MCP
+        streamable HTTP, and the id came from the pinned account's list, so
+        the take-back every other pinned route keeps (4e8fcd3) is never the
+        answer. A refused pin is refetched ONCE, then sent again as the pin,
+        and every bearer the upstream sees is a pinned one. The client gets the
+        pin's status, a 401 as a 403 (a relayed 401 makes Claude Code refresh
+        the ACTIVE account's token). The log names the connector path, not an
+        artifact one. A refetched token the upstream accepts is the answer."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
 
         monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
-        for code in (404, 401):
-            upstream = _FakeUpstream(certdir, reject_bearer="PINNED",
-                                     reject_status=code)
-            proxy = self._proxy(certdir, upstream)
-            self._via_mcp_proxy(monkeypatch, upstream)
-            lines = []
-            real_log = pp._log_lifecycle
-            pp._log_lifecycle = lines.append
-            proxy.start()
-            try:
-                status = _request_through_proxy(
-                    proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
-                    bearer="ACTIVE", host=_MCP_HOST)
-            finally:
-                proxy.stop()
-                upstream.stop()
-                pp._log_lifecycle = real_log
-            assert status == code, (code, status)
-            assert upstream.auths_seen == ["Bearer PINNED"], (
-                code, upstream.auths_seen)
-            assert not [ln for ln in lines if ln.startswith("swap refused")], (
-                code, lines)
+        both = {"stale-token", "fresh-token"}
+        routes = [  # method, host, asked, as logged
+            ("GET", "api.anthropic.com", "/v1/mcp_servers?limit=1000",
+             "/v1/mcp_servers"),
+            ("POST", _MCP_HOST, "/v1/mcp/srv_01", "/v1/mcp/srv_01"),
+        ]
+        stale, fresh = "Bearer stale-token", "Bearer fresh-token"
+        rows = [  # refused code, refused bearers, client status, auths, outcomes
+            (403, both, 403, [stale, fresh, fresh],
+             ["retried-fresh", "relayed as the pin"]),
+            (404, both, 404, [stale, fresh, fresh],
+             ["retried-fresh", "relayed as the pin"]),
+            (401, both, 403, [stale, fresh],
+             ["retried-fresh", "relayed as the pin as 403"]),
+            (401, {"stale-token"}, 200, [stale, fresh], ["retried-fresh"]),
+        ]
+        for method, host, asked, logged in routes:
+            for code, refused, want, auths, outcomes in rows:
+                upstream = _FakeUpstream(certdir, reject_bearer=refused,
+                                         reject_status=code)
+                proxy = PinProxy(
+                    certdir=certdir,
+                    pin_token_provider=self._stale_then_fresh_provider(
+                        certdir, monkeypatch),
+                    upstream=("127.0.0.1", upstream.port))
+                self._via_mcp_proxy(monkeypatch, upstream)
+                lines = []
+                monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+                proxy.start()
+                try:
+                    status = _request_through_proxy(
+                        proxy.port, certdir / "ca.pem", asked,
+                        bearer="ACTIVE", method=method, host=host)
+                finally:
+                    proxy.stop()
+                    upstream.stop()
+                row = (method, host, code, sorted(refused))
+                assert status == want, (row, status)
+                assert upstream.auths_seen == auths, (row, upstream.auths_seen)
+                assert [ln for ln in lines if ln.startswith("swap refused")
+                        ] == [f"swap refused ({code}) on {method} {logged}: {o}"
+                              for o in outcomes], (row, lines)
 
-    def case_a_refused_list_reaches_the_client_as_the_pins_answer(
+    def case_an_absolute_form_refused_connector_list_never_falls_back(
             self, certdir, monkeypatch):
-        """A pinned token lacking `user:mcp_servers` gets a 403 on the list.
-        The active account's list names servers the pinned-bearer calls cannot
-        use, so the take-back (4e8fcd3) is no answer here: the pin's status
-        goes out as it came, in ONE upstream request, with no `swap refused`
-        line. Off, the list is unpinned and nothing about it changes."""
-        from cswap_pin import proxy as pp
+        """The absolute-form twin (`_plain_relay_request`, Claude Code through
+        an HTTPS proxy it does not CONNECT through): the same artifact shape.
+        Refetched once, sent again as the pin, a 401 answered 403 from here,
+        and no request carrying the arrived (active) bearer reaches the hop."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        for on, code in ((True, 403), (True, 401), (True, 404), (False, 403)):
-            if on:
-                monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
-            else:
-                monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN",
-                                   raising=False)
-            seen = "PINNED" if on else "ACTIVE"
-            upstream = _FakeUpstream(certdir, reject_bearer=seen,
-                                     reject_status=code)
-            proxy = self._proxy(certdir, upstream)
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        for code, want, sent, outcomes in (
+                (403, b"403", 3, ["retried-fresh", "relayed as the pin"]),
+                (404, b"404", 3, ["retried-fresh", "relayed as the pin"]),
+                (401, b"403", 2,
+                 ["retried-fresh", "relayed as the pin as 403"])):
+            chain = _RecordingChain(
+                lambda req: (b"HTTP/1.1 %d X\r\nContent-Length: 0\r\n\r\n"
+                             % code if (b"Bearer stale-token" in req
+                                        or b"Bearer fresh-token" in req) else
+                             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
             lines = []
-            real_log = pp._log_lifecycle
-            pp._log_lifecycle = lines.append
+            monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=self._stale_then_fresh_provider(
+                    certdir, monkeypatch),
+                rediscover_chain=True)
             proxy.start()
             try:
-                status = _request_through_proxy(
-                    proxy.port, certdir / "ca.pem",
-                    "/v1/mcp_servers?limit=1000", bearer="ACTIVE",
-                    method="GET")
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        b"GET https://api.anthropic.com/v1/mcp_servers"
+                        b"?limit=1000 HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer ACTIVE\r\n\r\n")
+                    got = c.recv(256)
+                finally:
+                    c.close()
             finally:
                 proxy.stop()
-                upstream.stop()
-                pp._log_lifecycle = real_log
-            assert status == code, (on, code, status)
-            assert upstream.auths_seen == [f"Bearer {seen}"], (
-                on, code, upstream.auths_seen)
-            assert not [ln for ln in lines if ln.startswith("swap refused")], (
-                on, code, lines)
+                chain.stop()
+            assert got.startswith(b"HTTP/1.1 " + want), (code, got[:60])
+            assert len(chain.seen) == sent and not any(
+                b"ACTIVE" in r for r in chain.seen), (code, chain.seen)
+            assert b"Bearer fresh-token" in chain.seen[1], code
+            assert [ln for ln in lines if ln.startswith("swap refused")
+                    ] == [f"swap refused ({code}) on GET /v1/mcp_servers: {o}"
+                          for o in outcomes], (code, lines)
+
+    def case_off_a_refused_list_is_unchanged(self, certdir, monkeypatch):
+        """THE CONTROL: switch off, the list is no pinned route. It goes out as
+        the active account, once, and the account's own answer comes back with
+        no `swap refused` line."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.delenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", raising=False)
+        upstream = _FakeUpstream(certdir, reject_bearer="ACTIVE",
+                                 reject_status=403)
+        proxy = self._proxy(certdir, upstream)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/mcp_servers?limit=1000",
+                bearer="ACTIVE", method="GET")
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 403 and upstream.auths_seen == ["Bearer ACTIVE"]
+        assert not [ln for ln in lines if ln.startswith("swap refused")], lines
 
     def case_an_mcp_proxy_5xx_is_not_evidence_about_the_pins_hop(
             self, certdir, monkeypatch):

@@ -20011,7 +20011,8 @@ class PinProxy:
     def _note_slow_request(self, method: str, path: str,
                            total_ms: float, pin_ms: float,
                            wait_ms: float | None = None,
-                           stages: "dict | None" = None) -> None:
+                           stages: "dict | None" = None,
+                           up_host: str = UPSTREAM_HOST) -> None:
         """Record a request that took seconds, because nothing else does.
 
         `daemon.log` carries lifecycle events, so a slow request leaves no
@@ -20062,8 +20063,9 @@ class PinProxy:
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
             return
         # SO IS A CONNECTOR TOOL CALL (it runs as long as the tool does), and
-        # its line would spend the cooldown below that a real stall needs.
-        if is_connector_route(path, MCP_PROXY_HOST):
+        # its line would spend the cooldown below that a real stall needs. The
+        # HOST says so: the same path on api.anthropic.com is no tool call.
+        if up_host == MCP_PROXY_HOST:
             return
         now = time.monotonic()
         last = getattr(self, "_last_slow_report", None)
@@ -23054,6 +23056,7 @@ class PinProxy:
         # bearer belongs to the host it was minted for; rewriting one on the
         # way to somebody else's server would hand out the pinned token.
         unswapped = None      # set only when a swap actually happened
+        connector = False     # the opt-in connector list, set where it swaps
         rel = (split.path or "/") + (f"?{split.query}" if split.query else "")
         # `and secure` IS THE HALF THAT KEEPS THE TOKEN OFF THE WIRE. The host
         # guard asks WHO and says nothing about HOW, so an `http://` request to
@@ -23064,9 +23067,9 @@ class PinProxy:
             ua = next((h.split(":", 1)[1].strip() for h in headers
                        if h.split(":", 1)[0].strip().lower() == "user-agent"),
                       "")
-            if is_pinned_route(rel, ua) or (
-                    is_connector_route(rel)
-                    and connectors_follow_pin(self._certdir)):
+            connector = is_connector_route(rel) and connectors_follow_pin(
+                self._certdir)
+            if connector or is_pinned_route(rel, ua):
                 token = self._pin_token_provider()
                 # THE SAME PRE-CHECK THE MITM PATH MAKES (see its own note
                 # above `_wait_for_pin_token`'s call there). Without it, a
@@ -23223,7 +23226,7 @@ class PinProxy:
             len(rl) > 2 and rl[2] == "HTTP/1.0"
         )
 
-        artifact = is_artifact_route(rel)
+        artifact = connector or is_artifact_route(rel)
 
         def _swap_attempts():
             """Swapped once, refetched once on a refusal, then unswapped --
@@ -23785,14 +23788,8 @@ class PinProxy:
             _bridge_hold = (_bridge_cse, _bridge_event)
 
         try:
-            # NOT ARMED FOR A CONNECTOR ROUTE, THE LIST OR A CALL: the id comes
-            # from the pinned account's list, so a resend as the active account
-            # is never right, and the pin's 401 (re-auth), 403 (scope) or 404
-            # (re-initialize) is the client's to read. Relayed untouched, in
-            # one request.
             keep = self._forward(method, path, headers, body, tls,
-                                 swapped=swapped and not connector,
-                                 bridge_hold=_bridge_hold,
+                                 swapped=swapped, bridge_hold=_bridge_hold,
                                  affinity=inject[1] if inject else None,
                                  follow=followed)
             if inject and isinstance(keep, _AuthRejected) and keep.code == 401:
@@ -23876,7 +23873,10 @@ class PinProxy:
                     # refusal reaches the client (`_AuthRejected` sent nothing).
                     # A 401 is answered 403 from here instead (T1596).
                     # Every other pinned route keeps the take-back (4e8fcd3).
-                    artifact = is_artifact_route(clean_path)
+                    # A CONNECTOR ROUTE IS ONE (the list and a call): the id
+                    # comes from the pinned account's list, so a resend as the
+                    # active account is never right. It logs under its own path.
+                    artifact = connector or is_artifact_route(clean_path)
                     as_403 = artifact and keep.code == 401
                     # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
                     # rule as the failed mint above, so the pin's refusal is
@@ -24253,6 +24253,7 @@ class PinProxy:
                             self._local, "t_req", time.monotonic())) * 1000,
                         getattr(self._local, "pin_ms", 0.0),
                         stages=getattr(self._local, "pin_stages", None),
+                        up_host=up_host,
                         wait_ms=(
                             (time.monotonic() - self._local.t_sent) * 1000
                             if getattr(self._local, "t_sent", None) is not None
