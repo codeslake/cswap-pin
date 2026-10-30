@@ -29953,6 +29953,17 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("POST", "/v1/messages", 6040.0, 0.0)
         assert lines == []
 
+    def case_a_connector_tool_call_taking_seconds_is_not_a_stall(
+            self, monkeypatch):
+        """A call on mcp-proxy runs as long as the tool does. Its line would
+        also spend the once-a-minute cooldown and hide a real worker stall.
+        The connector LIST, on api.anthropic.com, is no tool call."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/mcp/srv_01", 6040.0, 0.0)
+        assert lines == []
+        P._note_slow_request("GET", "/v1/mcp_servers?limit=1000", 2400.0, 0.0)
+        assert len(lines) == 1
+
     def case_a_slow_token_count_is_still_a_stall(self, monkeypatch):
         """The exemption is for the inference route itself, not everything
         under it. Counting tokens does not call the model."""

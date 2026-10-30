@@ -29487,6 +29487,40 @@ class TestConnectorsFollowPin:
         assert status == 200 and body == [events]
         assert hdrs["content-type"] == "text/event-stream"
 
+    def case_a_refused_mcp_proxy_call_reaches_the_client_as_the_pins_answer(
+            self, certdir, monkeypatch):
+        """404 is "session expired, start a new one" and 401 is "this connector
+        needs re-auth" in MCP streamable HTTP, and the id came from the pinned
+        account's list: a resend as the active account (the take-back every
+        other pinned route keeps, 4e8fcd3) is never the right answer. The
+        pin's own status goes out as it came, in ONE upstream request, with no
+        `swap refused` line."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setenv("CSWAP_PIN_CONNECTORS_FOLLOW_PIN", "1")
+        for code in (404, 401):
+            upstream = _FakeUpstream(certdir, reject_bearer="PINNED",
+                                     reject_status=code)
+            proxy = self._proxy(certdir, upstream)
+            self._via_mcp_proxy(monkeypatch, upstream)
+            lines = []
+            real_log = pp._log_lifecycle
+            pp._log_lifecycle = lines.append
+            proxy.start()
+            try:
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/mcp/srv_01",
+                    bearer="ACTIVE", host=_MCP_HOST)
+            finally:
+                proxy.stop()
+                upstream.stop()
+                pp._log_lifecycle = real_log
+            assert status == code, (code, status)
+            assert upstream.auths_seen == ["Bearer PINNED"], (
+                code, upstream.auths_seen)
+            assert not [ln for ln in lines if ln.startswith("swap refused")], (
+                code, lines)
+
     def case_an_mcp_proxy_5xx_is_not_evidence_about_the_pins_hop(
             self, certdir, monkeypatch):
         from cswap_pin import proxy as pp

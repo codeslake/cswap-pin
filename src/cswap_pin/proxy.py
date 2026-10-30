@@ -20061,6 +20061,10 @@ class PinProxy:
         # under this route and calls no model, so a slow one is still a stall.
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
             return
+        # SO IS A CONNECTOR TOOL CALL (it runs as long as the tool does), and
+        # its line would spend the cooldown below that a real stall needs.
+        if is_connector_route(path, MCP_PROXY_HOST):
+            return
         now = time.monotonic()
         last = getattr(self, "_last_slow_report", None)
         if last is not None and now - last < _SLOW_REPORT_COOLDOWN_S:
@@ -23781,8 +23785,13 @@ class PinProxy:
             _bridge_hold = (_bridge_cse, _bridge_event)
 
         try:
+            # NOT ARMED FOR A CONNECTOR CALL: the id came from the pinned
+            # account's list, so a resend as the active account is never right,
+            # and the pin's 401 (re-auth) or 404 (re-initialize) is the
+            # client's to read. Relayed untouched, in one request.
             keep = self._forward(method, path, headers, body, tls,
-                                 swapped=swapped, bridge_hold=_bridge_hold,
+                                 swapped=swapped and up_host == UPSTREAM_HOST,
+                                 bridge_hold=_bridge_hold,
                                  affinity=inject[1] if inject else None,
                                  follow=followed)
             if inject and isinstance(keep, _AuthRejected) and keep.code == 401:

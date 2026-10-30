@@ -1550,9 +1550,10 @@ rotated to, not the pinned one. With the switch on, the pin sends both as the
 pinned account: `/v1/mcp_servers` (bare or with its query, nothing broader) is
 swapped like the other pinned routes, and `mcp-proxy.anthropic.com` is MITM'd
 so every request under `/v1/mcp/` carries the pinned token, with the rest of
-that host and every response (event streams included) relayed unchanged. A
-request with no pinned token to swap goes out as it came, never as a 503 of the
-pin's own.
+that host and every response (event streams included) relayed unchanged, a
+401, 403 or 404 too: it is the pinned account's own answer and is never resent
+as the active one. A request with no pinned token to swap goes out as it
+came, never as a 503 of the pin's own.
 
 It is **off by default**, and while it is off no request changes:
 `mcp-proxy.anthropic.com` stays the blind tunnel it always was. The switch
