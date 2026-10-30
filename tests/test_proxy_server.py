@@ -14749,8 +14749,7 @@ class TestDrainReportsWhatItCut:
             "uncapped arm and the superseded capped one")
         assert 'budget == float("inf")' in drain[:calls[0]][-200:], (
             "the tunnel wait is not confined to the uncapped arm")
-        assert "_superseded_on_the_port(self._certdir)" in drain[
-            :calls[1]][-200:], (
+        assert "not _superseded_on_the_port(" in drain[:calls[1]][-200:], (
             "a capped drain waits on tunnels with no successor serving the "
             "port, past a supervisor counting to `_DRAIN_SECONDS + 2`")
 
@@ -15347,13 +15346,12 @@ class TestDrainReportsWhatItCut:
                                      until we are gone, so every second here is
                                      a second with nothing serving the port.
                                      Cutting is the lesser evil
-                                     -> `_HELD_DRAIN_SECONDS`. ONE call site
-                                     shares it: no holder that can be asked at
-                                     all (one that never claimed the channel),
-                                     which leaves the supervisor to start the
-                                     next one the slow way. A holder that WAS
-                                     asked and whose successor is late is not
-                                     this: the daemon keeps serving (T3100).
+                                     -> `_HELD_DRAIN_SECONDS`. TWO call sites
+                                     share it: no holder pid to ask at all,
+                                     and a holder that survived the ask but
+                                     whose successor never published within
+                                     the wait -- both leave the supervisor to
+                                     start the next one the slow way.
 
         AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
         third constant rather than a bigger one: it is also the supervisor's
@@ -15393,12 +15391,12 @@ class TestDrainReportsWhatItCut:
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS",
+            "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
         ], (
             "the exit paths no longer drain on the ceilings that fit them. "
             "Four hand over to a successor that is already serving (free to "
-            "wait) and one exits so a holder that cannot be asked can start the "
-            "successor the slow way (every second is an unserved port). Got: "
+            "wait) and two exit so a holder can start the successor the slow "
+            "way (every second is an unserved port). Got: "
             + ", ".join(sorted(named))
         )
 
@@ -19427,7 +19425,8 @@ class TestAHandoverMidDrainDropsTheClock:
     change mid-wait, which is here.
     """
 
-    def _drain(self, tmp_path, monkeypatch, *, superseded, moving_for=3):
+    def _drain(self, tmp_path, monkeypatch, *, superseded, moving_for=3,
+               owed=None):
         import cswap_pin.proxy as pp
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
@@ -19439,7 +19438,7 @@ class TestAHandoverMidDrainDropsTheClock:
             seen["n"] += 1
             return seen["n"] <= moving_for
 
-        monkeypatch.setattr(proxy, "_owed_still_moving", moving)
+        monkeypatch.setattr(proxy, "_owed_still_moving", owed or moving)
         monkeypatch.setattr(pp, "_superseded_on_the_port",
                             lambda _c: superseded)
         monkeypatch.setattr(pp.time, "sleep", lambda _s: None)
@@ -19541,6 +19540,36 @@ class TestAHandoverMidDrainDropsTheClock:
         monkeypatch.setattr(pp, "_PUMP", pump)
         out = self._drain(tmp_path, monkeypatch, superseded=True, moving_for=0)
         assert "quiet for" in out and pump.released == 1, out
+
+    def test_a_reply_that_starts_during_the_tunnel_wait_finishes(
+            self, tmp_path, monkeypatch):
+        """T3100: a superseded capped drain waits on the tunnels after the owed
+        loop, and that wait can last hours. A reply that starts inside it is
+        owed from then on (a connection stays open through a drain), but the
+        owed loop was not entered again, so the release that follows the wait
+        cut it. It is waited on again, on no clock: the clock here runs 10 s
+        per look at the tunnels, far past the 5 s budget, by the time the
+        reply is looked at."""
+        import cswap_pin.proxy as pp
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        real = pp.time.monotonic
+        monkeypatch.setattr(pp.time, "monotonic",
+                            lambda: real() + 10.0 * pump.polls)
+        looks = []
+
+        def owed(_started):
+            """Nothing is owed until the tunnel wait has run; then a reply
+            that began during it is, for three looks."""
+            looks.append(pump.polls)
+            return pump.polls > 0 and len(looks) <= 4
+
+        self._drain(tmp_path, monkeypatch, superseded=True, owed=owed)
+        after = [p for p in looks if p > 0]
+        assert len(after) == 4 and pump.released == 0, (
+            f"{len(after)} look(s) at the reply after the tunnel wait, "
+            f"released {pump.released}: a reply that began during the wait "
+            "was cut, or the clock was not dropped")
 
 
 class TestARequestThatArrivesMidDrainIsNotBornStale:
