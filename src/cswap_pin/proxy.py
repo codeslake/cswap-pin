@@ -10846,7 +10846,7 @@ def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool
     if confirmed:
         _log_carry(
             certdir,
-            f"{pid} is under a holder — asked the holder for a successor "
+            f"{pid} is under a holder: asked the holder for a successor "
             f"before terminating it")
     return confirmed
 
@@ -10866,15 +10866,16 @@ def _recycle_daemon(certdir: Path, pid: int, fp: "str | None") -> bool:
       rewritten to a different port: 44411 -> 41569, with every live session
       still naming 44411.
 
-    So under a holder we ASK IT FOR A SUCCESSOR FIRST
-    (`_ask_holder_for_successor`, ``fp`` the successor's fingerprint), so
-    the TERM that follows lands on a daemon already replaced on the port and
-    its capped drain loses its clock, then TERM and report "handled": the
-    holder puts a successor on the socket it owns, and the code watchdog
-    inside that successor retires it again if the file on disk has moved on.
+    So under a holder we ask it for a successor FIRST
+    (`_ask_holder_for_successor`, ``fp`` the successor's fingerprint), so the
+    TERM lands on a daemon already replaced on the port and its capped drain
+    loses its clock. Then we TERM and report "handled": the holder puts a
+    successor on the socket it owns, and the code watchdog inside that
+    successor retires it again if the file on disk has moved on.
+
     An ask nobody hears, or no successor answers, still ends in the TERM: the
     last resort for a daemon nothing else will replace. Without a holder this
-    is the old behaviour, unchanged — kill, and let the caller spawn.
+    is the old behaviour, unchanged: kill, and let the caller spawn.
 
     NOT `_holder_owns` ALONE. That matches `--hold-port` argv only, and a
     standby PROMOTED IN PLACE (`_standby_revive`) never re-execs — its argv
