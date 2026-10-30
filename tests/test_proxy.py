@@ -11293,19 +11293,26 @@ class TestEnsureProxy:
         monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.3)
 
         def expect(label, want, fingerprint=fp, *, mark=True, parent=4242,
-                   owns=False, health=real_probe, beat=0.0, askable=False,
-                   publish=True, order=None):
+                   owns=False, health=real_probe, beat=0.0, askable=True,
+                   publish=True, order=None, draining=False, waits=None):
             """`parent` is `_wedged_parent_holder`'s answer, `owns` is
             `_holder_owns`'s (any holder for the certdir). `beat` is the age
             in seconds of the real daemon's last watchdog beat, None for a
             daemon whose watchdog never beat. `askable` is whether the holder
             would hear `_REPLACE_ME_SIGNAL`, `publish` whether the ask draws a
             successor record, and `order` the (ask, TERM) events wanted, each
-            TERM carrying the pid the record named when it was sent."""
+            TERM carrying the pid the record named when it was sent.
+            `draining` is a daemon whose handover is already running, and
+            `waits` the number of `_SPAWN_WAIT_S` the call may pay (the ask's
+            own, the caller's for a holder's replacement): its length is
+            measured, so a launch that leaves a daemon serving cannot sit
+            out a wait for a replacement nobody was asked for."""
             signalled.clear()
             spawned.clear()
             events.clear()
             publishes[0] = publish
+            monkeypatch.setattr(
+                pin_proxy, "_SPAWN_WAIT_S", 1.5 if waits is not None else 0.3)
             monkeypatch.setattr(
                 pin_proxy, "_wedged_daemon_can_be_asked",
                 lambda pid, holder: askable)
@@ -11319,11 +11326,22 @@ class TestEnsureProxy:
             monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: parent)
             monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: owns)
             monkeypatch.setattr(pin_proxy, "_health_probe", health)
-            port = pin_proxy.ensure_proxy(self._Sw(tmp_path))[0]
+            done = (pin_proxy.announce_draining(certdir, me) if draining
+                    else lambda: None)
+            started = time.monotonic()
+            try:
+                port = pin_proxy.ensure_proxy(self._Sw(tmp_path))[0]
+            finally:
+                done()
+            took = time.monotonic() - started
             assert (port, signalled, spawned) == want, (
                 f"{label}: port={port} signalled={signalled} spawned={spawned}")
             if order is not None:
                 assert events == order, f"{label}: {events} != {order}"
+            if waits is not None:
+                assert took < 1.5 * (waits + 0.5), (
+                    f"{label}: took {took:.1f}s, wanted at most {waits} wait(s) "
+                    f"of 1.5s")
 
         try:
             expect("a held current-code unpinnable daemon was replaced from "
@@ -11340,23 +11358,75 @@ class TestEnsureProxy:
             # record, then the TERM (which finds it already published, so the
             # drain is no longer the holder's cap).
             ask = ("ask", 4242, signal.SIGUSR1)
+            # AND A BURST AGAINST A DEAD WATCHDOG is one carry too: the first
+            # launch asks and TERMs, the rest find the successor's record.
+            with monkeypatch.context() as m:
+                m.setattr(pin_proxy, "_serving_can_pin",
+                          lambda p, timeout=1.0: True)
+                signalled.clear()
+                spawned.clear()
+                events.clear()
+                publishes[0] = True
+                m.setattr(pin_proxy, "_wedged_daemon_can_be_asked",
+                          lambda pid, holder: True)
+                m.setattr(pin_proxy, "_wedged_parent_holder",
+                          lambda p, cd: 4242)
+                m.setattr(pin_proxy, "_holder_owns", lambda cd: False)
+                m.setattr(pin_proxy, "_health_probe", real_probe)
+                live._code_watch_beat = time.monotonic() - (max_age + 1)
+                pin_proxy.write_daemon_state(
+                    certdir, live.port, me, "OTHER-FINGERPRINT")
+                for n in range(5):
+                    assert pin_proxy.ensure_proxy(
+                        self._Sw(tmp_path))[0] == live.port
+                assert events == [ask, ("TERM", me, successor_pid)] and (
+                    not spawned), (
+                    f"5 launches against a dead watchdog made {events}, "
+                    f"spawned {spawned}: not one ask and one TERM")
             expect("CONTROL: a stale fingerprint whose watchdog beat is older "
                    "than the bound stopped recycling, or TERMed before the "
                    "holder was asked and the successor published",
                    (live.port, [me], []), "OTHER-FINGERPRINT",
-                   beat=max_age + 1, askable=True,
+                   beat=max_age + 1,
                    order=[ask, ("TERM", me, successor_pid)])
-            expect("a holder that cannot hear the ask was signalled, or its "
-                   "daemon was not TERMed once", (live.port, [me], []),
-                   "OTHER-FINGERPRINT", beat=max_age + 1,
-                   order=[("TERM", me, me)])
-            expect("an ask no successor answered did not TERM once and "
-                   "leave the replacement to the holder",
-                   (live.port, [me], []), "OTHER-FINGERPRINT",
-                   beat=max_age + 1, askable=True, publish=False,
-                   order=[ask, ("TERM", me, me)])
+            # A LAUNCH NEVER TERMS A SERVING DAEMON BEFORE A SUCCESSOR HOLDS
+            # THE PORT (T3100). One probe at 1.0 s is not evidence of a wedge
+            # (1007 ms was measured on a loaded host), and a TERM under a
+            # holder drains capped and cuts every held channel. An ask nobody
+            # hears, or nobody answers, leaves the daemon serving and returns
+            # its port: a wedge is the holder's own port watch's to replace.
+            expect("a holder that cannot hear the ask TERMed its daemon, "
+                   "signalled it, or sat out a wait", (live.port, [], []),
+                   "OTHER-FINGERPRINT", beat=max_age + 1, askable=False,
+                   order=[], waits=0)
+            expect("an ask no successor answered TERMed its daemon, spawned, "
+                   "or waited again for a replacement nobody was asked for",
+                   (live.port, [], []), "OTHER-FINGERPRINT",
+                   beat=max_age + 1, publish=False, order=[ask], waits=1)
+            # ONE CARRY. A daemon already draining has its handover running:
+            # a second successor beside the first is the "two acceptors" the
+            # holder refuses, and the TERM would be a second drain on top.
+            expect("a daemon whose handover is running was asked again or "
+                   "TERMed", (live.port, [], []), "OTHER-FINGERPRINT",
+                   beat=max_age + 1, draining=True, order=[], waits=0)
+            # AND THE SAME FOR A WEDGE: it is the holder's port watch's to
+            # replace (`_wait_for_exit`), never this call's TERM.
+            expect("a held daemon that missed the one probe was TERMed with "
+                   "no successor on the port", (live.port, [], []),
+                   health=lambda p, timeout=1.0: None, askable=False,
+                   waits=0)
             expect("CONTROL: an unheld unpinnable daemon stopped recycling",
                    (9955, [me], ["2"]), parent=None)
+            # AN UNHELD STALE DAEMON WITH A LIVE BEAT is handed down by its own
+            # watchdog (gapless, `release_listener(hand_down=True)`); what that
+            # watchdog never does is repair CURRENT code, which is why the
+            # unheld unpinnable row above recycles. No beat: it recycles.
+            expect("an unheld daemon on stale code with a live watchdog was "
+                   "TERMed or replaced from here", (live.port, [], []),
+                   "OTHER-FINGERPRINT", parent=None)
+            expect("CONTROL: an unheld stale daemon with a dead watchdog "
+                   "stopped recycling", (9955, [me], ["2"]),
+                   "OTHER-FINGERPRINT", parent=None, beat=max_age + 1)
             # An UNMARKED daemon is the same arm's other entrant (a fresh blind
             # successor starts unmarked; a cold token reads `can_pin: false`):
             # its watchdog settles both, and a TERM from here cuts them.
@@ -11411,6 +11481,64 @@ class TestEnsureProxy:
                    (live.port, [], []))
         finally:
             live.stop(drain=0)
+
+    def case_the_ask_goes_out_only_for_the_daemon_the_record_names(
+            self, tmp_path, monkeypatch):
+        """T3100: ONE CARRY. `_retiring` is set only by the holder's own port
+        watch, so nothing on the holder's side stops a second successor beside
+        the first; the caller holds `.spawn.lock` and re-reads the record
+        before it asks. Asked only when the record still names the daemon and
+        that daemon is not draining; otherwise no signal, and for a daemon
+        under a holder no TERM either (`_recycle_daemon` answers None: left
+        serving). Seen as a launch read the record, then the watchdog's own
+        ask landed, then `/health` answered as the successor."""
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        me, other, real_kill = os.getpid(), os.getppid(), os.kill
+        asked, termed = [], []
+        monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: 4242)
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: True)
+        monkeypatch.setattr(
+            pin_proxy, "_wedged_daemon_can_be_asked", lambda p, h: True)
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.2)
+        monkeypatch.setattr(
+            pin_proxy, "_kill_daemon", lambda pid, *a, **k: termed.append(pid))
+
+        def kill(pid, sig):
+            if sig == 0:
+                return real_kill(pid, sig)
+            asked.append(pid)
+            pin_proxy.write_daemon_state(certdir, 1, other, "FP")
+        monkeypatch.setattr(os, "kill", kill)
+
+        def row(record_pid, draining=False):
+            asked.clear()
+            termed.clear()
+            if record_pid is None:
+                (certdir / "proxy.json").unlink(missing_ok=True)
+            else:
+                pin_proxy.write_daemon_state(certdir, 1, record_pid, "FP")
+            done = (pin_proxy.announce_draining(certdir, me) if draining
+                    else lambda: None)
+            try:
+                return pin_proxy._recycle_daemon(certdir, me)
+            finally:
+                done()
+
+        assert row(me) is True and asked == [4242] and termed == [me], (
+            "the premise: a record naming the daemon draws one ask and a TERM "
+            f"(asked={asked} termed={termed})")
+        for label, record_pid, draining in (
+                ("a record already naming another live daemon", other, False),
+                ("no record", None, False),
+                ("a daemon that is draining", me, True)):
+            assert row(record_pid, draining) is None and asked == [] and (
+                termed == []), (
+                f"{label}: asked={asked} termed={termed}, wanted neither")
 
     def case_a_launch_after_a_code_change_hands_over_successor_first_with_no_cut(
             self, tmp_path, monkeypatch):
@@ -15291,8 +15419,7 @@ print("OK", port)
                     )[-500:]
                 )
 
-            handled = pin_proxy._recycle_daemon(
-                tmp_path, first, pin_proxy.daemon_fingerprint())
+            handled = pin_proxy._recycle_daemon(tmp_path, first)
             if handled:
                 again = None
                 for _ in range(60):
@@ -15373,18 +15500,35 @@ print("OK", port)
         monkeypatch.setattr(
             proxy, "_wedged_parent_holder",
             lambda pid, cd: 424242 if pid == stale_pid else None)
-        assert proxy._recycle_daemon(tmp_path, stale_pid, "FP") is True, (
+        # T3100: the ask is not heard (a fake pid has no environment to claim
+        # the channel from), and an unconfirmed ask leaves the daemon serving:
+        # None, which `ensure_proxy` answers with the recorded port, never
+        # with the False that spawns a second holder.
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is None, (
             "a promoted standby holding the port was not recognised as the "
-            "holder -- ensure_proxy starts a second one over it"
+            "holder -- ensure_proxy starts a second one over it, or TERMs "
+            "with no successor on the port"
         )
+        assert killed == []
+
+        # AND HEARD AND ANSWERED: the successor's record, then the TERM, and
+        # the holder owns the replacement.
+        proxy.write_daemon_state(tmp_path, 1, stale_pid, "FP")
+        monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked", lambda p, h: True)
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: proxy.write_daemon_state(
+                tmp_path, 1, os.getppid(), "FP"))
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is True
         assert killed == [stale_pid]
 
         # CONTROL: an ordinary --hold-port holder, `_holder_owns` alone,
-        # must still read True.
+        # must still read True, and is TERMed with no ask: it is not this
+        # daemon's own parent, so there is nobody to ask for it.
         killed.clear()
         monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
         monkeypatch.setattr(proxy, "_wedged_parent_holder", lambda pid, cd: None)
-        assert proxy._recycle_daemon(tmp_path, stale_pid, "FP") is True
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is True
+        assert killed == [stale_pid]
 
         # CONTROL: a plain parent, neither a holder nor a promoted standby,
         # must still read False -- guessing True would skip a recycle that
@@ -15392,7 +15536,7 @@ print("OK", port)
         killed.clear()
         monkeypatch.setattr(proxy, "_holder_owns", lambda cd: False)
         monkeypatch.setattr(proxy, "_wedged_parent_holder", lambda pid, cd: None)
-        assert proxy._recycle_daemon(tmp_path, stale_pid, "FP") is False
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is False
 
     def case_an_idle_teardown_under_a_holder_still_unwires(self, tmp_path):
         """A holder's bare socket is not "somebody else is serving".

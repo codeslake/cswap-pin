@@ -2131,8 +2131,7 @@ def heal(backup_root: Path, identity: dict | None = None,
                         _write_port_hint(certdir, stale["port"])
                     # SUCCESSOR FIRST, THROUGH THE HOLDER, WHEN THERE IS ONE,
                     # before the TERM below: `_ask_holder_for_successor`.
-                    confirmed = _ask_holder_for_successor(
-                        certdir, fp, stale_pid)
+                    confirmed = _ask_holder_for_successor(certdir, stale_pid)
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
                     # a missed /health already said it was not moving -- on
@@ -10516,8 +10515,10 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                     return port, ca
 
         # A daemon exists but is stale (wrong account, or redeployed code) —
-        # recycle it before spawning, so a redeploy/repin takes effect instead
-        # of a stale daemon serving forever.
+        # replace it before spawning, so a redeploy/repin takes effect instead
+        # of a stale daemon serving forever. A held or hand-down-capable
+        # daemon with a live watchdog replaces itself, and the arm below
+        # leaves it to that; this launch recycles the rest.
         stale = read_daemon_state(certdir)
         # "Alive" is not "still ours". An unclean exit leaves proxy.json
         # behind, and a pid is reused freely — so liveness alone would aim
@@ -10563,19 +10564,25 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # handovers) while the daemon keeps serving, and then nothing
             # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
             # absent (an older daemon) reads as dead.
-            # A missing clause takes the path below (`_recycle_daemon`: it asks
-            # the holder for a successor, then TERMs): a STALL, unmarked or
-            # marked (the watchdog never replaces on a busy mint lock, nor
-            # clears the mark there), a daemon whose OWN parent is not the
-            # holder (`_holder_owns` is only "some holder exists"; an unheld
-            # watchdog never repairs current code), one whose `/health` does
-            # not name its pid (wedged), one whose watchdog beat is stale or
-            # absent (an older daemon).
+            # A missing clause takes the path below (`_recycle_daemon`: under a
+            # holder it asks for a successor and TERMs only once one holds the
+            # port, otherwise it leaves the daemon serving): a STALL, unmarked
+            # or marked (the watchdog never replaces on a busy mint lock, nor
+            # clears the mark there), a daemon of CURRENT code whose OWN parent
+            # is not the holder (`_holder_owns` is only "some holder exists";
+            # an unheld watchdog never repairs current code), one whose
+            # `/health` does not name its pid (wedged), one whose watchdog beat
+            # is stale or absent (an older daemon). An UNHELD daemon on STALE
+            # code is left alone like a held one: its watchdog hands it down
+            # gaplessly (`release_listener(hand_down=True)`, the successor
+            # bound before the drain) and a TERM here would cut what that
+            # hand-down keeps.
             if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
                  or "").lower() not in ("off", "0", "no")
                     and isinstance(stale.get("port"), int)
-                    and _wedged_parent_holder(
-                        int(stale["pid"]), certdir) is not None
+                    and (stale.get("fingerprint") != fp
+                         or _wedged_parent_holder(
+                             int(stale["pid"]), certdir) is not None)
                     and (health := _health_body(stale["port"])) is not None
                     and health.get("pid") == int(stale["pid"])
                     and not _mint_stalled(health)
@@ -10595,7 +10602,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # already wired to the old one.
             if isinstance(stale.get("port"), int):
                 _write_port_hint(certdir, stale["port"])
-            if _recycle_daemon(certdir, int(stale["pid"]), fp):
+            handled = _recycle_daemon(certdir, int(stale["pid"]))
+            if handled:
                 # THE HOLDER OWNS THE REPLACEMENT.
                 for _ in range(int(_SPAWN_WAIT_S * 10)):
                     port = _read_alive_port(certdir)
@@ -10603,6 +10611,15 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                         wire_global_config(port, ca)
                         return port, ca
                     time.sleep(0.1)
+            if handled is not False:
+                # HELD, SO NEVER THE SPAWN BELOW: a second holder for a socket
+                # the first one owns is the double bind `_recycle_daemon`
+                # measures. None is a daemon left serving (no successor was
+                # asked for, or none answered), True one whose successor has not
+                # answered `/health` yet; the holder's socket is the recorded
+                # port either way, queueing arrivals until one accepts.
+                wire_global_config(stale["port"], ca)
+                return stale["port"], ca
         elif (stale and isinstance(stale.get("port"), int)
               and _health_pid(stale["port"]) == int(stale["pid"])):
             # INVISIBLE HERE IS NOT DEAD. `_pin_daemon_pids` asked `ps` in
@@ -10801,13 +10818,24 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
     return True
 
 
-def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool:
+def _ask_holder_for_successor(certdir: Path, pid: int) -> bool:
     """Ask ``pid``'s own holder for a successor and wait for its record. True
     when one published, False for every other outcome: nothing asked, nobody
-    answered. The caller's TERM follows either way, and after a True the
-    successor already holds the port, so that TERM's capped drain loses its
-    clock (`_superseded_on_the_port`) instead of cutting a daemon nothing
-    has replaced yet.
+    answered. After a True the successor already holds the port, so the TERM
+    that follows loses its capped drain's clock (`_superseded_on_the_port`) and
+    waits on the tunnels (`_wait_for_tunnels`) instead of cutting a daemon
+    nothing has replaced yet. After a False `_recycle_daemon` TERMs nothing
+    under a holder (`heal` does, its wedge repair).
+
+    ONE CARRY, so asked only if the record, re-read here under the lock both
+    callers hold, still names ``pid`` and ``pid`` is not draining. Nothing on
+    the holder's side stops a second successor beside the first (`_retiring`
+    is set only by its own port watch), and a launch that read the record
+    before the daemon's own watchdog asked would otherwise ask again: the
+    watchdog's tick runs beside a TERM drain, and `/health` answering as the
+    successor fails a caller's pid clause. The record named ``pid`` the instant
+    before the ask, so ``pid`` is also the pre-ask pid `_await_successor_state`
+    excludes.
 
     A bare TERM-then-spawn races the holder for the port --
     `_recycle_daemon`'s own docstring measures the double bind this avoids.
@@ -10825,6 +10853,10 @@ def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool
     the looser "something holds it somewhere" check added nothing but a way to
     refuse the standby row.
     """
+    record = read_daemon_state(certdir)
+    if (not record or int(record.get("pid") or 0) != pid
+            or is_draining(certdir, pid)):
+        return False
     asked_holder = (
         _REPLACE_ME_SIGNAL is not None
         and _wedged_parent_holder(pid, certdir)
@@ -10841,8 +10873,12 @@ def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool
             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
         except OSError:
             asked_holder = None
+    # MATCHED ON PID IDENTITY, NOT FINGERPRINT, like the watchdog's own wait: a
+    # successor publishes `_OWN_FINGERPRINT` taken at ITS import, and a deploy
+    # landing since would make a fresh read here disagree with a successor that
+    # exists.
     confirmed = bool(asked_holder) and _await_successor_state(
-        certdir, fp, pid)
+        certdir, None, pid)
     if confirmed:
         _log_carry(
             certdir,
@@ -10851,14 +10887,16 @@ def _ask_holder_for_successor(certdir: Path, fp: "str | None", pid: int) -> bool
     return confirmed
 
 
-def _recycle_daemon(certdir: Path, pid: int, fp: "str | None") -> bool:
-    """Replace a stale daemon. True when a successor is already on the way.
+def _recycle_daemon(certdir: Path, pid: int) -> "bool | None":
+    """Replace a stale daemon. True when a successor is already on the way, False
+    for an unheld daemon (killed, and the caller spawns), None when a daemon
+    under a holder was LEFT SERVING.
 
     UNDER A HOLDER THIS IS NOT OURS TO DO, and doing it anyway was two
     mistakes at once (both measured):
 
       the TERM makes the daemon exit `_RESTART_ME_CODE`, so the holder
-      replaces it AT ONCE — with the same stale code the recycle was meant to
+      replaces it AT ONCE -- with the same stale code the recycle was meant to
       retire, and at zero backoff
 
       the caller then spawns, which starts a SECOND holder for a port the
@@ -10867,28 +10905,35 @@ def _recycle_daemon(certdir: Path, pid: int, fp: "str | None") -> bool:
       still naming 44411.
 
     So under a holder we ask it for a successor FIRST
-    (`_ask_holder_for_successor`, ``fp`` the successor's fingerprint), so the
-    TERM lands on a daemon already replaced on the port and its capped drain
-    loses its clock. Then we TERM and report "handled": the holder puts a
-    successor on the socket it owns, and the code watchdog inside that
-    successor retires it again if the file on disk has moved on.
-
-    An ask nobody hears, or no successor answers, still ends in the TERM: the
-    last resort for a daemon nothing else will replace. Without a holder this
-    is the old behaviour, unchanged: kill, and let the caller spawn.
+    (`_ask_holder_for_successor`), and TERM only once one is on the port: the
+    daemon's capped drain then loses its clock and waits on its tunnels, and
+    the holder's successor serves while it leaves. A LAUNCH NEVER TERMS A
+    SERVING DAEMON BEFORE A SUCCESSOR HOLDS THE PORT: a TERM there drains
+    capped (30 s) and cuts every held CONNECT channel, and the leave-alone gate
+    in `ensure_proxy` is one 1.0 s `/health` probe (1007 ms was measured on a
+    loaded host), no evidence of a wedge. An ask nobody hears, nobody answers,
+    or that a handover already running makes unneeded, therefore leaves the
+    daemon serving (None): a wedge is the holder's own port watch's to replace
+    (`_wait_for_exit`), and `heal` keeps its TERM as the wedge repair. Without
+    a holder this is the old behaviour, unchanged: kill, and let the caller
+    spawn.
 
     NOT `_holder_owns` ALONE. That matches `--hold-port` argv only, and a
-    standby PROMOTED IN PLACE (`_standby_revive`) never re-execs — its argv
-    still reads `--standby ...` — so a wedge under one fell through to
+    standby PROMOTED IN PLACE (`_standby_revive`) never re-execs -- its argv
+    still reads `--standby ...` -- so a wedge under one fell through to
     False here, `ensure_proxy` spawned a SECOND holder for a port the
     promoted standby's own exit-75 respawn was about to refill, and the
     caller was left with two holders on one certdir. `_wedged_parent_holder`
     already proves the stronger claim (``pid``'s OWN parent is a holder OR a
-    promoted standby for THIS certdir) — the same reason `heal`'s own wedge
-    branch stopped `and`-ing `_holder_owns` in.
+    promoted standby for THIS certdir) -- the same reason `heal`'s own wedge
+    branch stopped `and`-ing `_holder_owns` in. A holder that is only "some
+    holder for the certdir" is not ``pid``'s parent, so there is nobody to
+    ask: TERM, and the holder owns the replacement as before.
     """
-    held = _holder_owns(certdir) or _wedged_parent_holder(pid, certdir) is not None
-    _ask_holder_for_successor(certdir, fp, pid)
+    parent_held = _wedged_parent_holder(pid, certdir) is not None
+    if parent_held and not _ask_holder_for_successor(certdir, pid):
+        return None
+    held = parent_held or _holder_owns(certdir)
     _kill_daemon(pid, certdir)
     return held
 
@@ -13235,8 +13280,9 @@ def _host_package_dir() -> "Path | None":
 def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     """Identity of the code the daemon RUNS — this package and the host
     package it borrows from — so a redeploy of either makes a running daemon
-    stale and the launcher recycles it; mirrors the fingerprint staleness a
-    sibling proxy's ensure step uses.
+    stale and it is replaced: by its own code watchdog, or by the launcher when
+    the watchdog is dead; mirrors the fingerprint staleness a sibling proxy's
+    ensure step uses.
 
     IT NAMED `pin_proxy.py` UNTIL 0.1.104, which is where this code lived
     before the pin became its own package. A reader following that name looks
@@ -16151,9 +16197,9 @@ def _watch_own_code(
     """Hand over to a successor when this module's code is replaced on disk.
 
     WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
-    `ensure_proxy` recycles a stale daemon, but only when a new session starts.
-    A machine whose sessions are all already running never launches, so an
-    upgrade never reaches the process. Measured: a daemon served
+    `ensure_proxy` replaces a stale daemon whose watchdog is not beating, but
+    only when a new session starts. A machine whose sessions are all already
+    running never launches, so an upgrade never reaches the process. Measured: a daemon served
     for 22 hours on code that had been replaced 19 hours earlier, across six
     releases, dialling direct instead of chaining — every claude.ai handshake
     got the corporate MITM leaf and OAuth login was broken the whole time.
