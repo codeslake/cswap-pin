@@ -2374,6 +2374,16 @@ def heal(backup_root: Path, identity: dict | None = None,
                 # finishing, not a bystander's; reporting False read as
                 # "nothing to heal" for a call that just retired a daemon.
                 return recycled
+            # A HOLDER IS CARRYING A REPLACEMENT (T3107): the record is gone or
+            # names a dead pid while its successor boots, and a spawn here is a
+            # second holder for the socket the first owns. Deferred like the
+            # recycle branch above: the carry ends, and the next heal is a
+            # first pass again.
+            if successor_in_flight(certdir):
+                _log_lifecycle(
+                    "the holder's successor is still booting -- not spawning "
+                    "a daemon beside it")
+                return False
             port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             # Could not start. Make sure a stale wiring is not left behind to
@@ -10749,13 +10759,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                         wire_global_config(port, ca)
                         return port, ca
                     time.sleep(0.1)
-                # AND NEVER THE SPAWN BELOW (T3107): a second holder for a
-                # socket the first one owns is the double bind
-                # `_recycle_daemon` measures. The holder's socket IS the
-                # recorded port, and it queues arrivals until a daemon
-                # accepts; a successor that takes longer than the wait above
-                # (56-85 s measured) is still the holder's.
-                if isinstance(stale.get("port"), int):
+                # AND NEVER THE SPAWN BELOW, FOR A DAEMON THAT IS A HOLDER'S
+                # CHILD (T3107): a second holder for a socket the first one
+                # owns is the double bind `_recycle_daemon` measures. That
+                # holder's socket IS the recorded port (the daemon inherited
+                # it), and it queues arrivals until a daemon accepts; a
+                # successor that takes longer than the wait above (56-85 s
+                # measured) is still the holder's. `held`, not
+                # `_recycle_daemon`'s answer: that is also true for ANY holder
+                # of the certdir (`_holder_owns`), whose socket need not be
+                # this daemon's port. The daemon the TERM really killed then
+                # leaves nothing on the recorded port, and the spawn is right.
+                if held and port_ok:
                     wire_global_config(stale["port"], ca)
                     return stale["port"], ca
         elif (stale and isinstance(stale.get("port"), int)
@@ -10774,6 +10789,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # leave the record exactly as read.
             wire_global_config(stale["port"], ca)
             return stale["port"], ca
+        # A HOLDER IS CARRYING A REPLACEMENT (T3107): the record is gone or
+        # names a pid that died (the predecessor exited or crashed mid-carry)
+        # while its successor boots, so the checks above read "nothing serves".
+        # A spawn from here is a second holder for the socket the first owns:
+        # its sidecar names that socket, and that is the port to give back.
+        flight = successor_in_flight(certdir)
+        if flight and isinstance(flight.get("port"), int):
+            _log_lifecycle(
+                f"not spawning the pin daemon from here: the holder for port "
+                f"{flight['port']} is booting a successor")
+            wire_global_config(flight["port"], ca)
+            return flight["port"], ca
         if _keychain_denied_here():
             _log_lifecycle(
                 "not spawning the pin daemon from here: this process cannot "
@@ -13249,31 +13276,36 @@ def read_daemon_state(certdir: Path) -> dict | None:
     return data
 
 
-# A SUCCESSOR THE HOLDER SPAWNED AND THAT HAS NOT PUBLISHED YET (T3107). Until
-# `proxy.json` names it, nothing on disk says it exists: every other sender
-# (the daemon's own watchdog, a launch, heal, both orphan sweeps) read "no
-# successor", waited `_SPAWN_WAIT_S` (10 s) for a publish that took 56-85 s on a
-# loaded host, and then cut (a capped drain, a TERM) or asked again and got a
-# second successor, and the sweeps TERMed the booting successor itself. The
-# holder writes this beside the record when it spawns one for a replace ask and
-# removes it when the successor publishes or the holder gives up. NOT
-# `proxy.json` (rebuilt by every successor, see `write_carry_file`).
+# A CARRY THE HOLDER IS MAKING: A SUCCESSOR SPAWNED AND NOT PUBLISHED YET
+# (T3107). Until `proxy.json` names it, nothing on disk says it exists: every
+# other sender (the daemon's own watchdog, a launch, heal, both orphan sweeps)
+# read "no successor", waited `_SPAWN_WAIT_S` (10 s) for a publish that took
+# 56-85 s on a loaded host, and then cut (a capped drain, a TERM), asked again
+# and got a second successor, or spawned a second holder, and the sweeps TERMed
+# the booting successor itself. The holder writes this beside the record from
+# the moment it takes an ask (`PortHolder._carry`) and removes it when its
+# watch ends: the successor published, or the holder gave up. NOT `proxy.json`
+# (rebuilt by every successor, see `write_carry_file`).
 _SUCCESSOR_FLIGHT_FILE = "successor-in-flight.json"
 
 
 def successor_in_flight(certdir: Path) -> "dict | None":
-    """``{holder, successor, predecessor, spawned_at}`` while the holder's
-    successor is booting, else None.
+    """``{holder, port, successor, predecessor, spawned_at}`` while the holder
+    is carrying a replacement for its daemon, else None. ``port`` is the
+    holder's socket, what a caller with no record can still be given;
+    ``successor`` is None until the spawn returns and may name a child that
+    died, in the backoff before the watch spawns it again.
 
-    LIVENESS IS A PID'S, NOT A CLOCK'S: a record whose holder or successor is
-    dead is absent, so a holder that was killed mid-boot strands nothing. The
-    clock is only the backstop for a pid that lives and never publishes, at
-    the figure the holder's own watch gives up at (`_RELOCATE_WAIT_S`)."""
+    THE HOLDER'S LIVENESS, NOT THE SUCCESSOR'S: the carry is the holder's
+    through that backoff, most of the T2071 crash-loop window, so a dead
+    successor does not open it. A record whose holder is dead is absent, so a
+    holder that was killed mid-boot strands nothing. The clock is only the
+    backstop for a holder that lives and never ends its watch, at the figure
+    the watch gives up at (`_RELOCATE_WAIT_S`)."""
     rec = _read_json(Path(certdir) / _SUCCESSOR_FLIGHT_FILE)
     try:
         if (rec and time.time() - float(rec["spawned_at"]) < _RELOCATE_WAIT_S
-                and _pid_alive(int(rec["holder"]))
-                and _pid_alive(int(rec["successor"]))):
+                and _pid_alive(int(rec["holder"]))):
             return rec
     except (KeyError, TypeError, ValueError):
         pass
@@ -13495,6 +13527,17 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
 # Module level, so it is evaluated while the interpreter is executing this very
 # file. Nothing between import and the watchdog can move it.
 _OWN_FINGERPRINT = daemon_fingerprint()
+
+
+def _child_running(proc) -> bool:
+    """Whether the child ``proc`` has not exited. `poll()` reaps, so a death
+    nobody waited on is seen (``returncode`` alone stays None until someone
+    does); a double with only a ``returncode`` is read by that."""
+    if proc is None:
+        return False
+    poll = getattr(proc, "poll", None)
+    return (poll() if poll is not None
+            else getattr(proc, "returncode", 0)) is None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -13912,6 +13955,16 @@ class PortHolder:
     # waiting caller instead of spawning (`_hand_to_the_caller`). Class-level so
     # a holder built without `__init__` (a test double) reads False.
     _handed_off = False
+
+    # THE CARRY, OR NONE (T3107): ``{"before": the daemon being replaced or
+    # None, "at": wall time of the ask}`` from before the successor is spawned
+    # until `_respawn_until_published` ends. ONE OBJECT FOR THE WHOLE LIFE of a
+    # replacement, in memory, because `_replace_lock` is an RLock and the
+    # handler runs on the main thread: a second SIGUSR1 landing inside
+    # `_spawn`'s Popen nests through the lock and must find it. The sidecar
+    # (`successor_in_flight`) is the same fact for the other processes.
+    # Class-level so a holder built without `__init__` (a test double) reads None.
+    _carry = None
 
     def __init__(self, certdir: Path, account_num: str, email: str,
                  port: int | None = None, sock: socket.socket | None = None):
@@ -14676,22 +14729,22 @@ class PortHolder:
                     f"on its own"
                 )
                 return
-            # A SUCCESSOR THIS HOLDER SPAWNED IS STILL BOOTING (T3107). The ask
-            # comes from a daemon that waited `_SPAWN_WAIT_S` for a publish and
-            # asks again on a later tick, or from a launch or a heal that read
-            # a record naming only the predecessor. Honouring it spawns a
+            # THIS HOLDER IS CARRYING A REPLACEMENT ALREADY (T3107), from the
+            # moment it took the ask that began it, through the successor's
+            # boot and through the watch's backoff after a death, to the end of
+            # the watch. The ask comes from a daemon that waited
+            # `_SPAWN_WAIT_S` for a publish and asks again on a later tick, from
+            # a launch or a heal that read a record naming only the
+            # predecessor, from the port watch's repair, or from a SIGUSR1
+            # nested inside the spawn's own Popen (this lock is an RLock and the
+            # handler runs on the main thread). Honouring any of them spawns a
             # second successor beside the first, two acceptors on one socket
-            # and the first one orphaned from this watch. The sidecar is the
-            # one place that says so; the holder's own repair (no signal) never
-            # reaches it, its predecessor being the daemon that stopped
-            # accepting.
-            if signum is not None and certdir is not None:
-                flight = successor_in_flight(certdir)
-                if flight:
-                    _log_lifecycle(
-                        f"replace request for port {self.port} ignored: "
-                        f"successor {flight['successor']} is still booting")
-                    return
+            # and one of them unsupervised.
+            if self._carry is not None:
+                _log_lifecycle(
+                    f"replace request for port {self.port} ignored: a "
+                    f"successor is still booting")
+                return
             # ponytail: a SIGTERM (`_cleanup`, see `_install_signal_teardown`)
             # nested INSIDE this call, between `_spawn`'s `Popen()` and its
             # `self._proc = proc` (T1401), leaves the successor unassigned
@@ -14725,7 +14778,16 @@ class PortHolder:
             # a successor measured 56-85 s to publish. `_RELOCATE_WAIT_S` is
             # the figure the other long wait uses, and the sidecar's ceiling.
             deadline = time.monotonic() + _RELOCATE_WAIT_S
-            before = getattr(self, "_proc", None)
+            # THE DAEMON THAT SERVES, never a dead child: it is what a give-up
+            # hands the supervision back to and what a publish retires. A dead
+            # `self._proc` is the supervisor's to respawn, not ours to replace.
+            prior = getattr(self, "_proc", None)
+            before = prior if _child_running(prior) else None
+            # THE CARRY BEGINS HERE, BEFORE THE SPAWN, and the sidecar with it:
+            # a SIGUSR1 nested in the Popen finds the one, and a launch in
+            # another process finds the other while the fork runs.
+            self._carry = {"before": before, "at": time.time()}
+            self._note_carry(None)
             try:
                 self._spawn()
             except (OSError, ValueError) as exc:
@@ -14733,51 +14795,54 @@ class PortHolder:
                     f"could not spawn a successor on replace request: {exc!r} "
                     f"— staying up on the current daemon"
                 )
+                self._end_carry(None, before, False)
                 return
-            # ONLY THE DAEMON'S OWN ASK IS WAITING ON A RECORD. `_wait_for_exit`'s
-            # wedge repair (no signal) replaces a daemon that asked nothing and
-            # terminates it next, and the supervisor takes the successor from there.
-            if signum is not None and self._proc is not before:
-                # NAMED BEFORE THE WATCH STARTS, under the lock: no moment in
-                # which the successor exists and the sidecar does not.
-                self._note_successor(self._proc, before)
-                # RuntimeError IS HOW `Thread.start` REPORTS EAGAIN / RLIMIT_NPROC,
-                # the exhaustion the `_spawn` guard above contains: escaping this
-                # SIGNAL HANDLER it ends the holder with no `stop()`. Unwatched
-                # is what the successor was before T2071: nothing retires the
-                # predecessor, and no sidecar is left to hold readers off.
-                try:
-                    threading.Thread(
-                        target=self._respawn_until_published,
-                        args=(self._proc, deadline, before),
-                        daemon=True).start()
-                except RuntimeError as exc:
-                    self._forget_successor(self._proc)
-                    _log_lifecycle(
-                        f"could not start the successor watch: {exc!r} "
-                        f"- the successor goes unwatched")
+            if self._proc is prior:
+                self._end_carry(None, before, False)     # nothing was spawned
+                return
+            # EVERY ASK IS CARRIED AND WATCHED, the port watch's repair (no
+            # signal) included: it replaces a daemon that asked nothing and
+            # terminates it next, but the supervisor takes the successor from
+            # there only when it waits on that daemon. Parked on a predecessor
+            # that drains for hours it does not, and a repair successor that
+            # died at boot was never spawned again.
+            self._note_carry(self._proc)
+            # RuntimeError IS HOW `Thread.start` REPORTS EAGAIN / RLIMIT_NPROC,
+            # the exhaustion the `_spawn` guard above contains: escaping this
+            # SIGNAL HANDLER it ends the holder with no `stop()`. No watch
+            # means the carry ends here like any other exit without a publish:
+            # the successor is ended and the daemon it was for serves on.
+            try:
+                threading.Thread(
+                    target=self._respawn_until_published,
+                    args=(self._proc, deadline, before),
+                    daemon=True).start()
+            except RuntimeError as exc:
+                _log_lifecycle(
+                    f"could not start the successor watch: {exc!r} "
+                    f"- ending the successor")
+                self._end_carry(self._proc, before, False)
 
-    def _note_successor(self, proc, before) -> None:
-        """Write the sidecar naming the successor ``proc`` this holder is
-        waiting on; see `successor_in_flight`."""
-        certdir = getattr(self, "_certdir", None)
-        if certdir is not None:
-            write_carry_file(certdir, _SUCCESSOR_FLIGHT_FILE, {
-                "holder": os.getpid(), "successor": proc.pid,
-                "predecessor": getattr(before, "pid", 0),
-                "spawned_at": time.time()})
+    def _note_carry(self, proc) -> None:
+        """Write the sidecar from the carry (`successor_in_flight`): ``proc``
+        is the successor, None until the spawn returns. A write that fails
+        blinds the OTHER processes only; this holder's own declines read the
+        carry."""
+        carry, certdir = self._carry, getattr(self, "_certdir", None)
+        if carry is None or certdir is None:
+            return
+        if not write_carry_file(certdir, _SUCCESSOR_FLIGHT_FILE, {
+                "holder": os.getpid(), "port": self.port,
+                "successor": getattr(proc, "pid", None),
+                "predecessor": getattr(carry["before"], "pid", 0),
+                "spawned_at": carry["at"]}):
+            _log_lifecycle(
+                f"could not write {_SUCCESSOR_FLIGHT_FILE}: a launch, a heal "
+                f"or a sweep will not see the successor for port {self.port}")
+        if proc is not None:
             _log_lifecycle(
                 f"successor {proc.pid} spawned for port {self.port}: further "
                 f"asks are declined until it publishes")
-
-    def _forget_successor(self, proc) -> None:
-        """Remove the sidecar, but only while it still names ``proc``: a watch
-        that ends after a later ask wrote its own must not take that one."""
-        certdir = getattr(self, "_certdir", None)
-        rec = certdir is not None and _read_json(
-            Path(certdir) / _SUCCESSOR_FLIGHT_FILE)
-        if rec and rec.get("successor") == proc.pid:
-            write_carry_file(certdir, _SUCCESSOR_FLIGHT_FILE, None)
 
     def _retire_predecessor(self, before) -> None:
         """The successor published: the daemon it replaces is TERMed unless it
@@ -14787,7 +14852,7 @@ class PortHolder:
         teardown waits for tunnels (`_superseded_on_the_port`) and nothing here
         may end that wait."""
         certdir = getattr(self, "_certdir", None)
-        if (before is None or before.poll() is not None
+        if (not _child_running(before)
                 or is_draining(certdir, before.pid)):
             return
         _log_lifecycle(f"successor serves port {self.port} - retiring "
@@ -14795,62 +14860,75 @@ class PortHolder:
         with contextlib.suppress(OSError, ValueError):
             before.terminate()
 
-    def _give_up_on(self, proc, before) -> None:
-        """The successor did not publish in time. It ends, and the daemon that
-        was asked to hand over and is still alive is the supervised one again:
-        its exit then reads as a plain exit, and not as a handover to a daemon
-        that no longer exists. A predecessor that is gone leaves the supervisor
-        what there is."""
+    def _end_carry(self, proc, before, published: bool) -> None:
+        """The one end of a carry: the watch's `finally`, and the paths that
+        never started one. The carry and the sidecar go. WITHOUT A PUBLISH
+        (a clean exit, a failed respawn, the deadline, a stop, a raise) the
+        successor ``proc`` that is left is ended, and the daemon ``before``
+        that was asked to hand over and still lives is the supervised one
+        again: its exit then reads as a plain exit and not as a handover to a
+        daemon that no longer exists, and the port watch probes it, not a dead
+        child. A predecessor that is gone leaves the supervisor what there is."""
+        certdir = getattr(self, "_certdir", None)
         with self._replace_lock:
-            if self._stop or self._proc is not proc:
-                return
-            if before is not None and before.poll() is None:
+            if (not published and proc is not None and self._proc is proc
+                    and _child_running(before)):
                 self._proc, self.daemon_pid = before, before.pid
-        _log_lifecycle(
-            f"successor {proc.pid} did not publish for port {self.port} "
-            f"within {_RELOCATE_WAIT_S:.0f}s - ending it")
-        self._terminate_proc(proc)
+                _log_lifecycle(
+                    f"no successor published for port {self.port}: daemon "
+                    f"{before.pid} serves it again")
+            self._carry = None
+            if certdir is not None:
+                write_carry_file(certdir, _SUCCESSOR_FLIGHT_FILE, None)
+        if not published:
+            self._terminate_proc(proc)
 
     def _respawn_until_published(self, proc, deadline: float,
                                  before=None) -> None:
         """Watch the successor ``proc`` that `_on_replace_request` just spawned
         for the daemon ``before`` and spawn it again if it dies before
         `proxy.json` names its pid (T2071). Ends with the successor published
-        (``before`` is retired), given up on (ended; ``before`` serves again) or
-        no longer current.
+        (``before`` is retired) or, on every other way out, with ``before``
+        serving again (`_end_carry`).
 
         THE DAEMON THAT ASKED NO LONGER CUTS WHEN ITS WAIT RUNS OUT (T3107): it
         keeps its listener and serves on (4397803 chose the exit-75 cut over a
         keep-serving retry, and it cost every tunnel on a successor that was
         only slow). So this watch is the only owner of a successor that has not
-        published, for up to ``deadline`` (`_RELOCATE_WAIT_S`), and the sidecar
-        (`successor_in_flight`) is what tells every other sender so.
+        published, for up to ``deadline`` (`_RELOCATE_WAIT_S`), and the carry
+        (`PortHolder._carry`, the sidecar for other processes) is what tells
+        every other sender so, the backoff after a death included.
 
         ONLY A DEAD CHILD IS REPLACED, never a live one that has yet to
         publish: two daemons on one socket is the bug this class refuses to
         have. A clean exit is a decision (`_supervise_locked`) and ends the
         watch. A respawn is made under `_replace_lock`, and only while
         `self._proc` is still ``proc``: `stop()`, the supervisor (the daemon
-        left first), a later ask or a hand-off of the socket wins. `self._failures` is not climbed: its
-        cap would `degrade_now()` beside a daemon that still serves. `_backoff`
-        paces the respawns (0.5 s, 1 s, 2 s, ...) and none starts that could not
-        begin before ``deadline``.
+        left first) or a hand-off of the socket wins. `self._failures` is not
+        climbed: its cap would `degrade_now()` beside a daemon that still
+        serves. `_backoff` paces the respawns (0.5 s, 1 s, 2 s, ...) and none
+        starts that could not begin before ``deadline``.
         """
         import subprocess
 
         certdir = getattr(self, "_certdir", None)
         attempt = 0
+        published = False
         try:
             while certdir is not None and not self._stop:
                 rec = read_daemon_state(certdir)
                 if rec and int(rec.get("pid") or 0) == proc.pid:
+                    published = True
                     self._retire_predecessor(before)
                     return
                 try:
                     code = proc.wait(timeout=0.1)
                 except subprocess.TimeoutExpired:
                     if time.monotonic() >= deadline:
-                        self._give_up_on(proc, before)
+                        _log_lifecycle(
+                            f"successor {proc.pid} did not publish for port "
+                            f"{self.port} within {_RELOCATE_WAIT_S:.0f}s - "
+                            f"ending it")
                         return
                     continue
                 attempt += 1
@@ -14858,7 +14936,10 @@ class PortHolder:
                 if code == 0:
                     return
                 if time.monotonic() + wait >= deadline:
-                    self._give_up_on(proc, before)
+                    _log_lifecycle(
+                        f"successor {proc.pid} exited (code {code}) and could "
+                        f"not be spawned again before the {_RELOCATE_WAIT_S:.0f}"
+                        f"s limit for port {self.port}")
                     return
                 _log_lifecycle(
                     f"successor {proc.pid} exited (code {code}) before "
@@ -14877,9 +14958,9 @@ class PortHolder:
                                        f"{exc!r}")
                         return
                     proc = self._proc
-                    self._note_successor(proc, before)
+                    self._note_carry(proc)
         finally:
-            self._forget_successor(proc)
+            self._end_carry(proc, before, published)
 
     def _supervise(self) -> None:
         """ONE THREAD, ONE LOOP (T1193): ordinary supervision and the
@@ -15075,9 +15156,11 @@ class PortHolder:
                     f"daemon {target.pid} has not answered on port "
                     f"{self.port} for {silent_s:.0f}s: putting a successor "
                     f"on the socket, then retiring it")
-                # Degraded, stopped, or a spawn that raised: it declines or
-                # logs and leaves `self._proc` alone, and terminating the only
-                # daemon with no successor would be the outage this ends.
+                # Degraded, stopped, a carry in flight, or a spawn that raised:
+                # it declines or logs and leaves `self._proc` alone, and
+                # terminating the only daemon with no successor would be the
+                # outage this ends. A successor it does spawn is carried and
+                # watched like an ask's (the supervisor stays parked on `proc`).
                 self._on_replace_request(None, None)
                 if self._proc is target:
                     continue
@@ -16340,8 +16423,8 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
 
     TAKEN WHATEVER THE CAUSE OF THE TICK, stale code or a blind mint included:
     the holder answers any ask with the socket for a waiting helper, and the
-    ordinary ask's `_SPAWN_WAIT_S` and exit 75 would cut held tunnels for a
-    successor the helper takes far longer to publish.
+    ordinary ask would wait only `_SPAWN_WAIT_S` for a successor the helper
+    takes far longer to publish, then ask again on every later tick.
 
     THIS DAEMON OUTWAITS THE HELPER (1.25 x `_RELOCATE_WAIT_S`): a successor
     the helper can still see publish is one this daemon sees too, so the
@@ -16396,9 +16479,9 @@ def _code_is_current(own: str) -> bool:
     AN ABSENT PACKAGE IS "NOT YET", NOT "CHANGED", FOR `_ABSENT_CODE_GRACE_S`
     (T2890). `uv tool install --force` empties the venv before it downloads
     the wheels. A successor cannot start without this file, so asking inside
-    the window only ends on exit 75 when it outlasts `_SPAWN_WAIT_S` (the
-    holder's respawn loop otherwise rides it out), and the next tick looks
-    again. The wait is bounded because a venv rebuilt under another
+    the window only ends the ask unanswered when it outlasts `_SPAWN_WAIT_S`
+    (the holder's respawn watch otherwise rides it out), and the next tick
+    looks again. The wait is bounded because a venv rebuilt under another
     interpreter (a different Python minor) never brings this path back: the
     new code is elsewhere and the holder's `sys.executable` finds it. The
     clock starts at the first absent read and clears when the file is there
@@ -16670,8 +16753,8 @@ def _watch_own_code(
             # stale), and it OUTRANKS every other cause of this tick: the
             # holder answers any ask with the socket for the helper, so a
             # stale-code or blind ask would otherwise wait only `_SPAWN_WAIT_S`
-            # for a successor the helper takes far longer to publish, then exit
-            # 75. READ HERE, AFTER the mint check above (the one slow step), as
+            # for a successor the helper takes far longer to publish, then ask
+            # again on every later tick. READ HERE, AFTER the mint check above (the one slow step), as
             # late as it can be before the ask. Only under a holder that can be
             # asked, never unheld.
             if (held_by_a_holder() and _holder_pid() is not None
@@ -16745,30 +16828,6 @@ def _watch_own_code(
             why = ("accept loop fd-starved" if starved
                    else "cannot mint the pinned token" if replace_for_blind
                    else "code on disk changed")
-            if replace_for_blind:
-                n = note_blind_recycle(certdir, now)
-                _log_lifecycle(
-                    f"cannot mint the pinned token ({blind_cause}; blind "
-                    f"replace #{n}) — replacing ourselves so a successor can, "
-                    "while this one keeps serving"
-                )
-            if starved:
-                _log_lifecycle(
-                    f"accept loop fd-starved for "
-                    f"{_fd_last - server._fd_starved_since:.0f}s — replacing "
-                    "ourselves so a successor can accept, while this one "
-                    "keeps serving"
-                )
-            if orphaned:
-                _log_lifecycle(
-                    "the holder above this daemon is gone — handing over so "
-                    "the successor lands under one"
-                )
-            # UNDER A HOLDER THERE IS NOTHING TO HAND OVER. The holder already
-            # owns this socket and will put the successor on it, so the whole
-            # release-spawn-drain dance below is not merely unnecessary — it
-            # takes the port OUT of the holder, and the successor is then one
-            # failed bind away from stranding every session.
             if held_by_a_holder():
                 # A SUCCESSOR THAT ALREADY SERVES THE PORT IS NOT ASKED FOR.
                 # This tick runs beside a TERM drain (it keeps ticking: three
@@ -16796,15 +16855,42 @@ def _watch_own_code(
                     os._exit(0)
                 # A SUCCESSOR THE HOLDER IS STILL BOOTING IS NOT ASKED FOR
                 # EITHER (T3107). The tick after a miss lands here: the holder
-                # wrote a sidecar when it spawned one, would decline a second
-                # ask, and the publish is taken by the arm above on a later
+                # wrote a sidecar when it took the ask, would decline a second
+                # one, and the publish is taken by the arm above on a later
                 # tick. Nothing is announced, so the listener, the drain budget
-                # and the beat stay as they were.
+                # and the beat stay as they were. BOTH ARMS COME BEFORE THE
+                # NOTES BELOW: a tick that asks nothing is no blind replace, so
+                # it neither advances the backoff nor says it did.
                 if successor_in_flight(certdir):
                     _log_lifecycle(
                         f"{why}: the holder's successor is still booting, so "
                         "nothing is asked again")
                     continue
+            if replace_for_blind:
+                n = note_blind_recycle(certdir, now)
+                _log_lifecycle(
+                    f"cannot mint the pinned token ({blind_cause}; blind "
+                    f"replace #{n}) — replacing ourselves so a successor can, "
+                    "while this one keeps serving"
+                )
+            if starved:
+                _log_lifecycle(
+                    f"accept loop fd-starved for "
+                    f"{_fd_last - server._fd_starved_since:.0f}s — replacing "
+                    "ourselves so a successor can accept, while this one "
+                    "keeps serving"
+                )
+            if orphaned:
+                _log_lifecycle(
+                    "the holder above this daemon is gone — handing over so "
+                    "the successor lands under one"
+                )
+            # UNDER A HOLDER THERE IS NOTHING TO HAND OVER. The holder already
+            # owns this socket and will put the successor on it, so the whole
+            # release-spawn-drain dance below is not merely unnecessary — it
+            # takes the port OUT of the holder, and the successor is then one
+            # failed bind away from stranding every session.
+            if held_by_a_holder():
                 # ASK WHILE STILL ACCEPTING, then leave. The socket is the
                 # holder's and cannot be handed down from here — that is what
                 # `release_listener(hand_down=True)` refuses, and rightly. But
@@ -16841,8 +16927,8 @@ def _watch_own_code(
                 # THE RECORD THE INSTANT BEFORE THE ASK — so a record that
                 # was already sitting in `proxy.json` is never mistaken
                 # for the successor this ask is about to produce. See
-                # `_await_successor_state`. A LOCAL, not loop-carried: this
-                # whole branch exits before a second pass could need it.
+                # `_await_successor_state`. A LOCAL, not loop-carried: a pass
+                # that keeps serving after a missed wait reads it afresh.
                 _pre_ask = read_daemon_state(certdir)
                 pre_ask_pid = (
                     int(_pre_ask.get("pid") or 0) if _pre_ask else None
