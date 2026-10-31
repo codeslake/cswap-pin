@@ -3653,7 +3653,8 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     kept with that bar). The bar is the slot's own `switchThreshold` when it
     has one, else the one cswap's engine switches at for ``strategy`` and
     ``threshold`` (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
-    A slot not kept is recorded with the reason, for `_affinity_pick` to say.
+    A stored 7d window with no 5h one (an account whose 5h limit is gone) is a
+    whole reading: the week is its only wall. A slot not kept is recorded with the reason, for `_affinity_pick` to say.
     Runs on a daemon thread, never a request's: a store or Keychain read can
     hang, and then only this thread does.
 
