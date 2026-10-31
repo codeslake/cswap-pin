@@ -16985,8 +16985,7 @@ def _watch_own_code(
                 # attempts ceiling below does: `/health` then says
                 # `code_watch_age_s` null, which a launch reads as a dead
                 # watchdog and repairs itself (T3100).
-                if orphan_wait_since is None:
-                    orphan_wait_since = time.monotonic()
+                orphan_wait_since = orphan_wait_since or time.monotonic()
                 if time.monotonic() - orphan_wait_since >= _RELOCATE_WAIT_S:
                     _log_lifecycle(
                         f"{why}: no successor of the new holder served the "

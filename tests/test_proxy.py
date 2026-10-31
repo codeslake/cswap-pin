@@ -20965,18 +20965,14 @@ class TestTheDaemonWatchesItsOwnCode:
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
-        # The backstop of a watchdog that does NOT give up: it ends the run
-        # from the outside, and `done` set is then the failure.
-        backstop = threading.Timer(1.0, done.set)
-        backstop.start()
-        try:
-            pin_proxy._watch_own_code(
-                _Srv(), "1", "a@example.com", certdir,
-                done, teardown=lambda reason: events.append(("teardown", reason)),
-                interval=0.01, _own_fingerprint="fp-same",
-            )
-        finally:
-            backstop.cancel()
+        # The backstop of a watchdog that does NOT give up: `done` set is then
+        # the failure.
+        threading.Timer(1.0, done.set).start()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", certdir,
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-same",
+        )
 
         assert not done.is_set(), (
             "the watchdog waited on the holder's successor until the backstop "
