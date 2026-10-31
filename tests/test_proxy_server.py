@@ -19458,7 +19458,9 @@ class TestAHandoverMidDrainDropsTheClock:
         monkeypatch.setattr(proxy, "_owed_still_moving", owed or moving)
         monkeypatch.setattr(pp, "_superseded_on_the_port",
                             lambda _c: superseded)
-        monkeypatch.setattr(pp.time, "sleep", lambda _s: None)
+        real_sleep, drain = pp.time.sleep, threading.get_ident()
+        monkeypatch.setattr(pp.time, "sleep", lambda s: (
+            real_sleep(s) if threading.get_ident() != drain else None))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             proxy.await_inflight(5.0)
@@ -19487,6 +19489,24 @@ class TestAHandoverMidDrainDropsTheClock:
         out = self._drain(tmp_path, monkeypatch, superseded=True,
                           moving_for=25)
         assert out.count("dropping the wall clock") == 1, out
+
+    def test_CONTROL_another_threads_sleep_is_not_swallowed(
+            self, tmp_path, monkeypatch):
+        """T3183: `time.sleep` is the process's, so `_drain`'s no-op stub
+        also swallowed a leaked thread's sleep and let it busy-spin. A sleep
+        on any thread but the drain's goes to the sleep that was in place."""
+        elsewhere, spawned = [], []
+        monkeypatch.setattr(time, "sleep", elsewhere.append)
+
+        def owed(_started):
+            if not spawned:
+                spawned.append(True)
+                other = threading.Thread(target=time.sleep, args=(1e6,))
+                other.start()
+                other.join()
+            return False
+        self._drain(tmp_path, monkeypatch, superseded=False, owed=owed)
+        assert 1e6 in elsewhere, elsewhere
 
     class _Tunnels:
         """A pump with one live pair that ends once the tunnel wait has asked
