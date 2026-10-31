@@ -17335,7 +17335,7 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         rig = types.SimpleNamespace(
             now=1_800_000_000.0, calls=[], during=[], reads=[], lines=[],
             at_call=[], skew=0.0, on_read=None, on_consume=None,
-            account=("2", "pin@example.com"), live="1")
+            account=("2", "pin@example.com"), live="1", outcome=outcome)
 
         class _Host(_dt.datetime):
             @classmethod
@@ -17379,10 +17379,10 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
                 rig.at_call.append(
                     [ln for ln in rig.lines if ln.startswith("can_pin ")])
                 rig.during.append(rig.provider.can_pin_cached())
-                if outcome == "ok":
+                if rig.outcome == "ok":
                     rig.stored = blob("new", new_minutes)
                     return RefreshOutcome(rig.stored, None)
-                return RefreshOutcome(None, outcome)
+                return RefreshOutcome(None, rig.outcome)
 
         pp.save_pin(certdir, "pin@example.com", "org")
         switcher = _Switcher()
@@ -17563,6 +17563,31 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         assert len([ln for ln in rig.lines
                     if "refresh transient for slot 2" in ln]) == 1, rig.lines
         assert self._transitions(rig) == [], self._transitions(rig)
+
+    def case_a_held_token_is_served_without_a_post_and_the_tick_ends_the_hold(
+            self, certdir, monkeypatch):
+        """Requests in the hold do not each re-run the failing POST (peer-host
+        log: 0.15 to 0.3 s apart, which feeds a 429, and each request waits on
+        it). Only the tick retries, within its spacing; a success ends the
+        hold."""
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)   # 7 min: fails, quietly
+        rig.advance(150)                       # 4.5 min left: in the hold
+        assert [rig.provider() for _ in range(5)] == ["old"] * 5
+        assert len(rig.calls) == 1, "a pinned request POSTed during the hold"
+        self._tick(rig, certdir, monkeypatch, False)   # past the spacing
+        assert len(rig.calls) == 2, "the tick did not retry inside the buffer"
+        self._tick(rig, certdir, monkeypatch, False)   # inside the spacing
+        assert [rig.provider() for _ in range(5)] == ["old"] * 5
+        assert len(rig.calls) == 2, rig.calls
+        rig.outcome = "ok"
+        rig.advance(125)                       # 2.4 min left, spacing over
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 3, "the tick did not retry once more"
+        assert rig.provider() == "new"
+        assert rig.provider.can_pin_cached() is True
+        assert rig.provider.blind_reason == ""
+        assert len(rig.calls) == 3, rig.calls
 
     def case_a_transient_refresh_failure_inside_the_hold_margin_is_blind(
             self, certdir, monkeypatch):
