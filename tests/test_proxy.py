@@ -11197,7 +11197,7 @@ class TestEnsureProxy:
             f"spawn path: port={port} spawned={spawned}"
         )
 
-    def case_a_held_current_code_daemon_with_a_live_watchdog_is_not_signalled(
+    def case_a_held_daemon_is_signalled_only_on_proof_its_watchdog_cannot_replace_it(
             self, tmp_path, monkeypatch):
         """T1598, T1681: `repin_current` -> `ensure_proxy` read a held,
         current-code daemon that reached the stale arm (marked `unpinnable`,
@@ -11206,16 +11206,38 @@ class TestEnsureProxy:
         held CONNECT tunnel, and under a holder the TERM gains nothing (the
         holder respawns on the same socket): the daemon's own watchdog is the
         gapless repair, for the mark and for a false `can_pin` alike, so the
-        mark is NOT a clause. A REAL daemon (`PinProxy`), because `/health`
-        naming the recorded pid and carrying the watchdog's beat is half the
-        condition. ONE ROW PER CLAUSE of the early return: the fingerprint,
-        the daemon's OWN parent being the holder (not merely some holder for
-        the certdir), the ONE `/health` answer naming the recorded pid with no
+        mark is NOT a clause. T3100: nor is the fingerprint. A launch right
+        after an install read the changed code fingerprint as a stale daemon
+        and TERMed it, 4 s before its own watchdog would have replaced it
+        successor-first (a TERM under a holder drains CAPPED at 30 s, 9 live
+        channels on lmd_dkim). A HELD daemon on STALE code is therefore left
+        alone unless `/health` PROVES its watchdog dead: a miss of the one
+        1.0 s probe, or an answer that does not name the recorded pid, proves
+        nothing (1007 ms was measured on a loaded host; a wedge is the
+        holder's own port watch's), and a live beat means the watchdog is
+        coming. An answer naming the pid with a stale or absent beat is a
+        dead watchdog (or an older daemon with no beat) on a host where
+        nothing else repairs it (`cswap run` never reaches `heal`, and the
+        port watch sees a daemon answering as itself): the base recycle runs,
+        once. T3107 owns making that arm successor-first. No signal goes out
+        for the rest: no TERM, no SIGUSR1, no spawn.
+        A REAL daemon (`PinProxy`), because `/health` naming the recorded pid
+        and carrying the watchdog's beat is half the condition. ONE ROW PER
+        CLAUSE of the early return for CURRENT code (the arm T1598 added): the
+        daemon's OWN parent being the holder (not merely some holder for the
+        certdir), the ONE `/health` answer naming the recorded pid with no
         mint stall past `_MINT_STALL_WEDGE_S`, and a watchdog beat no older
         than `_CODE_WATCH_BEAT_MAX_AGE_S` (a watchdog that died while the
         daemon kept serving repairs nothing). Each other row must still
-        recycle exactly once; a STALL, unmarked or marked, is one (the
-        watchdog never replaces on a busy mint lock)."""
+        recycle exactly once, as before; a STALL, unmarked or marked, is one
+        (the watchdog never replaces on a busy mint lock), and so is the
+        daemon's self-heal switch off. An UNHELD daemon on stale code is left
+        alone only with a live beat: its watchdog hands it down gaplessly. The
+        handover a left-alone stale daemon then makes is the watchdog's own:
+        successor bound before `release_listener`, drain budget
+        `_HANDOVER_DRAIN_SECONDS`, in
+        `case_a_launch_after_a_code_change_hands_over_successor_first_with_no_cut`
+        and `TestAHandoverMidDrainDropsTheClock`."""
         import json
         import os
 
@@ -11230,8 +11252,9 @@ class TestEnsureProxy:
         live.start()
         fp = pin_proxy.daemon_fingerprint("2", "pin@example.com")
         me = os.getpid()
-        signalled, spawned = [], []
+        signalled, spawned, sent = [], [], []
         real_probe = pin_proxy._health_probe
+        real_kill = os.kill
         max_age = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
 
         def answers(**body):
@@ -11257,6 +11280,13 @@ class TestEnsureProxy:
             pin_proxy, "_spawn_daemon",
             lambda a, e, c, **kw: spawned.append(a) or 9955)
 
+        def kill(pid, sig):
+            """A signal to anyone is recorded; the liveness probe is not one."""
+            if sig == 0:
+                return real_kill(pid, sig)
+            sent.append((pid, sig))
+        monkeypatch.setattr(os, "kill", kill)
+
         def expect(label, want, fingerprint=fp, *, mark=True, parent=4242,
                    owns=False, health=real_probe, beat=0.0):
             """`parent` is `_wedged_parent_holder`'s answer, `owns` is
@@ -11265,6 +11295,7 @@ class TestEnsureProxy:
             daemon whose watchdog never beat."""
             signalled.clear()
             spawned.clear()
+            sent.clear()
             live.__dict__.pop("_code_watch_beat", None)
             if beat is not None:
                 live._code_watch_beat = time.monotonic() - beat
@@ -11278,14 +11309,62 @@ class TestEnsureProxy:
             port = pin_proxy.ensure_proxy(self._Sw(tmp_path))[0]
             assert (port, signalled, spawned) == want, (
                 f"{label}: port={port} signalled={signalled} spawned={spawned}")
+            assert sent == [], f"{label}: signals sent: {sent}"
 
         try:
             expect("a held current-code unpinnable daemon was replaced from "
                    "here", (live.port, [], []))
-            expect("CONTROL: a stale fingerprint under a holder stopped "
-                   "recycling", (live.port, [me], []), "OTHER-FINGERPRINT")
+            # A HELD DAEMON ON STALE CODE WITH A LIVE BEAT IS ITS WATCHDOG'S
+            # (T3100): a burst of launches right after an install makes ZERO
+            # signals, never "at most one". Each launch asserts no TERM, no
+            # SIGUSR1 and no spawn, and the recorded port.
+            stale = "OTHER-FINGERPRINT"
+            for n in range(5):
+                expect(f"launch {n + 1} of 5 against a held daemon on stale "
+                       "code, live watchdog beat, signalled it or spawned",
+                       (live.port, [], []), stale)
+            # A PROVEN DEAD WATCHDOG IS NOBODY'S BUT THIS LAUNCH'S, on a host
+            # that only runs `cswap run` (no `heal`): `/health` names the pid
+            # and the beat is stale or absent. The base recycle, once.
+            expect("a held daemon on stale code with a watchdog beat older "
+                   "than the bound was left to a watchdog that is dead",
+                   (live.port, [me], []), stale, beat=max_age + 1)
+            expect("a held daemon on stale code whose watchdog never beat "
+                   "was left alone", (live.port, [me], []), stale, beat=None)
+            expect("a held daemon on stale code whose `/health` has no beat "
+                   "field (an older daemon) was left alone",
+                   (live.port, [me], []), stale,
+                   health=answers(pid=me, can_pin=False))
+            # A MISS OR ANOTHER PID IS NOT PROOF: a wedge is the holder's port
+            # watch's, and a 1.0 s miss is no evidence of anything.
+            expect("a held daemon on stale code that missed the one `/health` "
+                   "probe was signalled", (live.port, [], []), stale,
+                   health=lambda p, timeout=1.0: None)
+            expect("a held daemon on stale code answering as another pid was "
+                   "signalled", (live.port, [], []), stale,
+                   health=answers(pid=me + 1, code_watch_age_s=0.0))
+            # The base arms, untouched: what remains of the recycle below.
+            expect("CONTROL: a stale held daemon in a mint stall stopped "
+                   "recycling", (live.port, [me], []), stale,
+                   health=answers(
+                       pid=me, code_watch_age_s=0.0,
+                       mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
             expect("CONTROL: an unheld unpinnable daemon stopped recycling",
                    (9955, [me], ["2"]), parent=None)
+            # AN UNHELD STALE DAEMON WITH A LIVE BEAT is handed down by its own
+            # watchdog (gapless, `release_listener(hand_down=True)`); what that
+            # watchdog never does is repair CURRENT code, which is why the
+            # unheld unpinnable row above recycles. A dead beat, or none:
+            # it recycles.
+            expect("an unheld daemon on stale code with a live watchdog was "
+                   "signalled or replaced from here", (live.port, [], []),
+                   stale, parent=None)
+            expect("CONTROL: an unheld stale daemon with a dead watchdog "
+                   "stopped recycling", (9955, [me], ["2"]), stale,
+                   parent=None, beat=max_age + 1)
+            expect("CONTROL: an unheld stale daemon that does not answer "
+                   "stopped recycling", (9955, [me], ["2"]), stale,
+                   parent=None, health=lambda p, timeout=1.0: None)
             # An UNMARKED daemon is the same arm's other entrant (a fresh blind
             # successor starts unmarked; a cold token reads `can_pin: false`):
             # its watchdog settles both, and a TERM from here cuts them.
@@ -11333,6 +11412,9 @@ class TestEnsureProxy:
             expect("CONTROL: with the DAEMON's self-heal switch off (the "
                    "caller's unset) the leave-alone row stopped recycling",
                    (live.port, [me], []))
+            expect("CONTROL: with the DAEMON's self-heal switch off a held "
+                   "daemon on stale code stopped recycling",
+                   (live.port, [me], []), stale)
             daemon_env.clear()
             monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
             expect("the caller's own switch, off, recycled a daemon whose "
@@ -11340,6 +11422,75 @@ class TestEnsureProxy:
                    (live.port, [], []))
         finally:
             live.stop(drain=0)
+
+    def case_a_launch_after_a_code_change_hands_over_successor_first_with_no_cut(
+            self, tmp_path, monkeypatch):
+        """T3100, the two legs composed on one certdir: a launch right after
+        an install leaves the held stale daemon alone (no TERM, no spawn), and
+        that daemon's own watchdog tick then asks the holder, sees the
+        successor publish, and only THEN releases the listener and drains for
+        `_HANDOVER_DRAIN_SECONDS` (not the signal arm's 30 s cap)."""
+        import os
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        me, real_kill, events = os.getpid(), os.kill, []
+        live._code_watch_beat = time.monotonic()
+        pin_proxy.write_daemon_state(certdir, live.port, me, "OLD-INSTALL")
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [me])
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: 4242)
+        monkeypatch.setattr(
+            pin_proxy, "_kill_daemon",
+            lambda pid, *a, **k: events.append(("TERM", pid)) or True)
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda *a, **k: events.append(("spawn",)) or 9955)
+
+        def kill(pid, sig):
+            if sig == 0:
+                return real_kill(pid, sig)
+            events.append(("ask", sig))
+            pin_proxy.write_daemon_state(
+                certdir, live.port, me + 1, "NEW-INSTALL")
+        live.release_listener = lambda *a, **k: events.append(
+            ("release", pin_proxy.read_daemon_state(certdir)["pid"]))
+        live.await_inflight = lambda budget: events.append(("drain", budget))
+        monkeypatch.setattr(os, "kill", kill)
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: events.append(("exit", code)) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        try:
+            assert pin_proxy.ensure_proxy(self._Sw(tmp_path))[0] == live.port
+            assert events == [], f"the launch signalled or spawned: {events}"
+            try:
+                pin_proxy._watch_own_code(
+                    live, "2", "pin@example.com", certdir, _Ticks(),
+                    lambda *a: None, interval=0.01,
+                    _own_fingerprint="never-matches")
+            except SystemExit:
+                pass
+        finally:
+            seen = list(events)
+            del live.release_listener, live.await_inflight  # the real stop
+            live.stop(drain=0)
+        # THE RELEASE CARRIES THE PID THE RECORD NAMED WHEN IT HAPPENED: the
+        # successor's (`me + 1`), never the old daemon's.
+        assert seen == [
+            ("ask", signal.SIGUSR1), ("release", me + 1),
+            ("drain", pin_proxy._HANDOVER_DRAIN_SECONDS), ("exit", 0)], seen
 
     def case_a_health_body_that_is_not_an_object_is_no_answer(
             self, monkeypatch):
@@ -16181,6 +16332,8 @@ print("OK", port)
         from cswap_pin import proxy as pin_proxy
 
         class _Srv:
+            port = 36301
+
             def release_listener(self, hand_down=False):
                 return 7 if hand_down else None
 
@@ -16196,8 +16349,12 @@ print("OK", port)
             os, "_exit",
             lambda code: exited.append(code) or (_ for _ in ()).throw(
                 SystemExit(code)))
-        # NEVER PUBLISHES: the only record on disk stays the foreign one.
+        # NEVER PUBLISHES: the only record on disk stays the foreign one. It
+        # names OUR port and a pid `os.kill` (stubbed) reads alive, and that
+        # pid is no pin daemon of this certdir: the held branch does not take
+        # it for a successor already serving, so it still asks.
         monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
         monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
         monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
         monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
@@ -16216,6 +16373,118 @@ print("OK", port)
             f"a foreign pid already in proxy.json before the ask was read "
             f"as the successor: {exited}"
         )
+
+    def case_a_live_pin_daemon_on_another_port_is_not_a_successor_so_it_asks(
+        self, tmp_path, monkeypatch
+    ):
+        """T3100: the record names a live pin daemon of this certdir that is
+        not us, and a DIFFERENT port (a second lineage, a daemon this one never
+        replaced). Reading it as the successor released the listener and
+        exited 0 with nobody behind OUR port. The held branch asks the holder,
+        as at the base, because only a pin daemon serving THIS server's port
+        is one."""
+        from cswap_pin import proxy as pin_proxy
+
+        class _Srv:
+            port = 36301
+
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                pass
+
+        exited, signalled = [], []
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        pin_proxy.write_daemon_state(
+            tmp_path, 36302, os.getppid(), pin_proxy.daemon_fingerprint())
+        monkeypatch.setattr(
+            pin_proxy, "_pin_daemon_pids", lambda cd: [os.getppid()])
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.05,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+
+        asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
+        assert len(asks) == 1 and exited == [pin_proxy._RESTART_ME_CODE], (
+            f"a daemon on another port was read as the successor: "
+            f"asks={asks} exited={exited}")
+
+    def case_a_held_daemon_whose_successor_already_serves_asks_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """T3100, one carry: the held branch reads the port BEFORE it announces
+        and asks. The watchdog ticks beside a TERM drain (three teardown
+        entries measured on one process, the incident's successor 4 s after the
+        TERM) with stale code and a successor already published; asking again
+        made the holder spawn a second successor beside the first (`_retiring`
+        is set only by the holder's own port watch). It takes the success arm's
+        tail instead: release the listener, drain UNCAPPED, exit 0 (75 would
+        have the holder spawn another)."""
+        from cswap_pin import proxy as pin_proxy
+
+        budgets, released, announced = [], [], []
+
+        class _Srv:
+            port = 36301
+
+            def release_listener(self, hand_down=False):
+                released.append(hand_down)
+                return None
+
+            def await_inflight(self, budget):
+                budgets.append(budget)
+
+        exited, signalled = [], []
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        real_announce = pin_proxy.announce_draining
+        monkeypatch.setattr(
+            pin_proxy, "announce_draining",
+            lambda *a, **k: announced.append(1) or real_announce(*a, **k))
+        # A PIN DAEMON THAT IS NOT THIS PROCESS, ON OUR PORT: the successor.
+        pin_proxy.write_daemon_state(
+            tmp_path, 36301, os.getppid(), pin_proxy.daemon_fingerprint())
+        monkeypatch.setattr(
+            pin_proxy, "_pin_daemon_pids", lambda cd: [os.getppid()])
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.05,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+
+        asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
+        assert asks == [] and announced == [], (
+            f"asked a holder for a successor with one serving: {asks}, "
+            f"announced={announced}")
+        assert exited == [0] and released == [False] and budgets == [
+            pin_proxy._HANDOVER_DRAIN_SECONDS], (
+            f"exits={exited} released={released} budgets={budgets}: the "
+            f"superseded tail is release, drain uncapped, exit 0")
 
     def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
         """WHY the case above is the only shape available, not a preference.
@@ -35383,8 +35652,8 @@ else:
         `_HEAL_LOCK_WAIT_S` ends it quietly (another spawn or relocation is
         running), and so does a daemon that is not denied, and one whose
         recorded fingerprint is not this code's (a redeploy since the launch
-        that started the helper: every launch arm required the match, and the
-        launch recycles that daemon instead)."""
+        that started the helper, or the held-daemon arm that starts it for a
+        daemon its own watchdog is about to replace)."""
         from cswap_pin import proxy as pp
 
         pp.write_daemon_state(

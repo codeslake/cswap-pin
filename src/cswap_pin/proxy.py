@@ -10343,9 +10343,10 @@ def relocate_main(certdir: Path, account_num: str, email: str) -> None:
         with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             st = read_daemon_state(certdir)
             # THE RECORD IS RE-READ UNDER THE LOCK, so it may be another
-            # daemon's than the launch saw: every arm that starts this helper
-            # required the fingerprint (`/health` carries none), and a daemon
-            # of other code is the launch's to recycle, not to move.
+            # daemon's than the launch saw, and `ensure_proxy`'s held-daemon
+            # arm starts this helper for a daemon of other code too. `/health`
+            # carries no fingerprint, so the record's is the check: a daemon of
+            # other code is its own watchdog's to replace, not to move.
             health = (st and st.get("fingerprint") == daemon_fingerprint()
                       and _health_body(int(st["port"])))
             if health and (os.environ.get(_RELOCATE_ENV) == "1"
@@ -10621,7 +10622,10 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
 
         # A daemon exists but is stale (wrong account, or redeployed code) —
         # recycle it before spawning, so a redeploy/repin takes effect instead
-        # of a stale daemon serving forever.
+        # of a stale daemon serving forever. A daemon on stale code replaces
+        # itself (held: unless `/health` proves its watchdog dead; unheld: with
+        # a live beat), and the arm below leaves it to that; this launch
+        # recycles the rest.
         stale = read_daemon_state(certdir)
         # "Alive" is not "still ours". An unclean exit leaves proxy.json
         # behind, and a pid is reused freely — so liveness alone would aim
@@ -10662,25 +10666,55 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # handovers) while the daemon keeps serving, and then nothing
             # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
             # absent (an older daemon) reads as dead.
-            # A missing clause takes the path below: a STALL, unmarked or
-            # marked (the watchdog never replaces on a busy mint lock, nor
-            # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
-            # parent is not the holder (`_holder_owns` is only "some holder
-            # exists"; an unheld watchdog never repairs current code), one
-            # whose `/health` does not name its pid (wedged), one whose
-            # watchdog beat is stale or absent (an older daemon).
+            # A HELD DAEMON ON STALE CODE IS LEFT ALONE UNLESS `/health` PROVES
+            # ITS WATCHDOG DEAD (T3100): a launch right after an install lands
+            # inside the watchdog's tick, and its TERM drained capped (30 s, 9
+            # live channels) 4 s before the watchdog would have replaced the
+            # daemon successor-first. A live beat is that tick coming. A miss
+            # of the one 1.0 s probe (1007 ms was measured on a loaded host,
+            # T1935) or an answer naming another pid proves nothing, and a
+            # wedge is the holder's own port watch's, which does not probe a
+            # successor while a predecessor drains (T3107 owns that gap). An
+            # answer that names the
+            # pid with a stale or absent beat IS the proof (a watchdog that
+            # died with the daemon serving, or an older daemon with no beat),
+            # and nothing else repairs it on a host that only uses `cswap run`:
+            # `heal` is not reached from there, and the port watch sees a
+            # daemon answering as itself. That one takes the recycle below.
+            # An UNHELD daemon on stale code is left alone only with a live
+            # beat: its watchdog hands it down gaplessly
+            # (`release_listener(hand_down=True)`, the successor bound before
+            # the drain), and a TERM here would cut what that hand-down keeps.
+            # A missing clause takes the path below (`_recycle_daemon`: a TERM,
+            # and under a holder the capped signal drain; T3107 owns it): a
+            # STALL, unmarked or marked (the watchdog never replaces on a busy
+            # mint lock, nor clears the mark there), the daemon's self-heal
+            # switch off, a daemon of CURRENT code whose OWN parent is not the
+            # holder (`_holder_owns` is only "some holder exists"; an unheld
+            # watchdog never repairs current code), one whose `/health` does
+            # not name its pid (wedged), one whose watchdog beat is stale or
+            # absent (an older daemon); the last two for an unheld daemon on
+            # stale code too, and for a held one on stale code only when
+            # `/health` DID name its pid.
+            port_ok = isinstance(stale.get("port"), int)
+            stale_code = stale.get("fingerprint") != fp
+            held = _wedged_parent_holder(
+                int(stale["pid"]), certdir) is not None
+            health = (_health_body(stale["port"])
+                      if port_ok and (held or stale_code) else None)
+            named = (health is not None
+                     and health.get("pid") == int(stale["pid"]))
             if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
                  or "").lower() not in ("off", "0", "no")
-                    and stale.get("fingerprint") == fp
-                    and isinstance(stale.get("port"), int)
-                    and _wedged_parent_holder(
-                        int(stale["pid"]), certdir) is not None
-                    and (health := _health_body(stale["port"])) is not None
-                    and health.get("pid") == int(stale["pid"])
-                    and not _mint_stalled(health)
-                    and isinstance(beat_age := health.get("code_watch_age_s"),
-                                   (int, float))
-                    and beat_age <= _CODE_WATCH_BEAT_MAX_AGE_S):
+                    and port_ok
+                    and not (health is not None and _mint_stalled(health))
+                    and ((held and stale_code and not named)
+                         or ((held or stale_code)
+                             and named
+                             and isinstance(
+                                 beat_age := health.get("code_watch_age_s"),
+                                 (int, float))
+                             and beat_age <= _CODE_WATCH_BEAT_MAX_AGE_S))):
                 # ITS OWN WATCHDOG IS THE REPAIR, unless it is blind because
                 # its lineage is refused the Keychain: no successor of that
                 # lineage can mint either, so the socket moves into ours.
@@ -11167,7 +11201,7 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
             ["ps", "-ww", "-axo", "pid=,command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return pids
     for line in out.splitlines():
         line = line.strip()
@@ -13278,7 +13312,8 @@ def _host_package_dir() -> "Path | None":
 def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     """Identity of the code the daemon RUNS — this package and the host
     package it borrows from — so a redeploy of either makes a running daemon
-    stale and the launcher recycles it; mirrors the fingerprint staleness a
+    stale and it is replaced: by its own code watchdog, or by the launcher or
+    `heal` when the watchdog is dead; mirrors the fingerprint staleness a
     sibling proxy's ensure step uses.
 
     IT NAMED `pin_proxy.py` UNTIL 0.1.104, which is where this code lived
@@ -15927,6 +15962,32 @@ def _superseded_on_the_port(certdir: Path) -> bool:
     return pid != os.getpid() and _pid_alive(pid)
 
 
+def _successor_serves_the_port(certdir: Path, port) -> bool:
+    """Whether ``proxy.json`` names a pin daemon of THIS certdir, not us, that
+    serves ``port``: `_superseded_on_the_port` narrowed to what releasing the
+    listener can act on.
+
+    That one reads "a live pid that is not me", so a record from a second
+    lineage on another port, a reused pid or a pid-namespace neighbour sharing
+    $HOME all read as a successor, and the watchdog's held branch then released
+    the listener and exited 0 with nothing behind the port (dark until the
+    holder's port watch notices, 90-155 s). `ps` cannot see a pid in another
+    namespace: that reads False and the branch asks the holder, as at the base.
+    The drain keeps the loose reading, and a false answer there costs more than
+    a clock. It takes a TERM plus a foreign record: the TERMed held daemon then
+    stays past its 30 s ceiling with its listener already released, so nothing
+    serves the port and the holder cannot respawn it until the port watch acts,
+    90-155 s on.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        pid = int(st["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (pid != os.getpid() and st["port"] == port
+            and pid in _pin_daemon_pids(certdir))
+
+
 def _release_daemon_state(certdir: Path) -> bool:
     """Drop ``proxy.json`` if it still names us. True when it names SOMEONE
     ELSE — i.e. we were superseded and must touch nothing further.
@@ -16194,9 +16255,11 @@ def _watch_own_code(
     """Hand over to a successor when this module's code is replaced on disk.
 
     WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
-    `ensure_proxy` recycles a stale daemon, but only when a new session starts.
-    A machine whose sessions are all already running never launches, so an
-    upgrade never reaches the process. Measured: a daemon served
+    `ensure_proxy` leaves a stale daemon to this watchdog and recycles it
+    only when this watchdog provably cannot repair it (no live beat, a mint
+    stall, the self-heal switch off; the last two recycle WITH a live beat),
+    and only when a new session starts. A machine whose sessions are all already running never
+    launches, so an upgrade never reaches the process. Measured: a daemon served
     for 22 hours on code that had been replaced 19 hours earlier, across six
     releases, dialling direct instead of chaining — every claude.ai handshake
     got the corporate MITM leaf and OAuth login was broken the whole time.
@@ -16513,6 +16576,30 @@ def _watch_own_code(
             # takes the port OUT of the holder, and the successor is then one
             # failed bind away from stranding every session.
             if held_by_a_holder():
+                # A SUCCESSOR THAT ALREADY SERVES THE PORT IS NOT ASKED FOR.
+                # This tick runs beside a TERM drain (it keeps ticking: three
+                # teardown entries on one process, and the incident's successor
+                # came 4 s after the TERM) with stale code; `_retiring` is set
+                # only by the holder's own port watch, so a second ask spawns a
+                # second successor beside the first, two acceptors on one
+                # socket. Leave through the same tail as the success arm below:
+                # release, drain UNCAPPED, exit 0 (75 would have the holder
+                # spawn another). Beside a TERM drain this is harmless:
+                # `release_listener` tolerates a second call, and two uncapped
+                # drains over the same replies and tunnels end together.
+                # A PIN DAEMON ON OUR PORT, NOT A LIVE PID: exit 0 here with
+                # nobody behind the port is an outage, so a record of another
+                # port, a reused pid or a pid that is no pin daemon asks.
+                if _successor_serves_the_port(
+                        certdir, getattr(server, "port", None)):
+                    _log_lifecycle(
+                        f"{why}: a successor already serves the port, so "
+                        "nothing is asked: leaving it the port while we "
+                        "finish what we hold"
+                    )
+                    server.release_listener()
+                    server.await_inflight(_HANDOVER_DRAIN_SECONDS)
+                    os._exit(0)
                 # ASK WHILE STILL ACCEPTING, then leave. The socket is the
                 # holder's and cannot be handed down from here — that is what
                 # `release_listener(hand_down=True)` refuses, and rightly. But
@@ -20962,58 +21049,15 @@ class PinProxy:
                       quiet=self.content_free_seconds(),
                       streams=streams, bridges=self.held_bridge_ids())
         beat_at = started
+        # THE REGIME THIS DRAIN IS IN, which the loop below can change: a
+        # successor taking the port drops the wall clock mid-wait, and the
+        # summary names the ceiling that applied at the END.
+        promoted = budget == float("inf")
         try:
-            # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to the
-            # ingress host the `/bridge` response names, so it is an opaque
-            # tunnel `_PUMP` drives rather than a reply anyone is owed —
-            # `_mitm` hands the debt back at the 101, correctly, because a
-            # tunnel owes no ANSWER. It is still a live channel that dies with
-            # this process.
-            #
-            # A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
-            # dropping this wait, and the fleet disproved it the same hour: pid
-            # 423760 owed nothing, left at once, and took four open connections
-            # with it, while pid 1452400 — which did owe — stayed and kept
-            # fourteen.
-            #
-            # ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer
-            # keeps its entry for ever. A tunnel quiet for the marker's own TTL
-            # cannot be told from a dead one, which is the same discriminator
-            # the reply wait uses. Uncapped arm only. The signal arm has a
-            # supervisor counting to `_DRAIN_SECONDS + 2`, and the held arm is
-            # holding the port dark.
+            # AND THE TUNNELS: `_wait_for_tunnels`, on the uncapped arm here and
+            # on a capped one a successor superseded, inside the loop below.
             if budget == float("inf"):
-                # A LIVE BRIDGE IS SERVED UNTIL IT ENDS, ON NO CLOCK. This
-                # loop once carried a deadline that released the keepalived
-                # Remote Control stream once it passed, on the reasoning that
-                # waiting can never outlast a stream that never goes quiet.
-                # It cannot, and that is the point: while this process holds
-                # the stream the session is RECEIVING through it. Releasing it
-                # turns a working channel into a deaf bridge, and Claude Code
-                # rebuilds the receive side after neither an EOF nor a reset.
-                #
-                # The silence bound is the exit that matters and it is
-                # reachable: a WEDGED peer moves no bytes, so `quiet_for`
-                # crosses the TTL and the loop leaves. Only a peer still
-                # talking holds this open, which is work, not a leak.
-                while (_PUMP.live_pairs()
-                       and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
-                    beat_draining(self._certdir,
-                                  owed=self.inflight_requests(),
-                                  live=self.live_replies(started),
-                                  quiet=self.content_free_seconds(),
-                                  streams=self.live_stream_count()
-                                  + _PUMP.live_pairs(),
-                                  bridges=self.held_bridge_ids())
-                    time.sleep(_DRAINING_BEAT_SECONDS)
-                if _PUMP.live_pairs():
-                    _log_lifecycle(
-                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
-                        f"{int(_PUMP.quiet_for())}s rather than holding this "
-                        f"process open on a wedged peer — releasing them so "
-                        f"each peer sees a clean EOF rather than the reset "
-                        f"this process exiting would give it: "
-                        f"{_PUMP.release_pairs()} released")
+                self._wait_for_tunnels(started)
             if budget > 0:
                 deadline = started + budget
                 # THE BUDGET WAS CHOSEN BEFORE THE HANDOVER EXISTED, and the
@@ -21035,7 +21079,6 @@ class PinProxy:
                 # this and CANNOT: `_HELD_DRAIN_SECONDS` is `_DRAIN_SECONDS`,
                 # so all four combinations of its arguments return 30.0. The
                 # fact has to be re-read HERE, where it can change mid-wait.
-                promoted = budget == float("inf")
                 # WHAT THE PREDICATE BUYS ON A CAPPED ARM, because
                 # `_HELD_DRAIN_SECONDS` < `_DRAIN_STALL_SECONDS` invites the
                 # reading that it buys nothing and a careful reader reached
@@ -21049,9 +21092,36 @@ class PinProxy:
                 # DURING the budget. The ceiling bounds that, and shrinking the
                 # window to reach inside it is refused on measurement: byte-free
                 # waits on completed replies reach 123s.
-                while time.monotonic() < deadline:
-                    if not self._owed_still_moving(started):
-                        break
+                # THE TUNNELS ARE WAITED ON ONCE, and then the owed replies are
+                # waited on again, on no clock: a reply that starts during a
+                # tunnel wait that can last hours is owed from then on, and
+                # leaving for the release below cut it. The uncapped arm did
+                # its tunnel wait above, so it starts with it done.
+                tunnels_waited = promoted
+                while True:
+                    if (time.monotonic() >= deadline
+                            or not self._owed_still_moving(started)):
+                        # A TERM THAT FOUND A SUCCESSOR ALREADY ON THE PORT, or
+                        # one that arrived while this drain ran, no longer holds
+                        # the port dark, and its supervisor counts the successor
+                        # (`_supervise_locked`: `self._proc is not proc`), but
+                        # the tests above end the moment nothing owed moves,
+                        # BEFORE the check below, so such a drain was never
+                        # promoted and released the tunnels it never waited on,
+                        # which Claude Code does not rebuild. READ HERE, where
+                        # the release acts on it, not carried from the loop.
+                        if tunnels_waited or not _superseded_on_the_port(
+                                self._certdir):
+                            break
+                        if not promoted:
+                            _log_lifecycle(
+                                "a successor took the port while this drain "
+                                "was running: dropping the wall clock so the "
+                                "replies already owed can finish")
+                        self._wait_for_tunnels(started)
+                        tunnels_waited = promoted = True
+                        deadline = float("inf")
+                        continue
                     if not promoted and _superseded_on_the_port(self._certdir):
                         promoted = True
                         deadline = float("inf")
@@ -21131,7 +21201,7 @@ class PinProxy:
         # infinite, and "of a infs budget" reads as a quantity nobody can act
         # on — this is the one line a later session reads to decide whether a
         # departure cost anybody a reply, so it says which regime it ran in.
-        ceiling = ("no wall-clock cap" if budget == float("inf")
+        ceiling = ("no wall-clock cap" if promoted
                    else f"a {budget:.0f}s budget")
         if cut:
             _log_lifecycle(
@@ -21157,6 +21227,68 @@ class PinProxy:
                 f" (this is the quantity `_owed_still_moving` reads)"
             )
         return cut
+
+    def _wait_for_tunnels(self, started: float) -> None:
+        """Hold this drain open while a CONNECT tunnel `_PUMP` drives is live,
+        on no clock, and leave on the tunnels' silence.
+
+        Remote Control RECEIVES over a WebSocket to the ingress host the
+        `/bridge` response names, so it is an opaque tunnel `_PUMP` drives
+        rather than a reply anyone is owed: `_mitm` hands the debt back at the
+        101, correctly, because a tunnel owes no ANSWER. It is still a live
+        channel that dies with this process.
+
+        A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
+        dropping this wait, and the fleet disproved it the same hour: pid
+        423760 owed nothing, left at once, and took four open connections with
+        it, while pid 1452400 - which did owe - stayed and kept fourteen.
+
+        ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer keeps
+        its entry for ever. A tunnel quiet for the marker's own TTL cannot be
+        told from a dead one, which is the same discriminator the reply wait
+        uses.
+
+        UNCAPPED ARM, AND A CAPPED ONE A SUCCESSOR SUPERSEDED. Where nothing
+        serves the port, the signal arm has a supervisor counting to
+        `_DRAIN_SECONDS + 2` and the held arm is holding the port dark; where
+        one does, a holder's `_supervise` counts the successor, not this
+        process (`_proc` is the successor), and `_kill_daemon` and the sweep
+        spare a marker that beats, which the beat below keeps. ONE CLOCK
+        REMAINS: the holder's port watch, for a daemon it found wedged, puts a
+        successor on the socket and then TERMs this process and KILLs it at
+        `_DRAIN_SECONDS + 2` (`_wait_for_exit`, `_terminate_proc`), so the wait
+        here cannot outlast that.
+        """
+        # A LIVE BRIDGE IS SERVED UNTIL IT ENDS, ON NO CLOCK. This loop once
+        # carried a deadline that released the keepalived Remote Control stream
+        # once it passed, on the reasoning that waiting can never outlast a
+        # stream that never goes quiet. It cannot, and that is the point: while
+        # this process holds the stream the session is RECEIVING through it.
+        # Releasing it turns a working channel into a deaf bridge, and Claude
+        # Code rebuilds the receive side after neither an EOF nor a reset.
+        #
+        # The silence bound is the exit that matters and it is reachable: a
+        # WEDGED peer moves no bytes, so `quiet_for` crosses the TTL and the
+        # loop leaves. Only a peer still talking holds this open, which is
+        # work, not a leak.
+        while (_PUMP.live_pairs()
+               and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
+            beat_draining(self._certdir,
+                          owed=self.inflight_requests(),
+                          live=self.live_replies(started),
+                          quiet=self.content_free_seconds(),
+                          streams=self.live_stream_count()
+                          + _PUMP.live_pairs(),
+                          bridges=self.held_bridge_ids())
+            time.sleep(_DRAINING_BEAT_SECONDS)
+        if _PUMP.live_pairs():
+            _log_lifecycle(
+                f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
+                f"{int(_PUMP.quiet_for())}s rather than holding this "
+                f"process open on a wedged peer: releasing them so "
+                f"each peer sees a clean EOF rather than the reset "
+                f"this process exiting would give it: "
+                f"{_PUMP.release_pairs()} released")
 
     def stop(self, drain: float = 0.0) -> int:
         """Stop accepting, and optionally let in-flight requests FINISH.
