@@ -11813,6 +11813,81 @@ class TestEnsureProxyLifecycle:
         assert got == 52000            # spawned fresh
         assert killed == [os.getpid()]  # stale daemon was recycled
 
+    def _recycle_unheld(self, tmp_path, monkeypatch, *, held=False,
+                        denied=False):
+        """`ensure_proxy` recycling a stale daemon whose pid is a REAL, dead
+        process, through the real `_recycle_daemon` and `_kill_daemon`: only
+        the signal is stubbed, by an `os.kill` spy that reads the record at the
+        instant the TERM is sent. Returns (the record at that instant, the
+        recycled pid)."""
+        import os, subprocess, sys
+        from cswap_pin import proxy as pin_proxy
+        self._pin(tmp_path)
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        pin_proxy.write_daemon_state(certdir, 40001, dead.pid, "STALE-FP")
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [dead.pid])
+        monkeypatch.setattr(pin_proxy, "_health_body", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: held)
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
+                            lambda *a, **k: denied)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
+        # A holder's respawn is what the held row waits for.
+        monkeypatch.setattr(
+            pin_proxy, "_read_alive_port",
+            lambda cd, fingerprint=None: 52000 if fingerprint is None else None)
+        at_term, real_kill = [], os.kill
+
+        def kill(pid, sig):
+            if sig == 15 and pid == dead.pid:
+                at_term.append(pin_proxy.read_daemon_state(certdir))
+                return None
+            return real_kill(pid, sig)
+        monkeypatch.setattr(os, "kill", kill)
+        got = (pin_proxy.ensure_proxy(self._Sw(tmp_path)) or (None,))[0]
+        # A denied host spawns nothing and answers None, as it always did.
+        assert got == (None if denied else 52000) and len(at_term) == 1, (
+            got, at_term)
+        return at_term[0], dead.pid
+
+    def case_the_unheld_recycle_marks_the_handover_before_it_terms(
+            self, tmp_path, monkeypatch):
+        """T3131: the TERM of an unheld daemon starts a signal drain with no
+        successor to supersede it. That drain breaks on "nothing owed" at once
+        and cuts every Remote Control tunnel, before `_spawn_daemon` (which
+        wrote the mark, after the TERM) has started a holder. The mark names
+        the daemon being replaced, so the drain waits for a successor."""
+        at_term, dead = self._recycle_unheld(tmp_path, monkeypatch)
+        assert at_term and at_term.get("handover") is True, (
+            f"the record at the TERM was {at_term}: no successor was marked, "
+            "so the drain it starts has nothing to wait for")
+        assert at_term["pid"] == dead and at_term["port"] == 40001
+
+    def case_a_held_recycle_a_denied_host_and_another_daemons_record_get_no_mark(
+            self, tmp_path, monkeypatch):
+        """The held arm is the holder's (T3107): its respawn is the successor
+        and the mark would only hide the record. A host that cannot read the
+        Keychain spawns nothing, so a mark nobody fulfils would also stop the
+        daemon's own teardown from unwiring. A record naming another pid is a
+        successor's, and a rewrite would clobber its publish."""
+        from cswap_pin import proxy as pin_proxy
+        for name, kw in (("held", {"held": True}), ("denied", {"denied": True})):
+            (tmp_path / name).mkdir()
+            at_term, _dead = self._recycle_unheld(
+                tmp_path / name, monkeypatch, **kw)
+            assert at_term and not at_term.get("handover"), (name, at_term)
+        certdir = tmp_path / "other"; certdir.mkdir()
+        pin_proxy.write_daemon_state(certdir, 40002, 424242, "NEW-FP")
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: False)
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
+                            lambda *a, **k: False)
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda *a, **k: True)
+        pin_proxy._recycle_daemon(certdir, 424243)
+        assert pin_proxy.read_daemon_state(certdir) == {
+            "port": 40002, "pid": 424242, "fingerprint": "NEW-FP"}
+
 
 def _watch_blocking_phase(monkeypatch):
     """An Event that fires when `watch_refcount` enters its blocking read.
@@ -16485,6 +16560,58 @@ print("OK", port)
             pin_proxy._HANDOVER_DRAIN_SECONDS], (
             f"exits={exited} released={released} budgets={budgets}: the "
             f"superseded tail is release, drain uncapped, exit 0")
+
+    def case_an_unheld_daemon_already_stopped_hands_nothing_down(
+        self, tmp_path, monkeypatch
+    ):
+        """T3131: an unheld daemon a launch TERMed now drains for up to
+        `_RELOCATE_WAIT_S`, waiting for the successor the launch marked, and
+        `done` is set only when that drain ends. The watchdog keeps ticking
+        beside it (30 s, against a wait that can last minutes), and a tick on
+        stale code, an orphaned daemon or a blind one took the hand-down: a
+        second release (no socket left to pass), then `_spawn_daemon` with
+        `listen_fd=None`, a SECOND successor beside the launch's that rewrote
+        the first one's record with the handover mark. The starved branch
+        already declines on `_stop`; this declines on it too, under the spawn
+        lock, so a tick queued behind the launch's own spawn is covered."""
+        from cswap_pin import proxy as pin_proxy
+
+        spawned = []
+
+        class _Srv:
+            port = 36301
+            _stop = True
+
+            def release_listener(self, hand_down=False):
+                # A STOPPED server has no socket left to pass down.
+                return 7 if hand_down and not self._stop else None
+
+            def await_inflight(self, budget):
+                pass
+
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon", lambda *a, **k: spawned.append(k) or 1234)
+        monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(
+            SystemExit(code)))
+        monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
+
+        def tick(srv):
+            try:
+                pin_proxy._watch_own_code(
+                    srv, "1", "a@b.c", tmp_path, self._Ticks(),
+                    lambda *a: None, interval=0.01,
+                    _own_fingerprint="never-matches")
+            except SystemExit:
+                pass
+
+        tick(_Srv())
+        assert spawned == [], (
+            f"a daemon already stopped handed down and spawned: {spawned}")
+        # CONTROL: the same tick on a daemon still accepting hands down.
+        control = _Srv()
+        control._stop = False
+        tick(control)
+        assert spawned and spawned[0].get("listen_fd") == 7, spawned
 
     def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
         """WHY the case above is the only shape available, not a preference.

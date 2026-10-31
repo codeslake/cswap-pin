@@ -10952,8 +10952,13 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     So under a holder we TERM and report "handled": the holder puts a
     successor on the socket it owns, and the code watchdog inside that
     successor retires it again if the file on disk has moved on. Without a
-    holder this is the old behaviour, unchanged — kill, and let the caller
-    spawn.
+    holder we kill and let the caller spawn, but MARK THE RECORD FIRST
+    (T3131): the TERM starts a signal drain before any successor exists, and
+    with nothing owed that drain released every tunnel within milliseconds,
+    before the caller had started a holder. The mark is the one signal it can
+    read (`PinProxy._successor_is_due`). Not on a host that cannot read the
+    Keychain: it spawns nothing, so a mark nobody fulfils would stop the
+    daemon's own teardown from unwiring.
 
     NOT `_holder_owns` ALONE. That matches `--hold-port` argv only, and a
     standby PROMOTED IN PLACE (`_standby_revive`) never re-execs — its argv
@@ -10966,6 +10971,12 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     branch stopped `and`-ing `_holder_owns` in.
     """
     held = _holder_owns(certdir) or _wedged_parent_holder(pid, certdir) is not None
+    if not held and not _keychain_denied_here():
+        # THE RECORD, NOT A STALE READ: one that names another pid is a
+        # successor's own publish, which a rewrite would clobber.
+        prev = read_daemon_state(certdir)
+        if prev and prev.get("pid") == pid:
+            _mark_handover(certdir, prev)
     _kill_daemon(pid, certdir)
     return held
 
@@ -15701,19 +15712,7 @@ def _spawn_daemon(
     if not mark_departing:
         pass  # the departing daemon is still serving: see the docstring
     elif isinstance(prev, dict) and isinstance(prev.get("pid"), int):
-        try:
-            write_daemon_state(
-                certdir, prev.get("port") or 0, prev["pid"],
-                prev.get("fingerprint") or "", handover=True,
-                # CARRIED THROUGH, NEVER INVENTED: this rewrites the
-                # DEPARTING predecessor's own record, so its capability is
-                # whatever it already was — this call cannot know the
-                # successor's, and must not claim one for a daemon that is
-                # not this one.
-                ungated=bool(prev.get(_PLAIN_RELAY_UNGATED_KEY)),
-            )
-        except OSError:
-            pass
+        _mark_handover(certdir, prev)
     else:
         try:
             (certdir / _STATE_FILE).unlink()
@@ -15825,6 +15824,27 @@ def _spawn_daemon(
     # unwire exists to prevent.
     _clear_handover_mark(certdir)
     return None
+
+
+def _mark_handover(certdir: Path, prev: dict) -> None:
+    """Rewrite ``prev``, the record of the daemon being replaced, as a handover
+    in flight: "a successor is coming". `_spawn_daemon` writes it before it
+    forks, and `_recycle_daemon` before it TERMs an unheld daemon (T3131), so a
+    drain started by that TERM can see the successor is coming. An unwritable
+    store changes nothing: the mark only ever REMOVES a cut."""
+    try:
+        write_daemon_state(
+            certdir, prev.get("port") or 0, prev["pid"],
+            prev.get("fingerprint") or "", handover=True,
+            # CARRIED THROUGH, NEVER INVENTED: this rewrites the
+            # DEPARTING predecessor's own record, so its capability is
+            # whatever it already was: this call cannot know the
+            # successor's, and must not claim one for a daemon that is
+            # not this one.
+            ungated=bool(prev.get(_PLAIN_RELAY_UNGATED_KEY)),
+        )
+    except OSError:
+        pass
 
 
 def _clear_handover_mark(certdir: Path) -> bool:
@@ -16756,6 +16776,17 @@ def _watch_own_code(
             with _spawn_lock(certdir):
                 # Another daemon may have recycled us while we queued.
                 if daemon_fingerprint() == own and not orphaned:
+                    continue
+                # A DAEMON THAT HAS ALREADY STOPPED HAS NOTHING TO HAND DOWN
+                # (T3131). A launch's TERM of an unheld daemon drains for up to
+                # `_RELOCATE_WAIT_S` waiting for its marked successor, and
+                # `done` is set only when that ends, so this watchdog ticks
+                # beside it: a second release, then a SECOND successor beside
+                # the launch's. Read under the lock, as a tick queued behind
+                # the launch's own spawn finds `_stop` set only now. The
+                # starved branch declines on it too; the held branch above
+                # is left as it is (4176ab0).
+                if getattr(server, "_stop", False):
                     continue
                 # RELEASE THE PORT, THEN DRAIN — in that order, and with the
                 # successor started in between. `stop(drain=N)` closes the
@@ -21097,10 +21128,17 @@ class PinProxy:
                 # tunnel wait that can last hours is owed from then on, and
                 # leaving for the release below cut it. The uncapped arm did
                 # its tunnel wait above, so it starts with it done.
+                # AND A SUCCESSOR A LAUNCH HAS MARKED IS WAITED FOR, not only
+                # one already on the port (`_successor_is_due`): the exit tests
+                # below fire on the first look when nothing is owed, which for
+                # a TERM of an unheld daemon is before the successor's holder
+                # has started, and they then released every tunnel.
                 tunnels_waited = promoted
                 while True:
-                    if (time.monotonic() >= deadline
-                            or not self._owed_still_moving(started)):
+                    if ((time.monotonic() >= deadline
+                         or not self._owed_still_moving(started))
+                            and (promoted
+                                 or not self._successor_is_due(started))):
                         # A TERM THAT FOUND A SUCCESSOR ALREADY ON THE PORT, or
                         # one that arrived while this drain ran, no longer holds
                         # the port dark, and its supervisor counts the successor
@@ -21227,6 +21265,28 @@ class PinProxy:
                 f" (this is the quantity `_owed_still_moving` reads)"
             )
         return cut
+
+    def _successor_is_due(self, started: float) -> bool:
+        """Whether this signal drain should keep waiting for a successor a
+        launch has marked, instead of ending on "nothing owed" and releasing
+        the tunnels it holds (T3131).
+
+        A launch that recycles an UNHELD daemon marks the record, naming this
+        daemon, before it TERMs (`_recycle_daemon`): the TERM's drain starts
+        before any successor exists and `_superseded_on_the_port` cannot say
+        one is coming until it has published. The wait ends when the successor
+        publishes (the drain is then promoted and takes `_wait_for_tunnels`),
+        when the mark is cleared (the spawn failed), or at `_RELOCATE_WAIT_S`,
+        the longest a successor was measured to take (56-85 s, T1935), and the
+        tunnels are then released as they always were. Only with a tunnel to
+        release. NOT A HELD DAEMON: its holder puts the successor on the socket
+        and T3107 owns that arm.
+        """
+        if (time.monotonic() >= started + _RELOCATE_WAIT_S
+                or held_by_a_holder() or not _PUMP.live_pairs()):
+            return False
+        st = read_daemon_state(self._certdir) or {}
+        return bool(st.get("handover")) and st.get("pid") == os.getpid()
 
     def _wait_for_tunnels(self, started: float) -> None:
         """Hold this drain open while a CONNECT tunnel `_PUMP` drives is live,
