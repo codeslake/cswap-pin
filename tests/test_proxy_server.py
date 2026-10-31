@@ -295,6 +295,47 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
     return resp.status
 
 
+def _kept_socket(proxy_port: int, ca_path: Path, host: str = "api.anthropic.com"):
+    """A TLS socket inside the proxy's CONNECT tunnel: one kept-alive client
+    connection, for a case that reads the head and the close itself."""
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+    assert b" 200 " in raw.recv(1024)
+    ctx = ssl.create_default_context(cafile=str(ca_path))
+    return ctx.wrap_socket(raw, server_hostname=host)
+
+
+def _reply_on(tls, path: str = "/v1/messages") -> "tuple[str, bytes]":
+    """Send one request on `tls`; return (head, body), the body read to its
+    Content-Length. A server that closed early shows as a short body."""
+    tls.sendall(f"POST {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                "Authorization: Bearer t\r\nContent-Length: 2\r\n\r\n{}".encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    want = next((int(h.split(b":")[1]) for h in head.split(b"\r\n")
+                 if h.lower().startswith(b"content-length:")), 0)
+    while len(body) < want:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    return head.decode("latin1"), body
+
+
+def _server_closed(tls) -> bool:
+    """True when the server has closed `tls` (EOF), False if it is still open."""
+    tls.settimeout(2)
+    try:
+        return tls.recv(1) == b""
+    except socket.timeout:
+        return False
+
+
 def _refetch_switcher(certdir, token_for_read):
     """A switcher for `make_pin_token_provider`, shared by every T1155
     pass 3 refetch-through-the-real-provider case below (they otherwise
@@ -8951,6 +8992,95 @@ class TestKeepAlive:
         assert up.paths == sent, f"upstream saw {up.paths}"
         # pinned routes swapped, inference untouched — even when pipelined
         assert up.auths == ["Bearer PINTOKEN", "Bearer DISK", "Bearer DISK"]
+
+    def _closes_once_draining(self, certdir, proxy, path, status, body):
+        """ONE ESTABLISHED KEEP-ALIVE SOCKET, SERVING THEN HANDING OVER.
+
+        A draining daemon keeps answering on the sockets it holds, so a client
+        reaches the successor only when its pool opens a fresh one. The close
+        is announced in the head of the reply it completes and follows the
+        full body: a client never reuses a socket whose last reply said close,
+        so nothing races. Closing an idle socket instead would race the
+        client's next request onto it, and Node does not retry that reset."""
+        import cswap_pin.proxy as pp
+
+        proxy.start()
+        tls = _kept_socket(proxy.port, certdir / "ca.pem")
+        try:
+            # SERVING: the reply keeps the socket, so a second request rides it
+            head, got = _reply_on(tls, path)
+            assert head.startswith(status) and got == body, head
+            assert "connection: close" not in head.lower(), head
+            done = pp.announce_draining(certdir, os.getpid())
+            try:
+                head, got = _reply_on(tls, path)
+            finally:
+                done()
+            assert head.startswith(status), head
+            assert got == body, "the reply was cut short by the close"
+            assert "connection: close" in head.lower(), head
+            assert _server_closed(tls), "the socket outlived its last reply"
+        finally:
+            tls.close()
+            proxy.stop()
+
+    def case_a_departing_daemon_closes_a_relayed_reply(self, certdir):
+        import cswap_pin.proxy as pp
+
+        up = _KeepAliveUpstream(certdir)
+        try:
+            self._closes_once_draining(
+                certdir,
+                pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", up.port)),
+                "/v1/messages", "HTTP/1.1 200", b"{}")
+        finally:
+            up.stop()
+
+    def case_a_departing_daemon_closes_after_its_own_refusal_too(self, certdir):
+        """THE PIN'S OWN 503, written without the relay, kept the socket."""
+        import cswap_pin.proxy as pp
+
+        def stalled():
+            return None
+        stalled.mint_stalled = lambda: True
+        self._closes_once_draining(
+            certdir,
+            pp.PinProxy(certdir=certdir, pin_token_provider=stalled,
+                        upstream=("127.0.0.1", _free_port())),
+            "/v1/code/sessions", "HTTP/1.1 503", b"")
+
+    def case_a_departing_daemon_closes_after_a_dead_chain_503(self, certdir):
+        import cswap_pin.proxy as pp
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        pp.write_upstream_hint(certdir, f"http://127.0.0.1:{dead.getsockname()[1]}")
+        dead.close()
+        self._closes_once_draining(
+            certdir,
+            pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                        upstream=("127.0.0.1", _free_port()),
+                        rediscover_chain=True),
+            "/v1/messages", "HTTP/1.1 503", b"")
+
+    def case_a_departing_daemon_closes_after_an_artifact_403(self, certdir):
+        import cswap_pin.proxy as pp
+
+        for draining in (False, True):
+            a, b = socket.socketpair()
+            done = pp.announce_draining(certdir, os.getpid()) \
+                if draining else None
+            try:
+                kept = pp.PinProxy._artifact_403(a, close=False)
+                head = b.recv(4096).decode("latin1").lower()
+            finally:
+                a.close()
+                b.close()
+                if done:
+                    done()
+            assert kept is not draining, (draining, head)
+            assert ("connection: close" in head) is draining, head
 
 
 class _WebSocketUpstream:

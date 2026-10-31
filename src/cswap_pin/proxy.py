@@ -23294,6 +23294,9 @@ class PinProxy:
         long as the pin cannot mint, and sharing the budget would let that
         burst swallow the next blind-mint line above.
         """
+        # A DEPARTING DAEMON'S ANSWER ENDS ITS SOCKET, as `_relay_response`'s
+        # does: the MITM loop would otherwise serve the next request on it.
+        close = close or this_process_is_draining()
         now = time.monotonic()
         slot = ("_policy_refused_at" if _is_policy_route(path)
                 else "_stall_refused_at")
@@ -23315,7 +23318,7 @@ class PinProxy:
             )
         except OSError:
             pass
-        return True
+        return not close
 
     def _warn_unpinnable(self) -> None:
         """Say once, on stderr, that the pin is not being applied.
@@ -24579,14 +24582,16 @@ class PinProxy:
         except NoChainHopError:
             # No hop and no direct: a retryable answer, not a dropped
             # connection and never the inspector's 403.
+            close = this_process_is_draining()  # see `_relay_response`
             try:
                 tls.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
-                    b"Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                    b"Content-Length: 0\r\nConnection: "
+                    + (b"close" if close else b"keep-alive") + b"\r\n\r\n"
                 )
             except OSError:
                 return False
-            return True
+            return not close
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
             if k.lower() == "connection" and "close" in v.lower():
@@ -24622,6 +24627,7 @@ class PinProxy:
         failing (its client rebuild is 401-only, and `authentication_failed`
         kills a subagent); a 403 is what these routes already give it. Never
         a resend as the active account. True when the connection lives on."""
+        close = close or this_process_is_draining()  # see `_relay_response`
         try:
             sock.sendall(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: "
