@@ -14752,9 +14752,10 @@ class PortHolder:
             # THE DAEMON THAT SERVES, never a dead child: it is what a give-up
             # hands the supervision back to and what a publish retires. A dead
             # `self._proc` is the supervisor's to respawn, not ours to replace.
+            self._carry = {"before": None, "at": time.time()}
             prior = getattr(self, "_proc", None)
             before = prior if _child_running(prior) else None
-            self._carry = {"before": before, "at": time.time()}
+            self._carry["before"] = before
             # ponytail: a SIGTERM (`_cleanup`, see `_install_signal_teardown`)
             # nested INSIDE this call, between `_spawn`'s `Popen()` and its
             # `self._proc = proc` (T1401), leaves the successor unassigned
@@ -15159,6 +15160,14 @@ class PortHolder:
                         and (read_daemon_state(self._certdir) or {}).get(
                             "pid") != target.pid):
                     continue
+                # A CLEAN EXIT IS A DECISION, NOT A FAILURE (T3107): a dead
+                # successor that exited 0 is repaired only while the pin still
+                # names this port, as `_supervise_locked` would at `proc`'s
+                # exit. Otherwise it is left to that exit.
+                if (target is not proc and not _child_running(target)
+                        and getattr(target, "returncode", 0) == 0
+                        and not self._pin_still_wanted()):
+                    continue
                 _log_lifecycle(
                     f"daemon {target.pid} has not answered on port "
                     f"{self.port} for {silent_s:.0f}s: putting a successor "
@@ -15179,6 +15188,28 @@ class PortHolder:
             # Outside the lock, which a `stop()` or a SIGUSR1 ask waits on.
             # TERM, `_DRAIN_SECONDS + 2`, then KILL: what `_kill_daemon` does.
             self._terminate_proc(target)
+
+    def _pin_still_wanted(self) -> bool:
+        """Whether a clean daemon exit is answered with a respawn on the held
+        port: the self-heal switch, the pin still naming this port, and a pin
+        set. The supervisor's gates, and the port watch's for a parked
+        successor that exited 0 (T3107). Never raises: a ``load_pin`` that
+        does reads as cleared, because both callers run in the supervisor
+        thread, which an escaping exception would end."""
+        certdir = getattr(self, "_certdir", None)
+        try:
+            return bool(
+                certdir is not None
+                and self._self_heal_on()
+                and _standby_port_still_wanted(certdir, self.port)
+                and load_pin(certdir.parent)
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log_lifecycle(
+                f"could not tell whether the pin is still set ({exc!r}); "
+                f"releasing port {self.port} rather than leaving the "
+                f"standby thinking a dead supervisor is still watching it")
+            return False
 
     def _supervise_locked(self, proc, code: int) -> str:
         """One `_supervise` iteration's decision, taken under
@@ -15274,22 +15305,7 @@ class PortHolder:
             # "holder alive" to the standby forever, port held, nothing
             # supervising it. `stop()` is the same release a genuinely
             # unpinned clean exit takes.
-            certdir = getattr(self, "_certdir", None)
-            try:
-                pinned = bool(
-                    certdir is not None
-                    and self._self_heal_on()
-                    and _standby_port_still_wanted(certdir, self.port)
-                    and load_pin(certdir.parent)
-                )
-            except Exception as exc:  # noqa: BLE001 — see above
-                _log_lifecycle(
-                    f"could not tell whether the pin is still set "
-                    f"({exc!r}) — releasing port {self.port} rather than "
-                    f"leaving the standby thinking a dead supervisor is "
-                    f"still watching it")
-                pinned = False
-            if pinned:
+            if self._pin_still_wanted():
                 _log_lifecycle(
                     f"daemon {self.daemon_pid} exited cleanly but the pin "
                     f"is still set — respawning on the held port "

@@ -4958,6 +4958,46 @@ class TestAHeldDaemonThatStoppedAccepting:
             predecessor.exit()
             holder.stop()
 
+    def case_a_parked_successor_that_exited_clean_is_repaired_only_while_the_pin_is_wanted(
+            self, tmp_path, monkeypatch):
+        """T3107: a clean exit is a decision, not a failure. The parked arm
+        repaired ANY dead successor, so one that exited 0 (the owner cleared
+        the pin, or it moved to another held port) was respawned every bound
+        for as long as the predecessor drained. It takes the supervisor's own
+        three gates now (`_pin_still_wanted`), and a failing one leaves the
+        exit to the supervisor, which reads it when the predecessor exits.
+        CONTROL: with the pin wanted again the same dead successor IS
+        repaired."""
+        from cswap_pin import proxy as pp
+
+        pin = {"set": None}
+        monkeypatch.setattr(pp, "load_pin", lambda root: pin["set"])
+        holder, log = self._drive(tmp_path, monkeypatch, bound=0.5,
+                                  drain=True, answer_pid=lambda: None)
+        predecessor = holder._proc
+        try:
+            holder._spawn()
+            holder._proc.returncode = 0     # `_Proc.exit` exits 75
+            holder._proc._ev.set()
+            time.sleep(2.0)
+            assert log.count("spawn") == 2, (
+                f"a successor that exited 0 with the pin cleared was "
+                f"respawned: {log}")
+            pin["set"] = ("a@b.c", "org-1")
+            pp.write_daemon_state(tmp_path, holder.port + 1, 4243, "fp")
+            time.sleep(2.0)
+            assert log.count("spawn") == 2, (
+                f"a successor that exited 0 was respawned on a port the pin "
+                f"no longer names: {log}")
+            pp.write_daemon_state(tmp_path, holder.port, 4243, "fp")
+            self._until(lambda: log.count("spawn") == 3, 10)
+            assert log.count("spawn") == 3, (
+                f"the pin is wanted and the dead successor was not "
+                f"repaired: {log}")
+        finally:
+            predecessor.exit()
+            holder.stop()
+
     def case_a_replace_ask_after_the_retired_predecessor_exited_spawns(
             self, tmp_path, monkeypatch):
         """The decline holds only while the retired daemon drains. The ask
@@ -38778,6 +38818,33 @@ class TestASuccessorInFlightIsNamedByASidecar:
             real(self)
 
         monkeypatch.setattr(type(h), "_spawn", spawn)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the outer ask started
+        assert nested and len(h.spawned) == 1, (
+            f"the nested ask spawned beside the outer one: {h.spawned}")
+
+    def test_a_signal_ask_nested_in_the_liveness_poll_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """`_child_running(prior)` polls (a `waitpid`) between the carry check
+        and the carry's set, and the handler runs on the main thread: a
+        SIGUSR1 landing there saw no carry and spawned a successor with its
+        own watch, then the outer frame spawned another over it. The carry is
+        set right after the check and the nested ask declines on it."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        h = self._holder(tmp_path, kid(), kid)
+        real, nested = pp._child_running, []
+
+        def running(proc):
+            if not nested:
+                nested.append(1)
+                h._on_replace_request(signal.SIGUSR1, None)
+            return real(proc)
+
+        monkeypatch.setattr(pp, "_child_running", running)
         h._on_replace_request(signal.SIGUSR1, None)
         h._stop = True      # ends the watch the outer ask started
         assert nested and len(h.spawned) == 1, (
