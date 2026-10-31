@@ -15346,12 +15346,13 @@ class TestDrainReportsWhatItCut:
                                      until we are gone, so every second here is
                                      a second with nothing serving the port.
                                      Cutting is the lesser evil
-                                     -> `_HELD_DRAIN_SECONDS`. TWO call sites
-                                     share it: no holder pid to ask at all,
-                                     and a holder that survived the ask but
-                                     whose successor never published within
-                                     the wait -- both leave the supervisor to
-                                     start the next one the slow way.
+                                     -> `_HELD_DRAIN_SECONDS`. ONE call
+                                     site: no holder pid to ask at all, which
+                                     leaves the supervisor to start the next
+                                     one the slow way. (A holder that survived
+                                     the ask but whose successor had not
+                                     published within the wait was the second;
+                                     the daemon now keeps serving there, T3107.)
 
         AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
         third constant rather than a bigger one: it is also the supervisor's
@@ -15388,14 +15389,16 @@ class TestDrainReportsWhatItCut:
         # and a port a successor already serves), its unheld branch, and the
         # caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
         # successor is serving before it drains exactly as the held branch's.
+        # ONE EXITS so a holder can start the successor the slow way (no holder
+        # pid to ask): the ask whose wait ran out keeps serving instead (T3107).
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
+            "_HELD_DRAIN_SECONDS",
         ], (
             "the exit paths no longer drain on the ceilings that fit them. "
             "Four hand over to a successor that is already serving (free to "
-            "wait) and two exit so a holder can start the successor the slow "
+            "wait) and one exits so a holder can start the successor the slow "
             "way (every second is an unserved port). Got: "
             + ", ".join(sorted(named))
         )

@@ -4621,6 +4621,17 @@ class TestAHeldDaemonThatStoppedAccepting:
         while not cond() and time.time() < deadline:
             time.sleep(0.02)
 
+    def _publishes(self, tmp_path, holder, proc):
+        """``proc`` publishes: the holder's watch takes the record and the
+        carry ends. The asks below are then the retired daemon's, declined (or
+        not) on `_retiring`; while the successor is still booting every ask is
+        declined on the carry (T3107)."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.write_daemon_state(tmp_path, holder.port, proc.pid, "fp")
+        self._until(lambda: holder._carry is None, 10)
+        assert holder._carry is None, "the carry outlived the publish"
+
     def case_a_daemon_that_never_answers_gets_its_successor_first(
             self, tmp_path, monkeypatch):
         holder, log = self._drive(tmp_path, monkeypatch, bound=1.0)
@@ -4893,6 +4904,7 @@ class TestAHeldDaemonThatStoppedAccepting:
             self._until(lambda: "terminate 4242" in log, 10)
             assert log == ["spawn", "spawn", "terminate 4242"], log
             successor = holder._proc
+            self._publishes(tmp_path, holder, successor)
             holder._on_replace_request(signal.SIGUSR1, None)
             predecessor.exit()
             time.sleep(0.3)  # its exit is read as a handover, not a crash
@@ -4900,6 +4912,88 @@ class TestAHeldDaemonThatStoppedAccepting:
                 f"the ask in the drain window spawned another successor "
                 f"beside the one the watcher put there: {log}")
             assert holder._thread.is_alive(), "the supervisor ended"
+        finally:
+            predecessor.exit()
+            holder.stop()
+
+    def case_a_parked_holder_repairs_a_published_successor_that_stopped_accepting(
+            self, tmp_path, monkeypatch):
+        """T3107: the supervisor is parked on a predecessor that drains by
+        itself for hours (its own watchdog asked, the successor published, it
+        released the listener), and the port watch only probed for ITS pid, so
+        a successor that published and then stopped accepting was repaired by
+        nobody. The same silence bound now replaces the published successor
+        (and terminates it), a successor that has NOT published is no wedge (it
+        is the respawn watch's), and the successor's own answer resets the
+        silence. The replace goes through although the predecessor still
+        drains: that decline is for the retired daemon's ASK. The REAL path,
+        with real processes and a real replacement that publishes late, is
+        `TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses`."""
+        from cswap_pin import proxy as pp
+
+        answer = {"pid": 4242}
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0,
+                                  drain=True, answer_pid=lambda: answer["pid"])
+        predecessor = holder._proc
+        try:
+            holder._spawn()     # what the draining daemon's ask did
+            successor = holder._proc
+            answer["pid"] = None
+            time.sleep(1.8)     # silent, and 4243 has published nothing
+            assert log == ["spawn", "spawn"], (
+                f"a successor that never published was replaced as wedged: "
+                f"{log}")
+            pp.write_daemon_state(tmp_path, holder.port, successor.pid, "fp")
+            answer["pid"] = successor.pid
+            time.sleep(1.8)     # it answers: the silence is reset
+            assert log == ["spawn", "spawn"], (
+                f"a published successor that answers was replaced: {log}")
+            answer["pid"] = None
+            self._until(lambda: "terminate 4243" in log, 10)
+            assert log == ["spawn", "spawn", "spawn", "terminate 4243"], (
+                f"the parked holder did not repair the wedged successor: {log}")
+            assert getattr(holder, "_retiring", None) is None, (
+                "the repair of a successor marked the predecessor retired")
+        finally:
+            predecessor.exit()
+            holder.stop()
+
+    def case_a_parked_successor_that_exited_clean_is_repaired_only_while_the_pin_is_wanted(
+            self, tmp_path, monkeypatch):
+        """T3107: a clean exit is a decision, not a failure. The parked arm
+        repaired ANY dead successor, so one that exited 0 (the owner cleared
+        the pin, or it moved to another held port) was respawned every bound
+        for as long as the predecessor drained. It takes the supervisor's own
+        three gates now (`_pin_still_wanted`), and a failing one leaves the
+        exit to the supervisor, which reads it when the predecessor exits.
+        CONTROL: with the pin wanted again the same dead successor IS
+        repaired."""
+        from cswap_pin import proxy as pp
+
+        pin = {"set": None}
+        monkeypatch.setattr(pp, "load_pin", lambda root: pin["set"])
+        holder, log = self._drive(tmp_path, monkeypatch, bound=0.5,
+                                  drain=True, answer_pid=lambda: None)
+        predecessor = holder._proc
+        try:
+            holder._spawn()
+            holder._proc.returncode = 0     # `_Proc.exit` exits 75
+            holder._proc._ev.set()
+            time.sleep(2.0)
+            assert log.count("spawn") == 2, (
+                f"a successor that exited 0 with the pin cleared was "
+                f"respawned: {log}")
+            pin["set"] = ("a@b.c", "org-1")
+            pp.write_daemon_state(tmp_path, holder.port + 1, 4243, "fp")
+            time.sleep(2.0)
+            assert log.count("spawn") == 2, (
+                f"a successor that exited 0 was respawned on a port the pin "
+                f"no longer names: {log}")
+            pp.write_daemon_state(tmp_path, holder.port, 4243, "fp")
+            self._until(lambda: log.count("spawn") == 3, 10)
+            assert log.count("spawn") == 3, (
+                f"the pin is wanted and the dead successor was not "
+                f"repaired: {log}")
         finally:
             predecessor.exit()
             holder.stop()
@@ -4916,6 +5010,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         try:
             self._until(lambda: "terminate 4242" in log, 10)
             successor = holder._proc
+            self._publishes(tmp_path, holder, successor)
             predecessor.exit()
             holder._on_replace_request(signal.SIGUSR1, None)
             assert log.count("spawn") == 3 and "terminate 4243" not in log, (
@@ -4939,6 +5034,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         try:
             self._until(lambda: "terminate 4242" in log, 10)
             successor = holder._proc
+            self._publishes(tmp_path, holder, successor)
             draining_marker_path(tmp_path, successor.pid).write_text(
                 str(time.time()))
             holder._on_replace_request(signal.SIGUSR1, None)
@@ -11219,7 +11315,9 @@ class TestEnsureProxy:
         dead watchdog (or an older daemon with no beat) on a host where
         nothing else repairs it (`cswap run` never reaches `heal`, and the
         port watch sees a daemon answering as itself): the base recycle runs,
-        once. T3107 owns making that arm successor-first. No signal goes out
+        once (T3107: where the holder can be asked it is asked instead, see
+        `test_a_launch_asks_the_holder_of_a_held_daemon_and_never_terms_it`).
+        No signal goes out
         for the rest: no TERM, no SIGUSR1, no spawn.
         A REAL daemon (`PinProxy`), because `/health` naming the recorded pid
         and carrying the watchdog's beat is half the condition. ONE ROW PER
@@ -16369,20 +16467,15 @@ print("OK", port)
             f"the holder to spawn AGAIN, on top of the successor it just made"
         )
 
-    def case_a_held_daemon_with_no_successor_takes_the_exit_75_fallback(
+    def case_a_held_daemon_whose_ask_nobody_answers_keeps_serving_and_asks_again(
         self, tmp_path, monkeypatch
     ):
-        """(a): a wait that never finds a successor takes the SAME fallback a
-        holder-less ask already takes, not a retry.
-
-        Pass 2 kept the daemon serving on a timed-out wait and rechecked on a
-        later tick -- a second recovery path duplicating what the exit-75
-        fallback (a few lines up in the source, for "no holder pid at all")
-        already does: release, drain `_HELD_DRAIN_SECONDS`, then
-        `os._exit(_RESTART_ME_CODE)`, and let the supervisor respawn.
-        `_supervise` already handles that exit correctly whether or not the
-        replace handler ever ran, so a second, home-grown recovery bought
-        nothing the fallback did not already have.
+        """(a), T3107: a wait that finds no successor no longer releases the
+        listener, drains capped and exits 75. The holder's successor may be
+        booting (56-85 s measured on a loaded host) and the cut costs every
+        held tunnel; the daemon hands the announcement back and serves on. With
+        no sidecar naming a booting successor (the ask was not heard, or the
+        holder declined it) the next tick asks again.
 
         Reproduced by never publishing a successor record at all: the ask
         lands, the holder survives it, and `_SPAWN_WAIT_S` elapses with
@@ -16390,7 +16483,7 @@ print("OK", port)
         """
         from cswap_pin import proxy as pin_proxy
 
-        released = []
+        released, budgets = [], []
 
         class _Srv:
             def release_listener(self, hand_down=False):
@@ -16398,7 +16491,7 @@ print("OK", port)
                 return 7 if hand_down else None
 
             def await_inflight(self, budget):
-                pass
+                budgets.append(budget)
 
         exited = []
         monkeypatch.setattr(
@@ -16429,27 +16522,79 @@ print("OK", port)
         assert pin_proxy.read_daemon_state(tmp_path) is None, (
             "premise: this case never publishes a successor record"
         )
-        assert exited == [pin_proxy._RESTART_ME_CODE], (
-            f"a wait that found no successor exited {exited} -- the holder "
-            f"surviving the ask proves only that IT is alive, nothing about "
-            f"a successor, and the fallback is exit "
-            f"{pin_proxy._RESTART_ME_CODE}, the same one a holder-less ask "
-            f"already takes"
+        assert exited == [] and released == [] and budgets == [], (
+            f"a wait that found no successor cut: exited={exited} "
+            f"released={released} drained={budgets} -- the successor may "
+            f"still be booting, and the daemon has lost nothing by waiting"
         )
-        assert released == [False], (
-            f"released {released} -- the fallback releases the plain way "
-            f"(`release_listener()`, no hand-down) exactly once, at the "
-            f"point it gives up, never before"
-        )
+        assert list(tmp_path.glob(".draining-*")) == [], (
+            "the drain announcement was not handed back")
         # `_pid_alive`'s own liveness probe is ALSO `os.kill(pid, 0)`, so this
         # filters to the REPLACE signal specifically -- counting every call
-        # would count that probe as a second ask.
+        # would count that probe as an ask.
         asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
-        assert len(asks) == 1, (
-            f"asked the holder {len(asks)} time(s): {signalled} -- the ask "
-            f"happens once per process, because every path out of the held "
-            f"branch exits"
+        assert len(asks) == 2, (
+            f"asked the holder {len(asks)} time(s): {signalled} -- no "
+            f"sidecar names a booting successor, so each tick asks once"
         )
+
+    def case_a_held_daemon_asks_nothing_while_the_holders_successor_boots(
+        self, tmp_path, monkeypatch
+    ):
+        """(a2), T3107: the tick after a miss finds the sidecar the holder
+        wrote when it spawned the successor, and asks nothing: not the signal
+        (the holder would decline it), not the announcement."""
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy as pin_proxy
+
+        released, exited, signalled = [], [], []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                released.append(hand_down)
+
+            def await_inflight(self, budget):
+                released.append(("drain", budget))
+
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        real_kill = os.kill
+        monkeypatch.setattr(
+            os, "kill",
+            lambda pid, sig: real_kill(pid, sig) if sig == 0
+            else signalled.append((pid, sig)))
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        booting = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            pin_proxy.write_carry_file(
+                tmp_path, pin_proxy._SUCCESSOR_FLIGHT_FILE,
+                {"holder": os.getpid(), "successor": booting.pid,
+                 "predecessor": os.getpid() + 1, "spawned_at": time.time()})
+            try:
+                pin_proxy._watch_own_code(
+                    _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
+                    lambda *a: None, interval=0.05,
+                    _own_fingerprint="never-matches",
+                )
+            except SystemExit:
+                pass
+            seen = (list(signalled), list(exited), list(released))
+        finally:
+            booting.kill()
+            booting.wait()
+        assert seen == ([], [], []), (
+            f"a tick beside a booting successor acted: signalled, exited, "
+            f"released = {seen}")
+        assert list(tmp_path.glob(".draining-*")) == [], (
+            "the tick announced a drain it was not going to start")
 
     def case_a_held_daemon_waits_for_its_successors_own_publish(
         self, tmp_path, monkeypatch
@@ -16524,10 +16669,13 @@ print("OK", port)
         """
         from cswap_pin import proxy as pin_proxy
 
+        released = []
+
         class _Srv:
             port = 36301
 
             def release_listener(self, hand_down=False):
+                released.append(hand_down)
                 return 7 if hand_down else None
 
             def await_inflight(self, budget):
@@ -16562,9 +16710,10 @@ print("OK", port)
         except SystemExit:
             pass
 
-        assert exited == [pin_proxy._RESTART_ME_CODE], (
+        assert exited == [] and released == [], (
             f"a foreign pid already in proxy.json before the ask was read "
-            f"as the successor: {exited}"
+            f"as the successor, or the wait cut: exited={exited} "
+            f"released={released}"
         )
 
     def case_a_live_pin_daemon_on_another_port_is_not_a_successor_so_it_asks(
@@ -16578,10 +16727,13 @@ print("OK", port)
         is one."""
         from cswap_pin import proxy as pin_proxy
 
+        released = []
+
         class _Srv:
             port = 36301
 
             def release_listener(self, hand_down=False):
+                released.append(hand_down)
                 return 7 if hand_down else None
 
             def await_inflight(self, budget):
@@ -16613,9 +16765,10 @@ print("OK", port)
             pass
 
         asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
-        assert len(asks) == 1 and exited == [pin_proxy._RESTART_ME_CODE], (
-            f"a daemon on another port was read as the successor: "
-            f"asks={asks} exited={exited}")
+        assert len(asks) >= 1 and exited == [] and released == [], (
+            f"a daemon on another port was read as the successor (exit 0 / "
+            f"release), or the unanswered ask cut (T3107): "
+            f"asks={asks} exited={exited} released={released}")
 
     def case_a_held_daemon_whose_successor_already_serves_asks_nothing(
         self, tmp_path, monkeypatch
@@ -16908,6 +17061,7 @@ print("OK", port)
                 self._replace_lock = threading.RLock()
                 self._srv = _FailingSrv()
                 self._certdir = tmp_path
+                self.port = 36301       # the carry's sidecar names it
                 self._account = "1"
                 self._email = "a@b.c"
                 self._replace_channel = False
@@ -17126,6 +17280,12 @@ print("OK", port)
                 )
                 self._proc = successor
                 spawn_done.set()
+
+            # NOT THIS CASE'S SUBJECT (T3107): the repair is watched now, and
+            # a watch over a stub that is never published would end the
+            # successor this case is guarding from the SUPERVISOR.
+            def _respawn_until_published(self, *args):
+                pass
 
         h = _Holder()
 
@@ -21889,6 +22049,35 @@ class TestHealRestoresWithoutRestart:
         assert spawn_calls, (
             "a dead pid on a dead port was still treated as reused")
 
+    def case_heal_spawns_nothing_beside_a_successor_the_holder_is_booting(
+        self, tmp_path, monkeypatch
+    ):
+        """T3107: the record is gone, or names a dead pid, while the holder's
+        successor boots: `_read_alive_port` says nothing serves and the spawn
+        path started a second holder for the socket the first owns. The
+        holder's sidecar defers it; with none, heal spawns."""
+        from cswap_pin import proxy as pin_proxy
+
+        root, _cfg = self._root(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        spawn_calls = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: spawn_calls.append(a) or 45678)
+        pin_proxy.write_carry_file(
+            certdir, pin_proxy._SUCCESSOR_FLIGHT_FILE,
+            {"holder": os.getpid(), "successor": None, "predecessor": 1,
+             "port": 4100, "spawned_at": time.time()})
+        for record in (None, 999999):
+            if record:
+                pin_proxy.write_daemon_state(certdir, 1, record, "FP")
+            assert pin_proxy.heal(root) is False
+            assert spawn_calls == [], (
+                f"heal spawned beside the holder's booting successor "
+                f"(record {record}): {spawn_calls}")
+        (certdir / pin_proxy._SUCCESSOR_FLIGHT_FILE).unlink()
+        pin_proxy.heal(root)
+        assert spawn_calls, "CONTROL: with no sidecar heal spawns"
+
 
 class TestTheGateDisarmsWhenThePinIsCleared:
     """Clearing the pin must remove the proxy credential.
@@ -23437,6 +23626,48 @@ class TestAWedgeIsNotTrustedForever:
             f"the bounded second pass re-asked the holder or did not TERM: "
             f"{kills!r}")
         assert not sighting.exists(), "the sighting outlived the retirement"
+
+    def case_a_bound_pass_beside_a_booting_successor_defers(
+            self, tmp_path, monkeypatch):
+        """T3107: the bound pass TERMs a daemon whose holder was asked and did
+        not publish inside `_SPAWN_WAIT_S`, so a successor that is only slow
+        (56-85 s measured) loses its predecessor's tunnels. The holder's
+        sidecar names that successor while it boots: heal sends nothing (the
+        holder TERMs the predecessor itself once the successor publishes) and
+        spawns nothing."""
+        (proxy, root, certdir, stale_pid, holder_pid, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        sighting = certdir / proxy._HEAL_DEFER_FILE
+        sighting.write_text(json.dumps(
+            {"pid": stale_pid, "fingerprint": "STALE-FP", "asked": True}))
+        old = time.time() - 3 * proxy._CODE_WATCH_INTERVAL_S
+        os.utime(sighting, (old, old))
+        proxy.write_carry_file(
+            certdir, proxy._SUCCESSOR_FLIGHT_FILE,
+            {"holder": holder_pid, "successor": 55543,
+             "predecessor": stale_pid, "spawned_at": time.time()})
+        assert proxy.heal(root) is False
+        assert kills == [], (
+            f"heal signalled beside a successor that was still booting: "
+            f"{kills!r}")
+        assert not spawn_calls, "heal spawned beside a booting successor"
+
+    def case_a_first_pass_beside_a_booting_successor_asks_nothing(
+            self, tmp_path, monkeypatch):
+        """T3107: the first pass asks the holder; a holder that already has a
+        successor booting would decline it, and the ask costs a wait of
+        `_SPAWN_WAIT_S` and an `asked` mark that bounds nothing."""
+        (proxy, root, certdir, stale_pid, holder_pid, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
+        proxy.write_carry_file(
+            certdir, proxy._SUCCESSOR_FLIGHT_FILE,
+            {"holder": holder_pid, "successor": 55543,
+             "predecessor": stale_pid, "spawned_at": time.time()})
+        assert proxy.heal(root) is False
+        assert kills == [] and not spawn_calls, (kills, spawn_calls)
 
     def case_a_drain_announced_during_the_bound_wait_is_not_a_term(
             self, tmp_path, monkeypatch):
@@ -32630,6 +32861,27 @@ class TestABlindDaemonRepairsItself:
         assert signalled == [] and exited == [], (
             "a HEALTHY pin was recycled on a timer")
 
+    def test_a_tick_beside_a_booting_successor_advances_no_blind_backoff(
+            self, monkeypatch, tmp_path):
+        """T3107: a tick that asks nothing because the holder's sidecar names
+        a booting successor is not a blind replace: it neither advances the
+        backoff (`blind-recycle.json`, which doubles the next wait) nor logs
+        "blind replace #n"."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.write_carry_file(
+            tmp_path, pin_proxy._SUCCESSOR_FLIGHT_FILE,
+            {"holder": os.getpid(), "successor": None, "predecessor": 1,
+             "port": 1, "spawned_at": time.time()})
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        self._drive_with(monkeypatch, tmp_path, self._Srv(lambda: None))
+        assert any("still booting" in m for m in said), (
+            f"premise: the tick found the sidecar: {said}")
+        assert not pin_proxy._blind_recycle_path(tmp_path).exists(), (
+            "a tick that asked nothing advanced the blind backoff")
+        assert not any("blind replace" in m for m in said), said
+
     # -- a dead refresh lineage: a successor cannot mint either ------------
 
     class _CannotMint:
@@ -36224,6 +36476,11 @@ else:
             def _terminate_proc(self, proc):
                 log.append(f"terminate {proc.pid}")
 
+            # The replace is carried and watched (T3107); the watch of a stub
+            # that never publishes is not this case's subject.
+            def _respawn_until_published(self, *args):
+                pass
+
         class _Daemon:
             pid = 111
 
@@ -36380,7 +36637,8 @@ else:
         successor the helper takes far longer to publish, and then exits 75
         (a capped drain that cuts held tunnels, and a holder that respawns on
         a socket it handed away). THE CONTROL is the same stale tick with no
-        helper: it asks the holder and takes the ordinary exit-75 fallback."""
+        helper: it asks the holder, and a miss keeps the port (T3107; it was
+        the exit-75 cut)."""
         import shutil
 
         from cswap_pin import proxy as pp
@@ -36408,8 +36666,10 @@ else:
                     bind_in_tick=True)
         finally:
             shutil.rmtree(certdir, ignore_errors=True)
-        assert exited == [pp._RESTART_ME_CODE], (
-            f"the control did not reach the ordinary arm: {exited}")
+        assert exited == [] and released == [], (
+            f"the control cut instead of keeping the port after the miss "
+            f"(T3107): released={released} exited={exited}")
+        assert signalled == [os.getppid()], "the control did not ask"
 
     def case_a_killed_draining_daemon_is_not_replaced_by_its_old_holder(
             self, tmp_path, monkeypatch):
@@ -37287,11 +37547,10 @@ class TestAHolderRespawnsASuccessorThatDiesBeforePublishing:
     shim's `_code_is_current` consumes once, so only the first daemon asks. A
     reply is held mid-body across all of it, past the capped drain.
 
-    THE LIMIT, and the last case pins it: the holder retries inside the
-    daemon's `_SPAWN_WAIT_S`. A window longer than that still ends on the
-    exit-75 fallback and still cuts. The daemon is not made to wait longer: its
-    listener is released at the bound, and the holder cannot respawn until it
-    exits (4397803).
+    THE LIMIT MOVED (T3107), and the last case pins it: the holder's watch runs
+    `_RELOCATE_WAIT_S`, not the daemon's `_SPAWN_WAIT_S`, and the daemon keeps
+    its listener past a miss (the exit-75 fallback, 4397803, cut a successor
+    that was only slow). A window longer than the daemon's wait is waited out.
     """
 
     EMAIL = "pin@example.com"
@@ -37567,26 +37826,30 @@ else:
                 f"{died} successor(s) died: the window was not several "
                 f"respawns wide\n" + t.log())
 
-    def case_a_window_longer_than_the_wait_still_cuts(self, monkeypatch):
-        """THE LIMIT. The wait is 3 s here and the window 5 s: no respawn can
-        publish in time, the daemon falls back to exit 75 and its capped drain,
-        and the held reply is cut. The holder then restarts a daemon once the
-        module is back, so the port is served again."""
+    def case_a_window_longer_than_the_wait_keeps_serving_and_takes_the_late_publish(
+            self, monkeypatch):
+        """T3107, THE LIMIT MOVED. The wait is 3 s here and the window 5 s: no
+        respawn can publish inside it. The daemon used to fall back to exit 75
+        and a capped drain and cut the held reply; it now keeps the listener,
+        serves on, and the holder (its watch runs `_RELOCATE_WAIT_S`, not the
+        daemon's wait) respawns until the module is back, takes the publish and
+        retires the daemon through an uncapped drain, so the reply completes."""
         with self._held_reply_across_a_window(
                 monkeypatch, 5.0, wait_s=3.0) as (t, rest):
             log = t.log()
-            at = [log.find(m) for m in (
-                "finding module specification",
-                "no successor published within the wait", "cut 1 in-flight")]
-            assert all(i >= 0 for i in at) and at == sorted(at), (
-                "the daemon did not fall back and cut, in that order\n" + log)
-            assert not rest.endswith(b"second\r\n0\r\n\r\n"), rest
-            again = self._until(
-                "the holder never served the port again",
+            assert "finding module specification" in log, (
+                "premise: the first successor died on the missing module\n"
+                + log)
+            assert "exiting for the holder to replace us the slow way" not in log
+            assert not re.search(r"cut \d+ in-flight", log), log
+            assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+                f"the held reply was cut: {rest!r}\n{log}")
+            late = self._until(
+                "no successor ever served the port",
                 lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
                          else None)(t.serving()), 40)
-            assert int(again["port"]) == t.port
-            self._one_daemon_is_left(t, int(again["pid"]))
+            assert int(late["port"]) == t.port, "the port moved"
+            self._one_daemon_is_left(t, int(late["pid"]))
 
     class _Child:
         """A successor as the watch sees it: dead with ``code``, or alive."""
@@ -37672,19 +37935,23 @@ else:
         h._respawn_until_published(kids[0], time.monotonic() + 5)
         assert h.spawned == 0
 
-    def case_the_watch_starts_only_on_the_daemons_own_ask(
+    def case_the_watch_starts_on_every_ask_the_holders_own_repair_included(
             self, tmp_path, monkeypatch):
+        """T3107: the port watch's repair (no signal) puts a successor on the
+        socket as an ask does, and parked on a predecessor that drains nobody
+        else supervises it: it is carried and watched too."""
         import signal
 
-        watched = []
-        kids = [self._Child(10), self._Child(11), self._Child(12)]
-        h = self._holder(tmp_path, kids)
-        h._respawn_until_published = lambda proc, deadline: watched.append(proc)
-        h._on_replace_request(None, None)       # the holder's own wedge repair
-        assert h.spawned == 1 and watched == []
-        h._on_replace_request(signal.SIGUSR1, None)
-        self._until("the daemon's ask started no watch",
-                    lambda: watched, 5)
+        for signum in (None, signal.SIGUSR1):
+            watched = []
+            kids = [self._Child(10), self._Child(11)]
+            h = self._holder(tmp_path, kids)
+            h._respawn_until_published = (
+                lambda proc, deadline, before=None: watched.append(proc))
+            h._on_replace_request(signum, None)
+            self._until(f"ask {signum} started no watch", lambda: watched, 5)
+            assert h.spawned == 1 and watched == [kids[1]], (signum, watched)
+            assert h._carry is not None, "the stub watch never ended it"
 
     def case_a_successor_that_died_is_not_logged_as_serving(
             self, tmp_path, monkeypatch):
@@ -37753,8 +38020,12 @@ else:
         with monkeypatch.context() as m:
             m.setattr(threading.Thread, "start", no_thread)
             h._on_replace_request(signal.SIGUSR1, None)
-        assert h.spawned == 1 and h._proc is kids[1] and not h._stop
+        assert h.spawned == 1 and not h._stop
         assert any("could not start the successor watch" in ln for ln in lines)
+        assert h._proc is kids[0] and h._carry is None, (
+            "an unwatched successor outlived the ask: nothing retires the "
+            "daemon it was for")
+        assert not (tmp_path / pp._SUCCESSOR_FLIGHT_FILE).exists()
 
 
 # -- T2310: the code watch's tick, for the Rule 0 sandbox's throwaway pin -------
@@ -38232,3 +38503,1038 @@ class TestConnectorRoutes:
         pp._CONNECTORS_CACHE.clear()
         assert pp.connectors_follow_pin(tmp_path / "pin-proxy") is False
         assert pp.connectors_follow_pin(None) is False
+
+
+class TestAHolderOwnsASuccessorItIsStillBooting:
+    """T3107: a successor the holder spawned and that has not published sat in
+    no record and no mark, so every other sender cut on old state. The daemons
+    waited `_SPAWN_WAIT_S` (10 s) for a publish that took 56-85 s on a loaded
+    host and then cut (the watchdog: release, a capped drain, exit 75; a launch
+    and heal: TERM) or asked again and got a second successor, and the orphan
+    sweep TERMed the booting successor itself.
+
+    REAL PROCESSES, on the seam `TestAHolderRespawnsASuccessorThatDiesBeforePublishing`
+    uses: a shim package re-points `_DAEMON_MODULE` at itself, and a marker file
+    makes every daemon after the first sleep ``BOOT_S`` before it starts, so a
+    successor is alive, holds the socket and has not published when the test
+    process's `_SPAWN_WAIT_S` (1 s) and the daemon's own (1 s) have long run out.
+    A reply is held mid-body across all of it, past the capped drain."""
+
+    EMAIL = "pin@example.com"
+    CAP_S = 3.0
+    BOOT_S = 6.0
+
+    _SHIM = '''
+import functools, os, sys, time
+from pathlib import Path
+from cswap_pin import proxy as p
+p._DAEMON_MODULE = "t3107_cswap_pin.proxy"
+p._HELD_DRAIN_SECONDS = @CAP@
+p._SPAWN_WAIT_S = @WAIT@
+p._watch_own_code = functools.partial(p._watch_own_code, interval=0.3)
+_root = Path("@ROOT@")
+if (_root / "nowatch").exists():
+    # A WATCHDOG THAT RETURNED: its beat is cleared, so /health says null.
+    p._watch_own_code = lambda server, *a, **k: setattr(
+        server, "_code_watch_beat", None)
+if (_root / "oldfp").exists():
+    p._OWN_FINGERPRINT = "t3107-old"
+if (_root / "fastwatch").exists():
+    # THE HOLDER'S PORT WATCH IN SECONDS: silence of 3 s replaces a daemon.
+    p._CODE_WATCH_INTERVAL_S = 0.3
+    p._CODE_WATCH_BEAT_MAX_AGE_S = 3.0
+    p._PORT_WATCH_PROBE_S = 1.0
+    p._PORT_WATCH_CONFIRM_S = 1.0
+_current = p._code_is_current
+def _code_is_current(own):
+    # STALE FOR THE ONE DAEMON THE FILE NAMES, so a successor does not ask.
+    try:
+        if int((_root / "stale").read_text()) == os.getpid():
+            return False
+    except (OSError, ValueError):
+        pass
+    return _current(own)
+p._code_is_current = _code_is_current
+_ask = p.PortHolder._on_replace_request
+def _on_replace_request(self, *args):
+    # THE HOLDER'S WATCH GIVES UP IN SECONDS once the file exists, read at each
+    # ask so the first successor is not held to it.
+    try:
+        p._RELOCATE_WAIT_S = float((_root / "relocate").read_text())
+    except (OSError, ValueError):
+        pass
+    return _ask(self, *args)
+p.PortHolder._on_replace_request = _on_replace_request
+a = sys.argv
+if a[1:2] == [p._HOLDER_MODULE_ARG]:
+    p.holder_main(a[3], a[4], Path(a[5]), port=int(a[2]))
+elif a[1:2] == [p._STANDBY_MODULE_ARG]:
+    p.standby_main(a[2], a[3], Path(a[4]))
+else:
+    # A SLOW BOOT: alive and holding the socket, nothing published yet.
+    if (_root / "slow").exists():
+        time.sleep(float((_root / "slow").read_text()))
+    p.daemon_main(a[1], a[2], Path(a[3]))
+'''
+
+    _Origin = TestAHolderRespawnsASuccessorThatDiesBeforePublishing._Origin
+    _until = staticmethod(TestAHolderRespawnsASuccessorThatDiesBeforePublishing._until)
+    _read_reply = staticmethod(
+        TestAHolderRespawnsASuccessorThatDiesBeforePublishing._read_reply)
+    _Sw = TestACallerOutsideTheLineageTakesTheSocketOver._Sw
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @contextlib.contextmanager
+    def _lineage(self, monkeypatch, *, nowatch=False, oldfp=False,
+                 slow_s=None, wait_s=1.0, fastwatch=False):
+        """A real holder + daemon + standby under a short scratch dir, a reply
+        held mid-body on the first daemon, and (``slow_s``) every later daemon
+        sleeping that long before it starts. ``nowatch``: the first daemon's
+        watchdog never beats, which is what sends a launch to the recycle.
+        ``oldfp``: the first daemon's record is on another fingerprint.
+        ``fastwatch``: the holder's port watch replaces a silent daemon in
+        seconds. Yields
+        ``t``; ``t.finish()`` releases the reply past the capped drain and
+        returns what the client got."""
+        import shutil
+        import subprocess
+        import sys
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        base = short_root().resolve()
+        certdir = base / "pin-proxy"
+        certdir.mkdir()
+        pkg = base / "shim" / "t3107_cswap_pin"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "proxy.py").write_text(
+            self._SHIM.replace("@ROOT@", str(base))
+            .replace("@WAIT@", str(wait_s)).replace("@CAP@", str(self.CAP_S)))
+        for name, on in (("nowatch", nowatch), ("oldfp", oldfp),
+                         ("fastwatch", fastwatch)):
+            if on:
+                (base / name).touch()
+        origin = self._Origin()
+        client = None
+        try:
+            pp.ensure_ca(certdir, "api.anthropic.com")
+            pp.save_pin(base, self.EMAIL, "org-1")
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            # THIS process's wait (a launch, a heal), shorter than the boot.
+            monkeypatch.setattr(pp, "_SPAWN_WAIT_S", 1.0)
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(base / "shim")]
+                + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+            subprocess.run(
+                [sys.executable, "-c",
+                 TestACallerOutsideTheLineageTakesTheSocketOver._LAUNCH,
+                 str(certdir / "daemon.log"), sys.executable, "-m",
+                 "t3107_cswap_pin.proxy", pp._HOLDER_MODULE_ARG, "0", "2",
+                 self.EMAIL, str(certdir)], env=env, check=True, timeout=30)
+
+            def serving():
+                st = pp.read_daemon_state(certdir)
+                body = st and pp._health_body(int(st["port"]))
+                return st if body and body.get("pid") == st["pid"] else None
+
+            st = self._until("the first daemon never served", serving, 40)
+            (base / "oldfp").unlink(missing_ok=True)
+            if slow_s:
+                (base / "slow").write_text(str(slow_s))
+            daemon = int(st["pid"])
+            client = socket.create_connection(
+                ("127.0.0.1", int(st["port"])), timeout=20)
+            client.sendall(
+                f"GET http://127.0.0.1:{origin.port}/s HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{origin.port}\r\n\r\n".encode())
+            assert b"first" in self._read_reply(client, b"first"), (
+                "premise: the reply is mid-body")
+
+            def finish():
+                # HELD PAST THE CAPPED DRAIN, so a cut is seen and a retirement
+                # that does not cut is seen not to.
+                time.sleep(self.CAP_S + 1.5)
+                origin.release.set()
+                return self._read_reply(client, b"0\r\n\r\n")
+
+            t = types.SimpleNamespace(
+                base=base, certdir=certdir, port=int(st["port"]),
+                daemon=daemon, serving=serving, finish=finish,
+                holder=pp._wedged_parent_holder(daemon, certdir),
+                log=lambda: (certdir / "daemon.log").read_text(
+                    errors="replace"),
+                booting=lambda: next(
+                    (p for p in pp._pin_daemon_pids(certdir) if p != daemon),
+                    None))
+            assert t.holder is not None, "premise: the daemon is held"
+            yield t
+        finally:
+            if client is not None:
+                client.close()
+            origin.release.set()
+            origin.srv.close()
+            _reap_pin_processes(certdir)
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _booting(self, t, timeout=20):
+        """The pid of the successor the holder started, with the log on a miss."""
+        try:
+            return self._until(
+                "the holder never started a successor", t.booting, timeout)
+        except AssertionError as exc:
+            raise AssertionError(f"{exc}\n{t.log()}") from None
+
+    def _the_successor_served_and_nothing_was_cut(self, t, booting):
+        """The booting successor publishes, THEN the held reply is released
+        past the capped drain: a retirement that cuts is seen."""
+        from cswap_pin import proxy as pp
+
+        late = self._until(
+            "the booting successor never served the port",
+            lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                     else None)(t.serving()), 60)
+        assert int(late["pid"]) == booting and int(late["port"]) == t.port, (
+            f"the serving daemon is not the one that was booting: {late}\n"
+            + t.log())
+        rest = t.finish()
+        log = t.log()
+        assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+            f"the held reply was cut: {rest!r}\n{log}")
+        assert not re.search(r"cut \d+ in-flight", log), log
+        self._until(f"exactly daemon {booting} is left",
+                    lambda: pp._pin_daemon_pids(t.certdir) == [booting], 30)
+        assert t.log().count("nofile before") == 2, (
+            "more than one successor started\n" + t.log())
+
+    def case_a_launch_asks_the_holder_once_and_cuts_nothing(self, monkeypatch):
+        """A launch finds a held daemon whose watchdog is dead (its beat is
+        absent) on another fingerprint, and the successor takes ``BOOT_S``,
+        far past the launch's 1 s wait. The base TERMed it (a capped drain,
+        the held reply cut at ``CAP_S``), waited, and spawned a second holder.
+        Now: the holder is asked once, nothing is signalled, the launch gets
+        the recorded port at once, and the one successor retires the daemon
+        after it publishes."""
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, nowatch=True, oldfp=True,
+                           slow_s=self.BOOT_S) as t:
+            port = pp.ensure_proxy(self._Sw(t.base))[0]
+            assert port == t.port, "the launch was not given the held port"
+            assert "signal SIGTERM" not in t.log(), (
+                "the launch TERMed the serving daemon\n" + t.log())
+            assert pp._health_pid(t.port) == t.daemon, (
+                "the daemon is not serving the port any more")
+            booting = self._booting(t)
+            assert t.log().count("further asks are declined") == 1, (
+                "the holder was not asked exactly once\n" + t.log())
+            assert pp.read_daemon_state(t.certdir)["pid"] == t.daemon, (
+                "the record moved before the successor published")
+            self._the_successor_served_and_nothing_was_cut(t, booting)
+
+    def case_a_watchdog_whose_wait_ran_out_serves_on_and_takes_the_late_publish(
+            self, monkeypatch):
+        """The daemon's own watchdog (1 s wait) asks, the successor boots for
+        ``BOOT_S``. No release, no capped drain, no exit 75: it serves on, the
+        following ticks see the sidecar and ask nothing, and the late publish
+        retires it without a cut."""
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, slow_s=self.BOOT_S) as t:
+            (t.base / "stale").write_text(str(t.daemon))
+            booting = self._booting(t)
+            time.sleep(2.5)     # past the daemon's 1 s wait, still booting
+            log = t.log()
+            assert pp.successor_in_flight(t.certdir), (
+                "premise: the successor is still booting\n" + log)
+            assert pp._health_pid(t.port) == t.daemon, (
+                "the daemon stopped serving after its ask timed out\n" + log)
+            assert "exiting for the holder to replace us" not in log, log
+            assert "ignored: successor" not in log, (
+                "a later tick asked the holder again\n" + log)
+            assert set(pp._pin_daemon_pids(t.certdir)) == {t.daemon, booting}, (
+                "a second successor started")
+            self._the_successor_served_and_nothing_was_cut(t, booting)
+
+    def case_an_ask_a_launch_and_a_sweep_beside_one_booting_successor_spawn_one(
+            self, monkeypatch):
+        """Two carries on one certdir: a second SIGUSR1 (the watchdog asking
+        again), a launch, and the orphan sweep (a heal's, a spawn's) all land
+        while the first successor boots. One successor in all, never TERMed."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, nowatch=True, oldfp=True,
+                           slow_s=self.BOOT_S) as t:
+            os.kill(t.holder, signal.SIGUSR1)
+            booting = self._booting(t)
+            os.kill(t.holder, signal.SIGUSR1)
+            assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            pp._sweep_orphan_daemons(t.certdir, keep_pid=t.daemon)
+            time.sleep(1.0)
+            assert booting in pp._pin_daemon_pids(t.certdir), (
+                "the sweep or the launch TERMed the booting successor\n"
+                + t.log())
+            assert "signal SIGTERM" not in t.log(), t.log()
+            assert t.log().count("further asks are declined") == 1, t.log()
+            self._the_successor_served_and_nothing_was_cut(t, booting)
+
+
+class TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses:
+    """T3107: the supervisor is parked on a predecessor that drains for hours
+    (a launch's ask put a successor on the socket, which published and retired
+    the predecessor), and the successor then STOPS ACCEPTING while its
+    process lives. The port watch must replace it, and the replacement is
+    carried and watched like an ask's: nothing else supervises it, so one
+    that dies at boot is spawned again, and a sweep or an ask meets the
+    sidecar, not an unexplained stranger.
+
+    REAL PROCESSES end to end, on `TestAHolderOwnsASuccessorItIsStillBooting`'s
+    lineage: a held reply keeps the predecessor draining, the wedge is a
+    SIGSTOP (the kernel still completes the handshake, nothing replies), the
+    replacement is killed once while it boots, and the one after it publishes
+    well past the daemons' own wait. Nothing here is set by hand: no
+    `_retiring`, no record, no marker."""
+
+    EMAIL = TestAHolderOwnsASuccessorItIsStillBooting.EMAIL
+    CAP_S = TestAHolderOwnsASuccessorItIsStillBooting.CAP_S
+    BOOT_S = 3.0
+    _SHIM = TestAHolderOwnsASuccessorItIsStillBooting._SHIM
+    _Origin = TestAHolderOwnsASuccessorItIsStillBooting._Origin
+    _until = staticmethod(TestAHolderOwnsASuccessorItIsStillBooting._until)
+    _read_reply = staticmethod(
+        TestAHolderOwnsASuccessorItIsStillBooting._read_reply)
+    _lineage = TestAHolderOwnsASuccessorItIsStillBooting._lineage
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_wedged_successor_is_replaced_and_the_replacement_is_respawned(
+            self, monkeypatch):
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, nowatch=True, oldfp=True,
+                           fastwatch=True) as t:
+            os.kill(t.holder, signal.SIGUSR1)
+            first = int(self._until(
+                "the first successor never served",
+                lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                         else None)(t.serving()), 40)["pid"])
+            # PARKED: the holder's successor retired the daemon, which drains
+            # on the held reply, and the supervisor waits on it.
+            assert t.daemon in pp._pin_daemon_pids(t.certdir), (
+                "premise: the predecessor drains")
+            (t.base / "slow").write_text(str(self.BOOT_S))
+            os.kill(first, signal.SIGSTOP)
+            try:
+                known = {t.daemon, first}
+                second = self._until(
+                    "the wedged successor was never replaced",
+                    lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                                  if p not in known), None), 60)
+                assert pp.successor_in_flight(t.certdir), (
+                    "the replacement is in no sidecar\n" + t.log())
+                # A SWEEP, MID-BOOT, IS THE ORPHAN SWEEP A HEAL OR A SPAWN RUNS.
+                pp._sweep_orphan_daemons(t.certdir, keep_pid=t.daemon)
+                assert pp._pid_alive(second), (
+                    "a sweep TERMed the replacement while it booted\n"
+                    + t.log())
+                os.kill(second, signal.SIGKILL)         # it dies at boot
+                known.add(second)
+                third = self._until(
+                    "the replacement that died was never spawned again",
+                    lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                                  if p not in known), None), 30)
+                late = self._until(
+                    "no replacement ever published",
+                    lambda: (lambda st: st if st and int(st["pid"]) == third
+                             else None)(t.serving()), 40)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(first, signal.SIGCONT)
+            assert int(late["port"]) == t.port, "the port moved"
+            rest = t.finish()
+            log = t.log()
+            assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+                f"the held reply was cut: {rest!r}\n{log}")
+            assert not re.search(r"cut \d+ in-flight", log), log
+            assert "spawning it again" in log, log
+            self._until(f"exactly daemon {third} is left",
+                        lambda: pp._pin_daemon_pids(t.certdir) == [third], 60)
+            assert pp.successor_in_flight(t.certdir) is None, (
+                "the sidecar outlived the carry")
+
+
+    def case_a_repair_that_gave_up_is_repaired_again_before_the_predecessor_exits(
+            self, monkeypatch):
+        """The wedged published successor is KILLed, its replacement never
+        publishes inside the watch's limit and is ended with it, so
+        `self._proc` is a dead child that is not the draining predecessor the
+        supervisor waits on. The port watch skipped any non-predecessor that
+        was not a live published daemon, so nothing repaired the port again:
+        dark until the predecessor exited, which a held reply makes hours."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, nowatch=True, oldfp=True,
+                           fastwatch=True) as t:
+            os.kill(t.holder, signal.SIGUSR1)
+            first = int(self._until(
+                "the first successor never served",
+                lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                         else None)(t.serving()), 40)["pid"])
+            assert t.daemon in pp._pin_daemon_pids(t.certdir), (
+                "premise: the predecessor drains")
+            (t.base / "relocate").write_text("8")
+            (t.base / "slow").write_text("60")      # the repair never publishes
+            os.kill(first, signal.SIGSTOP)
+            known = {t.daemon, first}
+            second = self._until(
+                "the wedged successor was never replaced",
+                lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                              if p not in known), None), 60)
+            os.kill(first, signal.SIGKILL)      # dead before the watch gives up
+            self._until("the repair never gave up",
+                        lambda: "did not publish for port" in t.log(), 30)
+            (t.base / "slow").unlink()          # the next one boots at once
+            known.add(second)
+            third = self._until(
+                "the port stayed dark after the repair gave up",
+                lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                              if p not in known), None), 30)
+            late = self._until(
+                "the repair that followed never published",
+                lambda: (lambda st: st if st and int(st["pid"]) == third
+                         else None)(t.serving()), 40)
+            assert int(late["port"]) == t.port, "the port moved"
+            assert t.daemon in pp._pin_daemon_pids(t.certdir), (
+                "the port was served only after the predecessor exited")
+            rest = t.finish()
+            assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+                f"the held reply was cut: {rest!r}\n{t.log()}")
+            self._until(f"exactly daemon {third} is left",
+                        lambda: pp._pin_daemon_pids(t.certdir) == [third], 60)
+            assert pp.successor_in_flight(t.certdir) is None, (
+                "the sidecar outlived the carry")
+
+
+class TestASuccessorInFlightIsNamedByASidecar:
+    """T3107: the sidecar and what reads it, with real child processes for the
+    pids (liveness is a pid's, never a clock's) and no process of the pin's."""
+
+    @pytest.fixture
+    def kid(self):
+        import subprocess
+        import sys
+
+        procs = []
+
+        def make():
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]))
+            return procs[-1]
+
+        yield make
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    @staticmethod
+    def _write(certdir, holder, successor, predecessor, at=None, port=None):
+        from cswap_pin import proxy as pp
+
+        assert pp.write_carry_file(
+            certdir, pp._SUCCESSOR_FLIGHT_FILE,
+            {"holder": holder, "successor": successor,
+             "predecessor": predecessor, "port": port,
+             "spawned_at": time.time() if at is None else at})
+
+    @staticmethod
+    def _holder(certdir, first, make):
+        """A holder whose `_spawn` starts a real child that never publishes."""
+        from cswap_pin import proxy as pp
+
+        class _H(pp.PortHolder):
+            _backoff = staticmethod(lambda failures: 0.0)
+
+            def __init__(self):
+                self._stop = False
+                self._certdir = certdir
+                self._replace_lock = threading.RLock()
+                self._proc = first
+                self.daemon_pid = first.pid
+                self.port = 1
+                self.spawned = []
+
+            def _spawn(self):
+                self._proc = make()
+                self.daemon_pid = self._proc.pid
+                self.spawned.append(self._proc)
+
+        return _H()
+
+    def test_it_reads_live_while_the_holder_lives_inside_the_ceiling(
+            self, tmp_path, kid, monkeypatch):
+        """THE HOLDER'S LIVENESS, NOT THE SUCCESSOR'S: a successor that died
+        is spawned again after a backoff, and the holder still owns the carry
+        through it (the gap is most of the T2071 crash-loop window)."""
+        from cswap_pin import proxy as pp
+
+        assert pp.successor_in_flight(tmp_path) is None, "no file"
+        (tmp_path / pp._SUCCESSOR_FLIGHT_FILE).write_text("not json")
+        assert pp.successor_in_flight(tmp_path) is None, "garbage"
+        succ, gone = kid(), kid()
+        gone.kill()
+        gone.wait()
+        self._write(tmp_path, os.getpid(), succ.pid, 1, port=4242)
+        rec = pp.successor_in_flight(tmp_path)
+        assert rec and rec["successor"] == succ.pid and rec["port"] == 4242
+        self._write(tmp_path, gone.pid, succ.pid, 1)
+        assert pp.successor_in_flight(tmp_path) is None, "the holder died"
+        self._write(tmp_path, os.getpid(), gone.pid, 1)
+        assert pp.successor_in_flight(tmp_path), "a dead successor, the backoff"
+        self._write(tmp_path, os.getpid(), None, 1)
+        assert pp.successor_in_flight(tmp_path), "spawned, no pid yet"
+        self._write(tmp_path, os.getpid(), succ.pid, 1,
+                    at=time.time() - pp._RELOCATE_WAIT_S - 1)
+        assert pp.successor_in_flight(tmp_path) is None, "past the ceiling"
+
+    def test_a_signal_ask_is_declined_while_the_successor_boots(
+            self, tmp_path, kid, monkeypatch):
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pp, "_RELOCATE_WAIT_S", 30.0)
+        first = kid()
+        h = self._holder(tmp_path, first, kid)
+        h._on_replace_request(signal.SIGUSR1, None)
+        rec = pp.successor_in_flight(tmp_path)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the first ask started
+        assert len(h.spawned) == 1, "the second ask spawned beside the first"
+        assert any("is still booting" in ln for ln in lines), lines
+        assert rec and (rec["holder"], rec["successor"], rec["predecessor"],
+                        rec["port"]) == (
+            os.getpid(), h.spawned[0].pid, first.pid, h.port)
+
+    _until = staticmethod(
+        TestAHolderRespawnsASuccessorThatDiesBeforePublishing._until)
+
+    @staticmethod
+    def _exits(code):
+        """A successor factory: a child that dies at once with ``code``."""
+        import subprocess
+        import sys
+
+        return lambda: subprocess.Popen(
+            [sys.executable, "-c", f"import sys; sys.exit({code})"])
+
+    def test_a_signal_ask_nested_in_the_spawn_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """`_replace_lock` is an RLock and the handler runs on the main
+        thread, so a second SIGUSR1 that lands inside `_spawn`'s Popen nests
+        straight through it. It saw no sidecar and spawned a second successor
+        that the outer frame then overwrote: two daemons, one supervised. The
+        carry is set before the spawn and the nested ask declines on it."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        h = self._holder(tmp_path, kid(), kid)
+        real, nested = type(h)._spawn, []
+
+        def spawn(self):
+            if not nested:
+                nested.append(1)
+                self._on_replace_request(signal.SIGUSR1, None)
+            real(self)
+
+        monkeypatch.setattr(type(h), "_spawn", spawn)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the outer ask started
+        assert nested and len(h.spawned) == 1, (
+            f"the nested ask spawned beside the outer one: {h.spawned}")
+
+    def test_a_signal_ask_nested_in_the_liveness_poll_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """`_child_running(prior)` polls (a `waitpid`) between the carry check
+        and the carry's set, and the handler runs on the main thread: a
+        SIGUSR1 landing there saw no carry and spawned a successor with its
+        own watch, then the outer frame spawned another over it. The carry is
+        set right after the check and the nested ask declines on it."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        h = self._holder(tmp_path, kid(), kid)
+        real, nested = pp._child_running, []
+
+        def running(proc):
+            if not nested:
+                nested.append(1)
+                h._on_replace_request(signal.SIGUSR1, None)
+            return real(proc)
+
+        monkeypatch.setattr(pp, "_child_running", running)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the outer ask started
+        assert nested and len(h.spawned) == 1, (
+            f"the nested ask spawned beside the outer one: {h.spawned}")
+
+    def test_an_ask_in_the_successors_backoff_is_declined_and_the_predecessor_returns(
+            self, tmp_path, kid, monkeypatch):
+        """The watch's backoff after a successor died is most of the T2071
+        crash-loop window, and the holder still owns the carry through it. A
+        launch, a tick or a heal in the gap read "no carry", asked, and the
+        ask took the dead successor as the daemon it replaces: the predecessor
+        that still served was never retired and could not be restored. Here
+        the ask lands in the gap (also the port watch's repair) and spawns
+        nothing, the sidecar stays, and the watch's end hands the supervised
+        daemon back to the predecessor."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pp, "_RELOCATE_WAIT_S", 4.0)
+        pred = kid()
+        h = self._holder(tmp_path, pred, self._exits(1))
+        h._backoff = lambda failures: 2.0
+        h._on_replace_request(signal.SIGUSR1, None)
+        self._until("the watch never reached its backoff",
+                    lambda: any("spawning it again" in ln for ln in lines), 5)
+        assert h.spawned[0].wait(5) == 1, "premise: the successor is dead"
+        rec = pp.successor_in_flight(tmp_path)
+        assert rec and rec["holder"] == os.getpid() and (
+            rec["predecessor"] == pred.pid), (
+            f"the carry was not readable in the backoff: {rec}")
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._on_replace_request(None, None)
+        assert len(h.spawned) == 1, "an ask in the backoff spawned a successor"
+        self._until("the watch never ended", lambda: h._carry is None, 10)
+        assert len(h.spawned) == 2, "the watch did not respawn once"
+        assert h._proc is pred and h.daemon_pid == pred.pid, (
+            "the predecessor that still serves is not the supervised daemon")
+        assert pred.poll() is None and not (
+            tmp_path / pp._SUCCESSOR_FLIGHT_FILE).exists()
+
+    def test_every_end_of_the_watch_without_a_publish_restores_the_predecessor(
+            self, tmp_path, kid, monkeypatch):
+        """Only the give-up restored the supervised daemon. A clean exit of
+        the successor, a respawn that failed, a stop and a raise left
+        `self._proc` on a dead child while the predecessor kept serving: the
+        port watch's target was then the dead child, so the predecessor's own
+        wedge went unrepaired for its life. One exit path, all of them."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+
+        def run(label, succ, setup=None):
+            pred = kid()
+            h = self._holder(tmp_path, succ, kid)
+            h._carry = {"before": pred, "at": time.time()}
+            self._write(tmp_path, os.getpid(), succ.pid, pred.pid)
+            if setup:
+                setup(h)
+            return h, pred, label
+
+        def check(h, pred, label):
+            assert h._proc is pred and h.daemon_pid == pred.pid, (
+                f"{label}: the predecessor is not the supervised daemon")
+            assert h._carry is None and not (
+                tmp_path / pp._SUCCESSOR_FLIGHT_FILE).exists(), (
+                f"{label}: the carry outlived the watch")
+            assert pred.poll() is None, f"{label}: the predecessor was touched"
+
+        clean = self._exits(0)()
+        h, pred, label = run("a clean exit of the successor", clean)
+        h._respawn_until_published(clean, time.monotonic() + 5, pred)
+        check(h, pred, label)
+
+        dead = self._exits(1)()
+
+        def cannot_spawn(h):
+            h._spawn = lambda: (_ for _ in ()).throw(OSError("fork"))
+        h, pred, label = run("a respawn that failed", dead, cannot_spawn)
+        h._respawn_until_published(dead, time.monotonic() + 5, pred)
+        check(h, pred, label)
+
+        live = kid()
+        h, pred, label = run("a stop", live)
+        h._stop = True
+        h._respawn_until_published(live, time.monotonic() + 5, pred)
+        check(h, pred, label)
+        assert live.poll() is not None, "a stop left the unpublished successor"
+
+        live2 = kid()
+
+        def raises(*a, **k):
+            raise RuntimeError("boom")
+        h, pred, label = run("a raise", live2)
+        monkeypatch.setattr(pp, "read_daemon_state", raises)
+        with pytest.raises(RuntimeError):
+            h._respawn_until_published(live2, time.monotonic() + 5, pred)
+        check(h, pred, label)
+
+    def test_the_port_watchs_repair_is_carried_and_watched_like_an_ask(
+            self, tmp_path, kid, monkeypatch):
+        """`_wait_for_exit` replaces a silent daemon with no signal. The
+        supervisor takes the successor from there only when it waits on the
+        daemon being replaced; parked on a predecessor that drains, nobody
+        did, so a repair successor that died at boot was never respawned and
+        a second ask or a sweep met it with no record of it."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        first = kid()
+        spawns = iter([self._exits(1), kid])
+        h = self._holder(tmp_path, first, lambda: next(spawns)())
+        h._on_replace_request(None, None)
+        rec = pp.successor_in_flight(tmp_path)
+        assert rec and rec["predecessor"] == first.pid and (
+            rec["port"] == h.port), f"the repair left no carry: {rec}"
+        h._on_replace_request(None, None)
+        self._until("the dead repair successor was not spawned again",
+                    lambda: len(h.spawned) == 2, 10)
+        assert h._proc is h.spawned[1]
+        h._stop = True
+
+    def test_a_signal_ask_nested_in_the_hand_off_check_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """The hand-off check (`_hand_to_the_caller`: a glob and a stat) runs
+        between the decline check and the spawn, and a SIGUSR1 landing in it
+        saw no carry and spawned a successor the outer ask then spawned
+        beside. The carry is set before it. A hand-off that is made ends the
+        carry on its return: no spawn, no sidecar, nothing left to decline."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        h = self._holder(tmp_path, kid(), kid)
+        real, nested = type(h)._hand_to_the_caller, []
+
+        def hand(self):
+            if not nested:
+                nested.append(1)
+                self._on_replace_request(signal.SIGUSR1, None)
+            return real(self)
+
+        monkeypatch.setattr(type(h), "_hand_to_the_caller", hand)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the outer ask started
+        assert nested and len(h.spawned) == 1, (
+            f"the nested ask spawned beside the outer one: {h.spawned}")
+
+        seen, other = [], tmp_path / "other"
+        other.mkdir()
+        h2 = self._holder(other, kid(), kid)
+        monkeypatch.setattr(
+            type(h2), "_hand_to_the_caller",
+            lambda self: seen.append(self._carry) or True)
+        h2._on_replace_request(signal.SIGUSR1, None)
+        assert seen and seen[0] is not None, "no carry during the hand-off"
+        assert h2._handed_off and h2._carry is None and not h2.spawned
+        assert not (other / pp._SUCCESSOR_FLIGHT_FILE).exists()
+
+    def test_a_signal_ask_nested_in_the_end_of_a_carry_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """The sidecar goes BEFORE the carry is cleared: an ask nested between
+        the two (the main thread's handler) wrote its own sidecar, which the
+        end then deleted."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        pred = kid()
+        h = self._holder(tmp_path, pred, kid)
+        h._carry = {"before": pred, "at": time.time()}
+        real, nested = pp.write_carry_file, []
+
+        def write(certdir, name, rec):
+            if rec is None and not nested:
+                nested.append(1)
+                h._on_replace_request(signal.SIGUSR1, None)
+            return real(certdir, name, rec)
+
+        monkeypatch.setattr(pp, "write_carry_file", write)
+        h._end_carry(None, pred, False)
+        h._stop = True
+        assert nested and not h.spawned and h._carry is None, (
+            f"an ask nested in the end of the carry spawned: {h.spawned}")
+
+    def test_stop_ends_the_daemon_a_carry_was_to_hand_back(
+            self, tmp_path, kid, monkeypatch):
+        """A watch asleep in a backoff longer than `stop()`'s join restores
+        the predecessor after the socket closed, and it survives with its
+        inherited descriptor. The locked pass ends it too."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        pred, succ = kid(), kid()
+        h = self._holder(tmp_path, succ, kid)
+        h._carry = {"before": pred, "at": time.time()}
+        h._srv = socket.socket()
+        h.stop()
+        assert succ.poll() is not None and pred.poll() is not None, (
+            "stop() left a daemon of this holder running")
+
+    def test_a_sidecar_that_could_not_be_written_is_said_and_the_ask_still_declines(
+            self, tmp_path, kid, monkeypatch):
+        """The in-memory carry is what declines a second ask, not the file; a
+        failed write (ENOSPC) only blinds the OTHER processes, and the log
+        says so."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pp, "write_carry_file", lambda *a, **k: False)
+        h = self._holder(tmp_path, kid(), kid)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True
+        assert len(h.spawned) == 1, "a failed write let a second ask through"
+        assert any("could not write" in ln for ln in lines), lines
+
+    def test_a_give_up_ends_the_successor_restores_the_predecessor_and_clears(
+            self, tmp_path, kid, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        pred, succ = kid(), kid()
+        h = self._holder(tmp_path, succ, kid)
+        self._write(tmp_path, os.getpid(), succ.pid, pred.pid)
+        h._respawn_until_published(succ, time.monotonic() + 0.3, pred)
+        assert succ.poll() is not None, "the unpublished successor was left"
+        assert h._proc is pred and h.daemon_pid == pred.pid, (
+            "the predecessor that still serves is not the supervised daemon")
+        assert not (tmp_path / pp._SUCCESSOR_FLIGHT_FILE).exists()
+        assert pred.poll() is None, "the predecessor was touched"
+        # A PREDECESSOR THAT IS GONE leaves the supervisor what there is.
+        pred2, succ2 = kid(), kid()
+        pred2.kill()
+        pred2.wait()
+        h._proc = succ2
+        h._respawn_until_published(succ2, time.monotonic() + 0.3, pred2)
+        assert h._proc is succ2
+
+    def test_a_published_successor_has_its_predecessor_terminated_unless_it_drains(
+            self, tmp_path, kid):
+        from cswap_pin import proxy as pp
+
+        pred, succ, draining = kid(), kid(), kid()
+        h = self._holder(tmp_path, succ, kid)
+        pp.write_daemon_state(tmp_path, 1, succ.pid, "fp")
+        self._write(tmp_path, os.getpid(), succ.pid, pred.pid)
+        h._respawn_until_published(succ, time.monotonic() + 5, pred)
+        assert pred.wait(5) < 0, "the predecessor was not sent the TERM"
+        assert succ.poll() is None, "the published successor was touched"
+        assert not (tmp_path / pp._SUCCESSOR_FLIGHT_FILE).exists()
+        # ITS OWN DRAIN IS ITS LEAVING (the watchdog announces before it asks).
+        pp.draining_marker_path(tmp_path, draining.pid).write_text(
+            str(time.time()))
+        h._respawn_until_published(succ, time.monotonic() + 5, draining)
+        time.sleep(0.2)
+        assert draining.poll() is None, "a draining predecessor was TERMed"
+
+    def test_the_sweep_spares_a_booting_successor_and_its_predecessor(
+            self, tmp_path, kid, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        succ, pred = kid(), kid()
+        orphan = 987654
+        killed = []
+        monkeypatch.setattr(pp, "_pin_daemon_pids",
+                            lambda cd: [succ.pid, pred.pid, orphan])
+        monkeypatch.setattr(pp, "_kill_daemon",
+                            lambda pid, certdir=None, **k: killed.append(pid))
+        pp._sweep_orphan_daemons(tmp_path, keep_pid=1)
+        assert sorted(killed) == sorted([succ.pid, pred.pid, orphan]), (
+            "CONTROL: with no sidecar the sweep takes every stranger")
+        killed.clear()
+        self._write(tmp_path, os.getpid(), succ.pid, pred.pid)
+        pp._sweep_orphan_daemons(tmp_path, keep_pid=1)
+        assert killed == [orphan], killed
+
+    def test_a_launch_asks_the_holder_of_a_held_daemon_and_never_terms_it(
+            self, tmp_path, kid, monkeypatch):
+        """`ensure_proxy`'s recycle of a held daemon whose watchdog is dead:
+        the ask is the SIGUSR1, nothing when the sidecar is live or the daemon
+        drains, the recorded port in every case and never the spawn; the TERM
+        stays where the holder cannot be asked."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        pp.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pp.ensure_ca(certdir, "api.anthropic.com")
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port, me, holder = srv.getsockname()[1], os.getpid(), 4242
+        pp.write_daemon_state(certdir, port, me, "OTHER-FINGERPRINT")
+        sent, termed, spawned = [], [], []
+        real_kill = os.kill
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: real_kill(pid, sig) if sig == 0
+            else sent.append((pid, sig)))
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [me])
+        monkeypatch.setattr(pp, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pp, "_wedged_parent_holder", lambda p, cd: holder)
+        askable = {"yes": True}
+        monkeypatch.setattr(pp, "_wedged_daemon_can_be_asked",
+                            lambda p, h: askable["yes"])
+        monkeypatch.setattr(pp, "_health_body", lambda p, timeout=1.0: {
+            "pid": me, "code_watch_age_s": None})
+        monkeypatch.setattr(pp, "_kill_daemon",
+                            lambda pid, *a, **k: termed.append(pid) or True)
+        monkeypatch.setattr(pp, "_spawn_daemon",
+                            lambda *a, **k: spawned.append(a) or 9955)
+        monkeypatch.setattr(pp, "_SPAWN_WAIT_S", 0.2)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            resolve_account=lambda ident: ("2", "pin@example.com", "org-1"))
+        try:
+            def launch(label, want_sent, want_term):
+                sent.clear()
+                termed.clear()
+                assert pp.ensure_proxy(sw)[0] == port, label
+                assert (sent, termed, spawned) == (want_sent, want_term, []), (
+                    f"{label}: sent={sent} termed={termed} spawned={spawned}")
+
+            launch("a holder that can be asked", [(holder, signal.SIGUSR1)], [])
+            succ = kid()
+            self._write(certdir, me, succ.pid, 1)
+            launch("a successor is booting", [], [])
+            (certdir / pp._SUCCESSOR_FLIGHT_FILE).unlink()
+            pp.draining_marker_path(certdir, me).write_text(str(time.time()))
+            launch("the daemon announced its drain", [], [])
+            pp.draining_marker_path(certdir, me).unlink()
+            askable["yes"] = False
+            launch("CONTROL: a holder that cannot hear it", [], [me])
+        finally:
+            srv.close()
+
+    def test_a_launch_never_spawns_beside_a_held_daemon_that_does_not_answer(
+            self, tmp_path, monkeypatch):
+        """The wait for the successor ran out and the port answers nothing: the
+        holder's socket is still the recorded port, and a second holder is the
+        double bind."""
+        from cswap_pin import proxy as pp
+
+        pp.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pp.ensure_ca(certdir, "api.anthropic.com")
+        pp.write_daemon_state(
+            certdir, 1, os.getpid(),
+            pp.daemon_fingerprint("2", "pin@example.com"))
+        spawned = []
+        monkeypatch.setattr(pp, "_kill_daemon", lambda *a, **k: True)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(pp, "_wedged_parent_holder", lambda p, cd: 4242)
+        monkeypatch.setattr(pp, "_wedged_daemon_can_be_asked",
+                            lambda p, h: True)
+        monkeypatch.setattr(pp, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pp, "_health_body", lambda p, timeout=1.0: None)
+        real_kill = os.kill
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: real_kill(pid, sig) if sig == 0
+            else None)
+        monkeypatch.setattr(pp, "_spawn_daemon",
+                            lambda *a, **k: spawned.append(a) or 9955)
+        monkeypatch.setattr(pp, "_SPAWN_WAIT_S", 0.2)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            resolve_account=lambda ident: ("2", "pin@example.com", "org-1"))
+        assert pp.ensure_proxy(sw)[0] == 1 and spawned == []
+
+    def test_a_launch_spawns_after_it_terms_a_daemon_that_is_no_holders_child(
+            self, tmp_path, kid, monkeypatch):
+        """`_recycle_daemon` also reports "handled" for ANY holder of the
+        certdir (`_holder_owns`), though this daemon's own parent is none: it
+        is TERMed, it really dies, and the holder's socket is not the port the
+        record names. The return for a held daemon (the holder's socket IS
+        the recorded port) then handed out a port nothing listens on, where
+        the base went on to spawn."""
+        from cswap_pin import proxy as pp
+
+        pp.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pp.ensure_ca(certdir, "api.anthropic.com")
+        daemon = kid()
+        pp.write_daemon_state(certdir, 1, daemon.pid, "OTHER-FINGERPRINT")
+        spawned = []
+
+        def dies(pid, *a, **k):
+            daemon.kill()
+            daemon.wait()
+            return True
+
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [daemon.pid])
+        monkeypatch.setattr(pp, "_wedged_parent_holder", lambda p, cd: None)
+        monkeypatch.setattr(pp, "_holder_owns", lambda cd: True)
+        monkeypatch.setattr(pp, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pp, "_health_body", lambda p, timeout=1.0: None)
+        monkeypatch.setattr(pp, "_kill_daemon", dies)
+        monkeypatch.setattr(pp, "_spawn_daemon",
+                            lambda *a, **k: spawned.append(a) or 9955)
+        monkeypatch.setattr(pp, "_SPAWN_WAIT_S", 0.2)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            resolve_account=lambda ident: ("2", "pin@example.com", "org-1"))
+        assert pp.ensure_proxy(sw)[0] == 9955 and len(spawned) == 1, (
+            f"a dead daemon's port was handed out: spawned={spawned}")
+
+    def test_a_launch_spawns_nothing_beside_a_successor_the_holder_is_booting(
+            self, tmp_path, kid, monkeypatch):
+        """The record is gone, or names a pid that died, while the holder's
+        successor boots (the predecessor exited or crashed mid-carry): the
+        launch read "nothing serves" and spawned a second holder for a socket
+        the first owns, the double bind `_recycle_daemon` measures. The
+        sidecar names the holder's port; that is what the launch gets."""
+        from cswap_pin import proxy as pp
+
+        pp.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pp.ensure_ca(certdir, "api.anthropic.com")
+        spawned = []
+        monkeypatch.setattr(pp, "_spawn_daemon",
+                            lambda *a, **k: spawned.append(a) or 9955)
+        monkeypatch.setattr(pp, "_SPAWN_WAIT_S", 0.2)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            resolve_account=lambda ident: ("2", "pin@example.com", "org-1"))
+        self._write(certdir, os.getpid(), None, 1, port=4242)
+        gone = kid()
+        gone.kill()
+        gone.wait()
+        for label, record in (("no record", None), ("a dead pid", gone.pid)):
+            if record:
+                pp.write_daemon_state(certdir, 1, record, "OTHER-FINGERPRINT")
+            assert pp.ensure_proxy(sw)[0] == 4242 and spawned == [], (
+                f"{label}: spawned beside the holder's successor: {spawned}")
+        (certdir / pp._SUCCESSOR_FLIGHT_FILE).unlink()
+        assert pp.ensure_proxy(sw)[0] == 9955 and len(spawned) == 1, (
+            "CONTROL: with no sidecar the launch spawns")
