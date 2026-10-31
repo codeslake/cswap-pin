@@ -9255,6 +9255,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # When the last early refresh was attempted (monotonic), for
     # `_FRESHEN_RETRY_S`. Set only under `refresh_lock`.
     _freshen_at: list = [None]
+    # The credential blob whose LAST refresh failed transiently, else None.
+    # Written by `_consume` (so the quiet early refresh counts too), under
+    # `refresh_lock`; read by `_held_after_transient`. A blob is not a flag so
+    # that a rotation by another process, never refreshed here, is not held.
+    _transient_blob: list = [None]
     # SET/CLEARED ONLY BY WHOEVER HOLDS `refresh_lock`. Lets a reader that
     # peeks the lock non-blocking (`_mint_lock_busy`) say how long it has
     # been held -- the fact that tells a stalled Keychain read apart from a
@@ -9295,9 +9300,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         went out.
         """
         gate = getattr(switcher, "consume_backup_grant", None)
+        outcome = (oauth.try_refresh_oauth_credentials(creds) if gate is None
+                   else gate(num, mail, creds))
+        transient = getattr(outcome, "error", None) == "transient"
+        if transient and _transient_blob[0] != creds:
+            _log_lifecycle(f"refresh transient for slot {num} ({mail})")
+        _transient_blob[0] = creds if transient else None
         if gate is None:
-            return oauth.try_refresh_oauth_credentials(creds)
-        outcome = gate(num, mail, creds)
+            return outcome
         # Remember a DEFERRAL. "consume-busy" means another process holds the
         # slot right now, which is a race with the usage collector, not a
         # broken daemon — and the caller's only other signal is a None token,
@@ -9343,6 +9353,21 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         access = data.get("accessToken")
         if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
             return access
+        return None
+
+    def _held_after_transient(creds: str) -> str | None:
+        """The access token of `creds` when its last refresh failed
+        transiently and it has more than `_HOLD_MARGIN_MS` left. cswap's
+        buffer says "refresh now", not "dead": a token it cannot refresh yet
+        is still good, and a successor would re-run the same failing POST.
+        The margin moves the expiry as `_freshen_due` does."""
+        if not creds or _transient_blob[0] != creds:
+            return None
+        data = oauth.extract_oauth_data(creds) or {}
+        exp = data.get("expiresAt")
+        if isinstance(exp, (int, float)) and not oauth.is_oauth_token_expired(
+                exp + oauth.OAUTH_EXPIRY_BUFFER_MS - _HOLD_MARGIN_MS):
+            return data.get("accessToken")
         return None
 
     def _freshen_due(creds: str) -> bool:
@@ -9612,11 +9637,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         """`freshen` (the watchdog tick's, via `provider.freshen`) refreshes a
         token that is live but inside `_FRESHEN_MARGIN_MS` of its expiry, so
         `can_pin_cached` never reads false across the refresh. It is
-        best-effort and says nothing when it fails: the held token is still
-        live, so it is returned and no `blind_reason` is set -- the real
-        failure surfaces at the buffer, through the path below, unchanged.
-        A cold cache or a token already past the buffer returns None
-        untouched: that refresh is `_can_mint`'s and the request path's.
+        best-effort and sets no `blind_reason` when it fails (`_consume`
+        writes one `refresh transient` lifecycle line per blob): the held
+        token is still live, so it is returned -- the real failure surfaces
+        at the buffer, through the path below, unchanged. A token held
+        after a transient failure (`_held_after_transient`) is retried the
+        same way, once per `_FRESHEN_RETRY_S`: the tick is the only retry,
+        since a request serves it without a POST. A cold cache or a token
+        already past the buffer returns None untouched: that refresh is
+        `_can_mint`'s and the request path's.
 
         `refused` is the `Authorization` value (``"Bearer <token>"``) a
         swap carrying it was just REFUSED upstream -- `refetch` below passes
@@ -9686,13 +9715,16 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
         live = _live_token(cached) if cached is not None else None
-        if freshen and not live:
-            # THE EARLY REFRESH IS FOR A TOKEN THAT IS STILL LIVE. Past the
-            # buffer (or cold) this is the on-demand branch below, which
-            # `_FRESHEN_RETRY_S` does not hold: with self-heal on `_can_mint`
-            # then asked again in the same tick, and with it off the tick
-            # spent a grant it never used to. No lock, no store read, no
-            # consume: `_can_mint` and the request path own that refresh.
+        if freshen and not live and not (
+                _held_after_transient(cached) and _freshen_due(cached)):
+            # THE EARLY REFRESH IS FOR A TOKEN THAT IS STILL LIVE, OR HELD
+            # AFTER A TRANSIENT FAILURE (the tick is its only retry: a request
+            # serves the held token without a POST). Past the buffer (or cold)
+            # this is the on-demand branch below, which `_FRESHEN_RETRY_S`
+            # does not hold: with self-heal on `_can_mint` then asked again in
+            # the same tick, and with it off the tick spent a grant it never
+            # used to. No lock, no store read, no consume: `_can_mint` and the
+            # request path own that refresh.
             return None
         bypass = False
         if cached is not None:
@@ -9805,14 +9837,18 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # with the guard below and overwrite the held copy.
                 token = _live_token(creds) if creds else None
                 if freshen and not token:
-                    # THE EARLY REFRESH IS FOR THE LIVE TOKEN IN HAND (`cached`
-                    # is live: the early return above). A store older than it
-                    # is no rotation to adopt: replacing the held copy would
+                    # THE EARLY REFRESH IS FOR THE TOKEN IN HAND (`cached` is
+                    # live or held: the early return above). A store older than
+                    # it is no rotation to adopt: replacing the held copy would
                     # leave the tick with no live token, so it would run the
                     # ON-DEMAND refresh below -- a deferral, an 'unpinned' line
                     # with no request out, and `can_pin_cached` false.
                     creds = cached
                     token = _live_token(creds)
+                # HELD AFTER A TRANSIENT FAILURE: served as it stands, so the
+                # on-demand refresh below does not re-run the failing POST for
+                # every request. The tick's early refresh below still retries.
+                token = token or _held_after_transient(creds)
                 if not creds:
                     # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
                     # empty read and a read of the WRONG slot are indistinguishable
@@ -9869,9 +9905,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     with _stage("refresh"):
                         token, rotated = resolve_pin_token(
                             creds, _consume_recording)
+                    token = token or _held_after_transient(creds)
                     if token:
-                        # THE REFRESH WORKED: the reason a failure left stood
-                        # all through it, so `/health` never read a clear one.
+                        # THE REFRESH WORKED, OR FAILED TRANSIENTLY ON A TOKEN
+                        # WITH TIME LEFT: the reason a failure left stood all
+                        # through it, so `/health` never read a clear one.
                         _blind("")
                     elif not errors:
                         # The refresh reported no error and still produced
@@ -9964,11 +10002,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         exactly the call that can wedge (see `_MINT_LOCK_BOUND_S`), and
         `/health` must never make it -- see `_can_pin_from_cache`.
 
-        True on a no-op pin (nothing to swap) or a cached, still-live token.
-        False otherwise: a cold or expired cache, which used to be resolved
-        by calling `provider()` from the health thread itself. The daemon-
-        start warm (`_warm_mint_cache`) is what keeps this True on a healthy
-        daemon before the first real request arrives.
+        True on a no-op pin (nothing to swap), a cached, still-live token, or
+        a cached token inside the buffer that is held after a transient
+        refresh failure (`_held_after_transient`). False otherwise: a cold or
+        expired cache, which used to be resolved by calling `provider()` from
+        the health thread itself. The daemon-start warm (`_warm_mint_cache`)
+        is what keeps this True on a healthy daemon before the first real
+        request arrives.
         """
         if pin_is_noop():
             return True
@@ -9984,7 +10024,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if target is None:
             return True
         cached = _cred_cache.get(target)
-        return bool(cached and _live_token(cached))
+        return bool(cached and (
+            _live_token(cached) or _held_after_transient(cached)))
 
     def can_pin_cached() -> bool:
         """`_can_pin_now`, writing one line per change of its answer. THE
@@ -16387,6 +16428,11 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 
 _CODE_WATCH_INTERVAL_S = 30.0
+# A TOKEN INSIDE CSWAP'S 5-MINUTE BUFFER IS DUE, NOT DEAD: after a TRANSIENT
+# refresh failure it is still served until this much of it is left (the next
+# tick plus the longest refresh), so that tick can still replace the daemon
+# before the token really expires. See `_held_after_transient`.
+_HOLD_MARGIN_MS = int((_CODE_WATCH_INTERVAL_S + _MINT_LOCK_BOUND_S) * 1000)
 # THE OLDEST WATCHDOG BEAT A CALLER MAY TRUST. `_watch_own_code` stamps the
 # server each tick and `/health` publishes its age (`code_watch_age_s`); a
 # watchdog that returned on an exception while the daemon kept serving stops
