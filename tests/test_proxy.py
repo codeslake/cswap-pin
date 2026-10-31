@@ -11888,6 +11888,90 @@ class TestEnsureProxyLifecycle:
             tmp_path / "held", monkeypatch, held=True, denied=True)
         assert len(at_term) == 1 and got == 52000, (at_term, got)
 
+    def case_a_holder_read_that_cannot_tell_answers_what_its_caller_chose(
+            self, tmp_path, monkeypatch):
+        """T3131 review: `_holder_owns` collapsed "cannot tell" into False. For
+        a recycle that is the safe side (recycle the old way; True would skip
+        a recycle that was asked for), for a signal drain it is the unsafe one
+        (False ends the wait and cuts every tunnel while a successor's holder
+        runs), so the caller chooses with ``unknown``. Every failure the read
+        has: a `ps` that times out, cannot fork (EAGAIN under a herd) or
+        prints what the locale cannot decode, and a /proc that cannot be
+        listed. A read that DID answer decides, whatever ``unknown`` says."""
+        import subprocess
+        import types
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+
+        def fails(exc):
+            def run(*a, **k):
+                raise exc
+            return run
+
+        def both(label, want_default=False):
+            assert pin_proxy._holder_owns(certdir) is want_default, label
+            assert pin_proxy._holder_owns(certdir, unknown=True) is True, label
+
+        with monkeypatch.context() as m:
+            m.setattr(pin_proxy.Path, "is_dir", lambda self: False)  # no /proc
+            for exc in (subprocess.TimeoutExpired("ps", 5), OSError("EAGAIN"),
+                        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")):
+                m.setattr(subprocess, "run", fails(exc))
+                both(f"ps raised {exc!r}")
+            m.setattr(subprocess, "run",
+                      lambda *a, **k: types.SimpleNamespace(stdout=""))
+            assert pin_proxy._holder_owns(certdir, unknown=True) is False, (
+                "a ps that answered with no holder in it was read as unknown")
+        with monkeypatch.context() as m:
+            m.setattr(pin_proxy.Path, "glob", fails(OSError("EMFILE")))
+            if os.path.isdir("/proc"):
+                both("/proc could not be listed")
+
+    def case_a_real_holder_argv_from_spawn_daemon_reads_as_owned(
+            self, tmp_path, monkeypatch):
+        """T3131 review: the drain's whole signal is `_holder_owns` matching the
+        argv `_spawn_daemon` really builds for a holder, so it is read from a
+        real process rather than from a hand-written command line. The argv is
+        captured from `_spawn_daemon`'s own Popen for a certdir given as it is
+        and through a symlink, then run by a child that only sleeps (the
+        module swapped, `--hold-port` and the certdir kept). The query goes by
+        the symlink: the argv may carry either form, and a different certdir
+        is no holder."""
+        import subprocess
+        import sys
+        from cswap_pin import proxy as pin_proxy
+
+        real_popen, seen = subprocess.Popen, []
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda argv, **kw: seen.append(list(argv)))
+        certdir = tmp_path / "real" / "pin-proxy"
+        certdir.mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(certdir)
+        for form in (certdir, link):
+            assert pin_proxy._spawn_daemon("1", "a@b.c", form, wait_s=0) is None
+        assert len(seen) == 2, seen
+        for argv in seen:
+            assert argv[1:3] == ["-m", pin_proxy._DAEMON_MODULE], argv
+            assert argv[3] == pin_proxy._HOLDER_MODULE_ARG, argv
+        children = []
+        try:
+            for argv in seen:
+                child = real_popen(
+                    [argv[0], "-c", "import time; time.sleep(60)", *argv[3:]])
+                children.append(child)
+                assert pin_proxy._holder_owns(link) is True, argv
+                assert pin_proxy._holder_owns(tmp_path / "other") is False
+                child.kill()
+                child.wait(timeout=5)
+                assert pin_proxy._holder_owns(link) is False, (
+                    "the holder is gone and still reads as owned", argv)
+        finally:
+            for child in children:
+                child.kill()
+                child.wait(timeout=5)
+
 
 def _watch_blocking_phase(monkeypatch):
     """An Event that fires when `watch_refcount` enters its blocking read.

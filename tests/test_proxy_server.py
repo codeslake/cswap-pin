@@ -19566,7 +19566,8 @@ class TestAHandoverMidDrainDropsTheClock:
 
     def _drain_for_a_successor(self, tmp_path, monkeypatch, *, holder,
                                port=lambda t: False,
-                               publishes=float("inf"), held=False, live=20):
+                               publishes=float("inf"), held=False, live=20,
+                               read_fails=lambda t: False):
         """An UNHELD signal drain with live tunnels and nothing owed, on a clock
         each sleep advances, with the launch's side played as it happens: its
         `_spawn_daemon` gives up at `_SPAWN_WAIT_S`, where the REAL
@@ -19575,7 +19576,10 @@ class TestAHandoverMidDrainDropsTheClock:
         ``port`` says what a loopback connect to ANY port meets: True accepts,
         False is refused, None times out as a loaded host's does. The
         successor publishes its record at ``publishes``, and
-        `_superseded_on_the_port` reads it for real. Returns (clock, pump,
+        `_superseded_on_the_port` reads it for real. ``read_fails`` says, from
+        the clock, that the read itself could not tell (a `ps` that timed out):
+        `_holder_owns` then answers what its caller chose for "cannot tell",
+        its ``unknown``. Returns (clock, pump,
         log, the clock times `_holder_owns` was read at)."""
         import cswap_pin.proxy as pp
         certdir = tmp_path / "pin-proxy"
@@ -19607,10 +19611,10 @@ class TestAHandoverMidDrainDropsTheClock:
             return contextlib.nullcontext()
         monkeypatch.setattr(pp.socket, "create_connection", connect)
 
-        def owns(cd):
+        def owns(cd, unknown=False):
             assert cd == certdir, cd
             reads.append(clock[0])
-            return holder(clock[0])
+            return unknown if read_fails(clock[0]) else holder(clock[0])
         monkeypatch.setattr(pp, "_holder_owns", owns)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
                             upstream=("127.0.0.1", 1))
@@ -19663,6 +19667,36 @@ class TestAHandoverMidDrainDropsTheClock:
             f"released {pump.released} live tunnel(s) after {clock:.1f}s "
             f"while the holder's port timed out: {out}")
         assert clock >= 60.0, (clock, out)
+
+    def test_a_holder_read_that_fails_does_not_end_the_wait(
+            self, tmp_path, monkeypatch):
+        """T3131 review: `_holder_owns` answered False for "cannot tell" (a
+        macOS `ps` that hit its 5 s bound or could not fork, which a loaded
+        host does: the file records multi-second stalls), and in the drain a
+        False ends the wait at once and `release_pairs` cuts every tunnel
+        while the successor's holder runs. The holder exists from 0.2 s, the
+        reads between 12 s and 40 s fail, and the successor publishes at 60 s:
+        a read that fails is not an answer that nobody is coming."""
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            read_fails=lambda t: 12.0 <= t < 40.0, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"because a holder read could not tell: {out}")
+        assert clock >= 60.0, (clock, out)
+
+    def test_CONTROL_a_read_that_always_fails_is_waited_on_to_the_bound_only(
+            self, tmp_path, monkeypatch):
+        """Reading "cannot tell" as a holder is bounded like any other holder:
+        a `ps` that never answers, with no successor ever coming, holds the
+        tunnels to `_RELOCATE_WAIT_S` and then they go as they always did."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False,
+            read_fails=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), clock
 
     def test_CONTROL_no_holder_releases_the_tunnels_when_the_grace_ends(
             self, tmp_path, monkeypatch):

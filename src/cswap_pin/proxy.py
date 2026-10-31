@@ -10989,7 +10989,7 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     return held
 
 
-def _holder_owns(certdir: Path) -> bool:
+def _holder_owns(certdir: Path, unknown: bool = False) -> bool:
     """Is a holder holding the port for ``certdir``?
 
     /proc FIRST, `ps` only as the fallback. `ps -eo command=` TRUNCATES a long
@@ -11000,14 +11000,23 @@ def _holder_owns(certdir: Path) -> bool:
     width to run out of. It does not exist on macOS, which is why `ps` stays
     as the fallback rather than the primary.
 
-    Cannot tell -> False, which means "recycle the old way". Guessing True
-    would skip a recycle that was asked for.
+    CANNOT TELL -> ``unknown`` (a `ps` that times out, cannot fork or will
+    not decode, a /proc that cannot be listed; one unreadable /proc entry is
+    skipped), and the CALLER chooses it because the safe side differs. False,
+    the default, is "recycle the old way": guessing True would skip a recycle
+    that was asked for. A signal drain waiting for its successor's holder
+    passes True (`PinProxy._successor_is_due`): there False cuts every tunnel
+    while the holder runs, and the wait is bounded anyway.
     """
     targets = {str(Path(certdir)), str(Path(certdir).resolve())}
 
     proc = Path("/proc")
     if proc.is_dir():
-        for entry in proc.glob("[0-9]*"):
+        try:
+            entries = list(proc.glob("[0-9]*"))
+        except OSError:
+            return unknown
+        for entry in entries:
             try:
                 argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
             except OSError:
@@ -11026,8 +11035,8 @@ def _holder_owns(certdir: Path) -> bool:
             ["ps", "-ww", "-eo", "pid=,command="], capture_output=True, text=True,
             timeout=5,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return unknown
     for line in out.splitlines():
         cmd = line.strip().partition(" ")[2].rstrip()
         if _HOLDER_MODULE_ARG not in cmd:
@@ -21289,6 +21298,9 @@ class PinProxy:
         holder can exist yet. After that the holder is looked for once per
         `_DRAINING_BEAT_SECONDS`, the last answer carried: the loop passes every
         50 ms and the read scans `/proc` (a `ps` with a 5 s bound on macOS).
+        A READ THAT FAILS READS AS A HOLDER (``unknown=True``): a `ps` that
+        times out or cannot fork is what a loaded host does, and "no holder"
+        cut every tunnel while the successor's holder ran.
         The wait ends when the successor publishes (the drain is promoted and
         takes `_wait_for_tunnels`), when no holder is left, or at
         `_RELOCATE_WAIT_S`, and the tunnels go as they always did. Only with a
@@ -21303,7 +21315,7 @@ class PinProxy:
             return True
         at, owned = getattr(self, "_due_probe", (float("-inf"), False))
         if at < started + _SPAWN_WAIT_S or now - at >= _DRAINING_BEAT_SECONDS:
-            owned = _holder_owns(self._certdir)
+            owned = _holder_owns(self._certdir, unknown=True)
             self._due_probe = (now, owned)
         return owned
 
