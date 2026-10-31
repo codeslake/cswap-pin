@@ -11818,8 +11818,8 @@ class TestEnsureProxyLifecycle:
         """`ensure_proxy` recycling a stale daemon whose pid is a REAL, dead
         process, through the real `_recycle_daemon` and `_kill_daemon`: only
         the signal is stubbed, by an `os.kill` spy that reads the record at the
-        instant the TERM is sent. Returns (the record at that instant, the
-        recycled pid)."""
+        instant each TERM is sent. Returns (those records, the port it
+        answers)."""
         import os, subprocess, sys
         from cswap_pin import proxy as pin_proxy
         self._pin(tmp_path)
@@ -11847,46 +11847,38 @@ class TestEnsureProxyLifecycle:
             return real_kill(pid, sig)
         monkeypatch.setattr(os, "kill", kill)
         got = (pin_proxy.ensure_proxy(self._Sw(tmp_path)) or (None,))[0]
-        # A denied host spawns nothing and answers None, as it always did.
-        assert got == (None if denied else 52000) and len(at_term) == 1, (
-            got, at_term)
-        return at_term[0], dead.pid
+        return at_term, got
 
-    def case_the_unheld_recycle_marks_the_handover_before_it_terms(
+    def case_the_unheld_recycle_writes_no_mark_before_it_terms(
             self, tmp_path, monkeypatch):
-        """T3131: the TERM of an unheld daemon starts a signal drain with no
-        successor to supersede it. That drain breaks on "nothing owed" at once
-        and cuts every Remote Control tunnel, before `_spawn_daemon` (which
-        wrote the mark, after the TERM) has started a holder. The mark names
-        the daemon being replaced, so the drain waits for a successor."""
-        at_term, dead = self._recycle_unheld(tmp_path, monkeypatch)
-        assert at_term and at_term.get("handover") is True, (
-            f"the record at the TERM was {at_term}: no successor was marked, "
-            "so the drain it starts has nothing to wait for")
-        assert at_term["pid"] == dead and at_term["port"] == 40001
+        """T3131: the TERM of an unheld daemon starts a signal drain that must
+        wait for a successor, and the signal it reads is the old port
+        answering (`PinProxy._successor_is_due`). A mark written before the
+        TERM was the first try: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and
+        clears it while the holder is still booting, and it outlived a launch
+        that died before the spawn. The record at the TERM is the daemon's
+        own, as it was."""
+        at_term, got = self._recycle_unheld(tmp_path, monkeypatch)
+        assert got == 52000 and len(at_term) == 1, (got, at_term)
+        assert "handover" not in at_term[0], (
+            f"the record at the TERM was {at_term[0]}: a launch-owned mark "
+            "the drain would have to outlive")
 
-    def case_a_held_recycle_a_denied_host_and_another_daemons_record_get_no_mark(
+    def case_a_denied_host_sends_an_unheld_daemon_no_term(
             self, tmp_path, monkeypatch):
-        """The held arm is the holder's (T3107): its respawn is the successor
-        and the mark would only hide the record. A host that cannot read the
-        Keychain spawns nothing, so a mark nobody fulfils would also stop the
-        daemon's own teardown from unwiring. A record naming another pid is a
-        successor's, and a rewrite would clobber its publish."""
-        from cswap_pin import proxy as pin_proxy
-        for name, kw in (("held", {"held": True}), ("denied", {"denied": True})):
-            (tmp_path / name).mkdir()
-            at_term, _dead = self._recycle_unheld(
-                tmp_path / name, monkeypatch, **kw)
-            assert at_term and not at_term.get("handover"), (name, at_term)
-        certdir = tmp_path / "other"; certdir.mkdir()
-        pin_proxy.write_daemon_state(certdir, 40002, 424242, "NEW-FP")
-        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: False)
-        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
-                            lambda *a, **k: False)
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda *a, **k: True)
-        pin_proxy._recycle_daemon(certdir, 424243)
-        assert pin_proxy.read_daemon_state(certdir) == {
-            "port": 40002, "pid": 424242, "fingerprint": "NEW-FP"}
+        """T3131: a host that cannot read the Keychain spawns nothing, so the
+        TERM of an unheld daemon cut every tunnel with no successor coming.
+        The daemon is left serving and its port returned, as the leave-alone
+        clause does. The HELD arm is the holder's respawn and still TERMs."""
+        at_term, got = self._recycle_unheld(
+            tmp_path, monkeypatch, denied=True)
+        assert at_term == [] and got == 40001, (
+            f"TERMs {at_term}, port {got}: a denied host sent a TERM that "
+            "nothing would follow")
+        (tmp_path / "held").mkdir()
+        at_term, got = self._recycle_unheld(
+            tmp_path / "held", monkeypatch, held=True, denied=True)
+        assert len(at_term) == 1 and got == 52000, (at_term, got)
 
 
 def _watch_blocking_phase(monkeypatch):
@@ -16565,7 +16557,7 @@ print("OK", port)
         self, tmp_path, monkeypatch
     ):
         """T3131: an unheld daemon a launch TERMed now drains for up to
-        `_RELOCATE_WAIT_S`, waiting for the successor the launch marked, and
+        `_RELOCATE_WAIT_S`, waiting for the successor a launch is starting, and
         `done` is set only when that drain ends. The watchdog keeps ticking
         beside it (30 s, against a wait that can last minutes), and a tick on
         stale code, an orphaned daemon or a blind one took the hand-down: a
