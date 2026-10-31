@@ -20197,6 +20197,27 @@ class TestASpuriousStream404DoesNotEndTheSession:
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
 
 
+def _no_5h_headers(seven="0.96") -> bytes:
+    """The rate-limit headers of a /v1/messages 200 for an account whose 5h
+    limit Anthropic removed (measured 2026-10-31, account 8): a 7d reading and
+    NO `5h-utilization`, `5h-reset`, `5h-status` or `grace-5h-utilization`."""
+    return (
+        b"anthropic-ratelimit-unified-representative-claim: seven_day\r\n"
+        b"anthropic-ratelimit-unified-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-utilization: %s\r\n"
+        b"anthropic-ratelimit-unified-7d-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-7d-surpassed-threshold: 0.75\r\n"
+        b"anthropic-ratelimit-unified-fallback: available\r\n"
+        b"anthropic-ratelimit-unified-fallback-percentage: 0.5\r\n"
+        b"anthropic-ratelimit-unified-overage-status: rejected\r\n"
+        b"anthropic-ratelimit-unified-overage-disabled-reason: "
+        b"org_level_disabled\r\n"
+        b"anthropic-ratelimit-unified-upgrade-paths: overage\r\n"
+        % str(seven).encode())
+
+
 class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     """A 429 on /v1/messages sleeps the client for the WHOLE reset window of
     the account it walled; a credential swap underneath that sleep does not
@@ -20780,6 +20801,37 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     in got), (what, got)
             assert self.CLAIM + b"five_hour\r\n" in got, (what, got)
 
+    def case_a_weekly_walled_account_with_no_5h_window_relays_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """T3114. An account whose 5h limit is gone can only be walled by the
+        week, but cswap's walled override still forces its `five_hour` to 100
+        at the wall's deadline, so the decision value alone reads a 5h wall.
+        The entry's own `last_good` says there is no 5h window and a weekly
+        one: the wall is the week's, at any stored weekly figure (96 here, not
+        yet 100) and at 100 alike. With a stored 5h window the tie is the
+        session claim as before."""
+        at = time.time() + 3600
+        week = at + 86400
+        forced = {"five_hour": {"pct": 100.0, "resets_at": at}}
+        for what, seven, stored, claim in (
+                ("no 5h, week at 96", 96.0, {"seven_day": {
+                    "pct": 96.0, "resets_at": week}}, b"seven_day"),
+                ("no 5h, week at 100", 100.0, {"seven_day": {
+                    "pct": 100.0, "resets_at": at}}, b"seven_day"),
+                ("5h stored, week at 96", 96.0, {
+                    "five_hour": {"pct": 60.0, "resets_at": at},
+                    "seven_day": {"pct": 96.0, "resets_at": week}},
+                 b"five_hour")):
+            self._wire(monkeypatch, switched=False, fleet={"6": {
+                **forced, "seven_day": {
+                    "pct": seven, "resets_at": at if seven >= 100 else week}}},
+                stored={"6": stored})
+            got = self._relay()
+            assert (f"anthropic-ratelimit-unified-reset: {int(at)}".encode()
+                    in got), (what, got)
+            assert self.CLAIM + claim + b"\r\n" in got, (what, got)
+
     def case_the_decision_time_cap_keeps_the_fleet_claim(self, monkeypatch):
         """Not every blocked slot proved a reset, so the announced reset is
         the cap, not any window's: the claim stays the fleet's weekly one."""
@@ -21268,13 +21320,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42", (
             recorded)
 
-    def case_no_5h_header_never_calls_record(self, monkeypatch):
+    def case_a_reply_with_no_utilization_header_at_all_never_calls_record(
+        self, monkeypatch,
+    ):
         self._run_usage_thread_synchronously(monkeypatch)
         recorded = []
         self._wire(monkeypatch, switched=True, live_token=self.LIVE,
                    record_usage_headers=lambda *a: recorded.append(a))
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE)
         assert not recorded, recorded
+
+    def case_a_200_with_7d_headers_and_no_5h_header_records_the_7d_reading(
+        self, monkeypatch,
+    ):
+        """T3114: an account whose 5h limit is gone replies with a 7d reading
+        and no 5h header. It is a no-5h account, not an unmeasured one: the
+        reading goes to the store call with no 5h value in it (absent, never
+        0)."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   live_num="8",
+                   record_usage_headers=lambda num, headers:
+                       recorded.append((num, headers)))
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=_no_5h_headers())
+        assert len(recorded) == 1, recorded
+        num, headers = recorded[0]
+        assert num == "8", recorded
+        assert headers["anthropic-ratelimit-unified-7d-utilization"] == "0.96", (
+            recorded)
+        assert not [k for k in headers if "5h" in k], headers
+
+    def case_cswap_refusing_a_7d_only_reading_costs_the_reply_nothing(
+        self, monkeypatch,
+    ):
+        """A cswap older than its T3160 answers False for a reading with no 5h
+        value: the reply is relayed and nothing is logged as a raise."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._run_usage_thread_synchronously(monkeypatch)
+        asked = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: asked.append(a) or False)
+        got = self._relay(status=b"200 OK", reset=False,
+                          auth="Bearer " + self.LIVE,
+                          extra_headers=_no_5h_headers())
+        assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        assert len(asked) == 1, asked
+        assert not any("usage-header record raised" in m for m in logged), logged
 
     def case_many_200s_inside_30s_spawn_one_thread(self, monkeypatch):
         """T1178: moving the throttle inside `_run` left NOTHING in front
@@ -26278,6 +26373,43 @@ class TestSessionAffinityOnMessages:
                 reply=self._util(five, seven=seven))
             assert auths == ["Bearer tok-A", "Bearer tok-B"], (
                 five, seven, auths)
+
+    @staticmethod
+    def _no_5h(seven, extra=b""):
+        return (b"HTTP/1.1 200 OK\r\n" + extra + _no_5h_headers(seven)
+                + b"Content-Length: 2\r\n\r\n{}")
+
+    def case_a_kept_accounts_7d_only_reply_is_read_against_its_bar(
+            self, monkeypatch, certdir):
+        """T3114: an account with no 5h limit replies with a 7d reading alone.
+        That reading is the whole of its use, so it drops the slot at the bar
+        (and records to the slot, past the throttles) and keeps it under."""
+        for util, want, recorded in ((0.96, "tok-B", ["1"]),
+                                     (0.80, "tok-A", [])):
+            seen = self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._no_5h(util))
+            assert auths == ["Bearer tok-A", f"Bearer {want}"], (util, auths)
+            assert seen.recorded[:1] == recorded, (util, seen.recorded)
+
+    def case_a_7d_only_reply_updates_the_last_known_use(
+            self, monkeypatch, certdir):
+        """The snapshot said 10; a kept reply with 7d alone says 88 (bar 90,
+        margin 10): a stale snapshot no longer keeps the slot. A reply whose
+        5h header is there but unreadable is NOT a no-5h account, and its 7d
+        figure alone is no whole reading."""
+        for extra, want in ((b"", "tok-B"), (
+                b"anthropic-ratelimit-unified-5h-utilization: n/a\r\n",
+                "tok-A")):
+            self._stale(monkeypatch, certdir, pct=10.0)
+            _, auths = self._send(certdir, [("tok-A", "S")],
+                                  reply=self._no_5h(0.88, extra))
+            assert auths == ["Bearer tok-A"], auths
+            self._seed("S", "tok-A", age=100)
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (extra, auths)
 
     def case_a_stored_credential_with_no_expiry_is_not_kept(
             self, monkeypatch, certdir):

@@ -3854,7 +3854,12 @@ def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
         ident = _affinity_idents.get(token)
         stored = _affinity_kept.get(ident)
         if stored is None or used < stored[2]:
-            if stored is not None and len(seen) == 2:  # the last known use
+            # the last known use, from a reading of both windows or, for a
+            # no-5h account, of the 7d one it carries alone (a 5h header that
+            # is there and unreadable leaves the reading short)
+            if stored is not None and (len(seen) == 2 or (
+                    seen and "anthropic-ratelimit-unified-5h-utilization"
+                    not in headers)):
                 _affinity_kept[ident] = (*stored[:4], used)
             return None
         del _affinity_kept[ident]
@@ -26745,7 +26750,9 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
     windows), "5h" is `five_hour` and every other, "7d" and a per-model
     weekly one alike, is `seven_day`. A tie between "5h" and a weekly window
     is `seven_day` when the entry's stored reading (``last_good``, not the
-    walled override) has a weekly window at >=100%, else `five_hour`.
+    walled override) has a weekly window at >=100%, else `five_hour`; and an
+    entry whose stored reading has a "7d" window and no "5h" one (a no-5h
+    account) is `seven_day`, tie or not.
     ``all_provable`` is False as soon as
     some blocked slot's own reset is unprovable (absent, or already past — it
     could recover at any moment) —
@@ -26791,13 +26798,19 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
                 # stored 7d gets a synthesized 7d at that deadline too. The
                 # entry's own `last_good` tells them apart: a weekly window
                 # at 100% there is the wall; without one nothing says the
-                # week is walled, so the tie is the session claim.
+                # week is walled, so the tie is the session claim. A stored
+                # week with no stored 5h window is an account whose 5h limit
+                # is gone: its forced 5h is only cswap's override, so the
+                # wall is the week's at any stored figure.
                 labels = {l for l, ts in walled if ts == reset}
+                stored = {l: pct for l, pct, _ in
+                          oauth.relevant_windows(entry.last_good, ("all",))}
+                no_5h = "7d" in stored and "5h" not in stored
                 stored_weekly = any(
-                    l != "5h" and pct >= 100.0 for l, pct, _ in
-                    oauth.relevant_windows(entry.last_good, ("all",)))
-                claim = ("five_hour" if labels <= {"5h"} or (
-                    "5h" in labels and not stored_weekly) else "seven_day")
+                    l != "5h" and pct >= 100.0 for l, pct in stored.items())
+                claim = ("five_hour" if not no_5h and (
+                    labels <= {"5h"} or "5h" in labels and not stored_weekly)
+                    else "seven_day")
         return earliest, all_provable, claim
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None, True, "five_hour"
@@ -27410,7 +27423,11 @@ def _note_usage_headers(
         k, v = line.split(b":", 1)
         headers[k.strip().lower().decode("latin1", "replace")] = (
             v.strip().decode("latin1", "replace"))
-    if "anthropic-ratelimit-unified-5h-utilization" not in headers:
+    # EITHER WINDOW'S READING IS ONE: an account whose 5h limit is gone replies
+    # with 7d headers and no 5h one, and is a no-5h account, not an unmeasured
+    # one. The 5h value stays absent in what is handed over, never 0.
+    if not any(f"anthropic-ratelimit-unified-{w}-utilization" in headers
+               for w in ("5h", "7d")):
         return
     token = auth.strip()
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
