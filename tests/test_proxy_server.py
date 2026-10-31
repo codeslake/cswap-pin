@@ -19545,10 +19545,255 @@ class TestAHandoverMidDrainDropsTheClock:
         """What keeps the two above from being "always wait": nothing serves
         the port, the capped arm is holding it dark, and a supervisor counts
         to `_DRAIN_SECONDS + 2` - the tunnels go as they always did."""
-        out, pump = self._drain_a_tunnel(
-            tmp_path, monkeypatch, superseded=False, moving_for=0)
+        import cswap_pin.proxy as pp
+        # T3131: an unheld drain with a tunnel gives a launch `_SPAWN_WAIT_S`
+        # before it asks whether a holder exists, so this one needs a clock.
+        # `_drain` stubs the sleep, so each look at the owed replies moves it
+        # half a second.
+        real, spent = pp.time.monotonic, [0.0]
+        monkeypatch.setattr(pp.time, "monotonic", lambda: real() + spent[0])
+        monkeypatch.setattr(pp, "_holder_owns", lambda *a, **k: False)
+
+        def nothing_owed(_started):
+            spent[0] += 0.5
+            return False
+        pump = self._Tunnels()
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        out = self._drain(tmp_path, monkeypatch, superseded=False,
+                          owed=nothing_owed)
         assert pump.polls == 0 and pump.released == 1, (
             f"polls={pump.polls} released={pump.released}: {out}")
+
+    def _drain_for_a_successor(self, tmp_path, monkeypatch, *, holder,
+                               port=lambda t: False,
+                               publishes=float("inf"), held=False, live=20,
+                               read_fails=lambda t: False, emfile=False):
+        """An UNHELD signal drain with live tunnels and nothing owed, on a clock
+        each sleep advances, with the launch's side played as it happens: its
+        `_spawn_daemon` gives up at `_SPAWN_WAIT_S`, where the REAL
+        `_clear_handover_mark` runs. ``holder`` says, from the clock, whether a
+        `--hold-port` process for this certdir exists (`_holder_owns`).
+        ``port`` says what a loopback connect to ANY port meets: True accepts,
+        False is refused, None times out as a loaded host's does. The
+        successor publishes its record at ``publishes``, and
+        `_superseded_on_the_port` reads it for real. ``read_fails`` says, from
+        the clock, that the read itself could not tell (a `ps` that timed out):
+        `_holder_owns` then answers what its caller chose for "cannot tell",
+        its ``unknown``. ``emfile`` leaves `_holder_owns` REAL and fails every
+        `/proc/<pid>/cmdline` read with EMFILE, as a daemon out of descriptors
+        gets. Returns (clock, pump,
+        log, the clock times `_holder_owns` was read at)."""
+        import cswap_pin.proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        pp.write_daemon_state(certdir, 1234, os.getpid(), "fp", handover=True)
+        pump = self._Tunnels(life=live)
+        monkeypatch.setattr(pp, "_PUMP", pump)
+        monkeypatch.setattr(pp, "held_by_a_holder", lambda *a, **k: held)
+        real, clock, done, reads = pp.time.monotonic, [0.0], set(), []
+        monkeypatch.setattr(pp.time, "monotonic", lambda: real() + clock[0])
+
+        def sleep(s):
+            clock[0] += s
+            if clock[0] >= pp._SPAWN_WAIT_S and "gave up" not in done:
+                done.add("gave up")
+                pp._clear_handover_mark(certdir)
+            if clock[0] >= publishes and "published" not in done:
+                done.add("published")
+                # A LIVE pid that is not this one: the real predicate reads it.
+                pp.write_daemon_state(certdir, 1234, os.getppid(), "fp2")
+        monkeypatch.setattr(pp.time, "sleep", sleep)
+
+        def connect(addr, timeout=None, *a, **k):
+            met = port(clock[0])
+            if met is None:
+                raise TimeoutError("timed out")
+            if not met:
+                raise ConnectionRefusedError(111, "refused")
+            return contextlib.nullcontext()
+        monkeypatch.setattr(pp.socket, "create_connection", connect)
+
+        def owns(cd, unknown=False):
+            assert cd == certdir, cd
+            reads.append(clock[0])
+            return unknown if read_fails(clock[0]) else holder(clock[0])
+        if emfile:
+            real_read = pp.Path.read_bytes
+
+            def read_bytes(self):
+                if self.name == "cmdline":
+                    raise OSError(errno.EMFILE, "Too many open files")
+                return real_read(self)
+            monkeypatch.setattr(pp.Path, "read_bytes", read_bytes)
+        else:
+            monkeypatch.setattr(pp, "_holder_owns", owns)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        proxy.port = 1234
+        monkeypatch.setattr(proxy, "_owed_still_moving", lambda _s: False)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            proxy.await_inflight(pp.teardown_drain_budget(
+                "signal SIGTERM", held))
+        return clock[0], pump, err.getvalue(), reads
+
+    def test_an_unheld_drain_waits_out_a_successor_slower_than_the_launchs_wait(
+            self, tmp_path, monkeypatch):
+        """T3131: a launch recycling an UNHELD daemon TERMs it before any
+        successor exists, and the drain owed nothing, so its first look broke
+        on "nothing owed" and `release_pairs` cut every Remote Control channel
+        before `_spawn_daemon` had started a holder. The drain now waits while
+        a `--hold-port` process for its certdir exists, which is true from the
+        holder's exec, before it imports this module or binds anything, and
+        needs no launch to keep it so. The mark the launch writes is no such
+        signal: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and clears it while
+        the holder is still booting, and a successor was measured at 56-85 s
+        on a loaded host. The holder exists from 0.2 s, its port REFUSES until
+        20 s (the import, the bind), the launch clears the mark at 10 s (the
+        real `_clear_handover_mark`), and the successor publishes at 60 s, past
+        both that and the drain's 30 s cap; `_superseded_on_the_port` is the
+        real one."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, reads = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            port=lambda t: None if t >= 20.0 else False, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"with a successor's holder running: {out}")
+        assert clock >= 60.0 and "dropping the wall clock" in out, (clock, out)
+        assert reads, "the drain never asked whether a holder exists"
+
+    def test_a_holder_whose_port_times_out_every_probe_is_still_waited_on(
+            self, tmp_path, monkeypatch):
+        """T3131 review: a booting holder's `listen` backlog has no acceptor
+        for the 56-85 s the daemon takes to start, while live sessions keep
+        dialling it, so a connect can time out at any probe. The file's own
+        rule (`_port_refuses`, T2534/T2554) is that a timeout is a live peer
+        and only a refusal means nobody; the drain asks no port at all, and the
+        holder's existence decides."""
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            port=lambda t: None, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"while the holder's port timed out: {out}")
+        assert clock >= 60.0, (clock, out)
+
+    def test_a_holder_read_that_fails_does_not_end_the_wait(
+            self, tmp_path, monkeypatch):
+        """T3131 review: `_holder_owns` answered False for "cannot tell" (a
+        macOS `ps` that hit its 5 s bound or could not fork, which a loaded
+        host does: the file records multi-second stalls), and in the drain a
+        False ends the wait at once and `release_pairs` cuts every tunnel
+        while the successor's holder runs. The holder exists from 0.2 s, the
+        reads between 12 s and 40 s fail, and the successor publishes at 60 s:
+        a read that fails is not an answer that nobody is coming."""
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t >= 0.2,
+            read_fails=lambda t: 12.0 <= t < 40.0, publishes=60.0)
+        assert pump.polls >= pump.life and pump.released == 0, (
+            f"released {pump.released} live tunnel(s) after {clock:.1f}s "
+            f"because a holder read could not tell: {out}")
+        assert clock >= 60.0, (clock, out)
+
+    def test_CONTROL_a_read_that_always_fails_is_waited_on_to_the_bound_only(
+            self, tmp_path, monkeypatch):
+        """Reading "cannot tell" as a holder is bounded like any other holder:
+        a `ps` that never answers, with no successor ever coming, holds the
+        tunnels to `_RELOCATE_WAIT_S` and then they go as they always did."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False,
+            read_fails=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), clock
+
+    def test_a_daemon_out_of_descriptors_does_not_cut_before_the_bound(
+            self, tmp_path, monkeypatch):
+        """T3131 review: with no descriptor to open /proc/<pid>/cmdline, every
+        read of the real `_holder_owns` failed, each was skipped, and the scan
+        answered "no holder": the drain ended its wait at the end of the grace
+        and cut every tunnel while the successor's holder ran. Nothing read is
+        not a reading of nobody, so it waits like any holder, to the bound."""
+        import cswap_pin.proxy as pp
+        if not os.path.isdir("/proc"):
+            pytest.skip("the /proc scan is Linux's")
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False, emfile=True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), (
+            f"the tunnels went at {clock:.1f}s, not at the bound: {out}")
+
+    def test_CONTROL_no_holder_releases_the_tunnels_when_the_grace_ends(
+            self, tmp_path, monkeypatch):
+        """What the wait is NOT: the first `_SPAWN_WAIT_S` cover the moments
+        between the drain's announce and the launch's Popen, when no holder can
+        exist yet, and then a holder decides. None ever (the spawn failed, a
+        bare TERM) releases at the end of the grace: not at 0.0, which cut a
+        tunnel before the holder could start, and not at 180 s."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert pp._SPAWN_WAIT_S <= clock < pp._SPAWN_WAIT_S + 1.0, clock
+
+    def test_CONTROL_a_port_that_answers_without_a_holder_is_no_successor(
+            self, tmp_path, monkeypatch):
+        """The detach arm of `release_listener`: a daemon on an inherited
+        listener (a macOS orphan whose holder was killed) keeps its own fd, or
+        a standby's dup of it, listening after its release, so the old port
+        answers for as long as the process lives with nobody accepting. A
+        port that answers is not a successor coming; only a holder is. The
+        tunnels go at the end of the grace, not at 180 s."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False,
+            port=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert pp._SPAWN_WAIT_S <= clock < pp._SPAWN_WAIT_S + 1.0, clock
+
+    def test_CONTROL_a_holder_that_dies_releases_the_tunnels(
+            self, tmp_path, monkeypatch):
+        """The holder died with the successor not yet published: the wait ends
+        at the next read, a `_DRAINING_BEAT_SECONDS` apart, not at the bound."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: t < 30.0)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert 30.0 <= clock < 30.0 + pp._DRAINING_BEAT_SECONDS + 1.0, clock
+
+    def test_CONTROL_a_holder_that_never_gets_a_successor_up_is_waited_on_to_a_bound(
+            self, tmp_path, monkeypatch):
+        """The wait is bounded by `_RELOCATE_WAIT_S`, the longest a successor
+        was measured to take (56-85 s, T1935) with margin: a holder that never
+        gets a successor up does not hold the tunnels for ever, and past the
+        bound they go as they always did. And the read costs a /proc scan (a
+        5 s `ps` on macOS), so it is one per `_DRAINING_BEAT_SECONDS`, not one
+        per 50 ms pass of the loop."""
+        import cswap_pin.proxy as pp
+        clock, pump, out, reads = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), clock
+        assert len(reads) <= pp._RELOCATE_WAIT_S / pp._DRAINING_BEAT_SECONDS + 1, (
+            f"{len(reads)} reads in {clock:.0f}s")
+
+    def test_CONTROL_no_live_tunnel_or_a_held_daemon_waits_for_nothing(
+            self, tmp_path, monkeypatch):
+        """What keeps the wait from being "every signal drain waits": a drain
+        with no tunnel to cut, and a HELD one (the holder puts the successor on
+        its own socket, T3107's arm), end at the first look as before, however
+        the holder reads."""
+        for i, (kw, want_released) in enumerate((
+                ({"live": 0}, 0), ({"held": True}, 1))):
+            clock, pump, out, reads = self._drain_for_a_successor(
+                tmp_path / str(i), monkeypatch, holder=lambda t: True, **kw)
+            assert pump.released == want_released and clock < 1.0, (
+                kw, clock, pump.released, out)
+            assert reads == [], (kw, reads)
 
     def test_a_tunnel_gone_quiet_still_leaves_a_superseded_drain(
             self, tmp_path, monkeypatch):
@@ -19583,7 +19828,7 @@ class TestAHandoverMidDrainDropsTheClock:
             that began during it is owed for three looks, and the next
             finds it done."""
             looks.append(pump.polls)
-            return pump.polls > 0 and len(looks) <= 4
+            return pump.polls > 0 and sum(map(bool, looks)) <= 3
 
         self._drain(tmp_path, monkeypatch, superseded=True, owed=owed)
         after = [p for p in looks if p > 0]

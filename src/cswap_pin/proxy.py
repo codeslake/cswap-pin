@@ -2190,8 +2190,12 @@ def heal(backup_root: Path, identity: dict | None = None,
                         asked_holder = None
                     # A DELIVERED ASK NOBODY CONFIRMED IS NOT GROUNDS TO TERM A
                     # SERVING DAEMON: its successor may be slow (56-85 s on a
-                    # loaded host) and with none on the port the TERM cuts every
-                    # tunnel. STALE FINGERPRINT ONLY (a wedge's TERM is its only
+                    # loaded host) and with none on the port a HELD daemon's
+                    # TERM cuts every tunnel (T3107's arm). An UNHELD daemon's
+                    # drain waits while a holder for this certdir exists
+                    # (`PinProxy._successor_is_due`, T3131); only a lock wait
+                    # that pushes the Popen below past `_SPAWN_WAIT_S` still
+                    # cuts. STALE FINGERPRINT ONLY (a wedge's TERM is its only
                     # repair). BOUNDED: the first time, leave an `asked` mark on
                     # this pid AND fingerprint (else `_watchdog_had_its_turn`
                     # rewrites it and the bound is lost). The next heal is the
@@ -10183,6 +10187,13 @@ def _keychain_denied_here(confirm: bool = True) -> bool:
     return True
 
 
+_DENIED_NO_SPAWN = (
+    "not spawning the pin daemon from here: this process cannot "
+    "read the Keychain (security rc=36), and a daemon it starts "
+    "could never mint. Start it from the login session -- the TUI "
+    "does, and so does `cswap pin --ensure` in a terminal there")
+
+
 def _note_keychain_denial(server) -> None:
     """Read ONCE, from the daemon's own process, whether this lineage is
     refused the Keychain, and let `/health` say so (`keychain_denied`, present
@@ -10722,6 +10733,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                     certdir, account_num, email, stale["port"], locked=True)
                 wire_global_config(port, ca)
                 return port, ca
+            # A HOST THAT CANNOT READ THE KEYCHAIN SPAWNS NOTHING BELOW, so the
+            # TERM of an UNHELD daemon (T3131) cut every tunnel with no
+            # successor coming. Send none: log the refusal the cold start
+            # logs, return None, wire nothing. NOT the stale daemon's port:
+            # `_read_alive_port` already refused it (a drainer, a wedged
+            # daemon, another account's), and wiring it is the outage or the
+            # wrong account. A held daemon's successor is the holder's, not
+            # ours, so that arm is unchanged.
+            if (not held and _keychain_denied_here()
+                    and not _holder_owns(certdir)):
+                _log_lifecycle(_DENIED_NO_SPAWN)
+                return None
             # Save the port BEFORE the kill: the daemon unlinks its own state
             # on TERM, so afterwards there is nothing left to reclaim from and
             # the successor would take a fresh port — stranding every session
@@ -10753,11 +10776,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             wire_global_config(stale["port"], ca)
             return stale["port"], ca
         if _keychain_denied_here():
-            _log_lifecycle(
-                "not spawning the pin daemon from here: this process cannot "
-                "read the Keychain (security rc=36), and a daemon it starts "
-                "could never mint. Start it from the login session -- the TUI "
-                "does, and so does `cswap pin --ensure` in a terminal there")
+            _log_lifecycle(_DENIED_NO_SPAWN)
             return None
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
@@ -10970,7 +10989,7 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     return held
 
 
-def _holder_owns(certdir: Path) -> bool:
+def _holder_owns(certdir: Path, unknown: bool = False) -> bool:
     """Is a holder holding the port for ``certdir``?
 
     /proc FIRST, `ps` only as the fallback. `ps -eo command=` TRUNCATES a long
@@ -10981,24 +11000,38 @@ def _holder_owns(certdir: Path) -> bool:
     width to run out of. It does not exist on macOS, which is why `ps` stays
     as the fallback rather than the primary.
 
-    Cannot tell -> False, which means "recycle the old way". Guessing True
-    would skip a recycle that was asked for.
+    CANNOT TELL -> ``unknown`` (a `ps` that times out, cannot fork or will
+    not decode; a /proc that cannot be listed or none of whose entries can be
+    read, as with no descriptor left; one unreadable entry is skipped), and
+    the CALLER chooses it because the safe side differs. False,
+    the default, is "recycle the old way": guessing True would skip a recycle
+    that was asked for. A signal drain waiting for its successor's holder
+    passes True (`PinProxy._successor_is_due`): there False cuts every tunnel
+    while the holder runs, and the wait is bounded anyway.
     """
     targets = {str(Path(certdir)), str(Path(certdir).resolve())}
 
     proc = Path("/proc")
     if proc.is_dir():
-        for entry in proc.glob("[0-9]*"):
+        # `os.listdir`, not `Path.glob`: glob swallows a failed scandir (3.13+).
+        try:
+            pids = [n for n in os.listdir("/proc") if n.isdigit()]
+        except OSError:
+            return unknown
+        read = 0
+        for pid in pids:
             try:
-                argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                argv = (proc / pid / "cmdline").read_bytes().replace(b"\0", b" ")
             except OSError:
                 continue
+            read += 1
             cmd = argv.decode("utf-8", "replace").rstrip()
             if _HOLDER_MODULE_ARG not in cmd:
                 continue
             if any(cmd.endswith(" " + t) for t in targets):
                 return True
-        return False
+        # Entries and not one readable: no descriptor left, not "no holder".
+        return unknown if pids and not read else False
 
     import subprocess
 
@@ -11007,8 +11040,8 @@ def _holder_owns(certdir: Path) -> bool:
             ["ps", "-ww", "-eo", "pid=,command="], capture_output=True, text=True,
             timeout=5,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return unknown
     for line in out.splitlines():
         cmd = line.strip().partition(" ")[2].rstrip()
         if _HOLDER_MODULE_ARG not in cmd:
@@ -16757,6 +16790,17 @@ def _watch_own_code(
                 # Another daemon may have recycled us while we queued.
                 if daemon_fingerprint() == own and not orphaned:
                     continue
+                # A DAEMON THAT HAS ALREADY STOPPED HAS NOTHING TO HAND DOWN
+                # (T3131). A launch's TERM of an unheld daemon drains for up to
+                # `_RELOCATE_WAIT_S` waiting for its successor, and
+                # `done` is set only when that ends, so this watchdog ticks
+                # beside it: a second release, then a SECOND successor beside
+                # the launch's. Read under the lock, as a tick queued behind
+                # the launch's own spawn finds `_stop` set only now. The
+                # starved branch declines on it too; the held branch above
+                # is left as it is (4176ab0).
+                if getattr(server, "_stop", False):
+                    continue
                 # RELEASE THE PORT, THEN DRAIN — in that order, and with the
                 # successor started in between. `stop(drain=N)` closes the
                 # listener FIRST and only then waits up to N seconds for in-
@@ -21097,10 +21141,18 @@ class PinProxy:
                 # tunnel wait that can last hours is owed from then on, and
                 # leaving for the release below cut it. The uncapped arm did
                 # its tunnel wait above, so it starts with it done.
+                # AND A SUCCESSOR ABOUT TO PUBLISH IS WAITED FOR, not only one
+                # already on the port (`_successor_is_due`): the exit tests
+                # below fire on the first look when nothing is owed, which for
+                # a TERM of an unheld daemon is before the successor's holder
+                # has started, and they then released every tunnel. The wait
+                # is for a HOLDER of this certdir, not for a port to answer.
                 tunnels_waited = promoted
                 while True:
-                    if (time.monotonic() >= deadline
-                            or not self._owed_still_moving(started)):
+                    if ((time.monotonic() >= deadline
+                         or not self._owed_still_moving(started))
+                            and (promoted
+                                 or not self._successor_is_due(started))):
                         # A TERM THAT FOUND A SUCCESSOR ALREADY ON THE PORT, or
                         # one that arrived while this drain ran, no longer holds
                         # the port dark, and its supervisor counts the successor
@@ -21227,6 +21279,50 @@ class PinProxy:
                 f" (this is the quantity `_owed_still_moving` reads)"
             )
         return cut
+
+    def _successor_is_due(self, started: float) -> bool:
+        """Whether this signal drain should keep waiting for a successor
+        instead of ending on "nothing owed" and releasing its tunnels (T3131).
+
+        A launch that recycles an UNHELD daemon TERMs it before any successor
+        exists, and `_superseded_on_the_port` cannot say one is coming until it
+        has PUBLISHED, 56-85 s on a loaded host (T1935). The signal read here is
+        A HOLDER EXISTING for this certdir (`_holder_owns`, a `--hold-port`
+        process): true from the holder's exec, before it imports this module or
+        binds anything, whichever port the successor takes, and gone when the
+        holder dies. NOT A PORT PROBE: a connect to a booting holder can time
+        out with its backlog unserved, and the file's rule is that only a
+        refusal means nobody (`_port_refuses`); and where this daemon runs on
+        an inherited listener (a macOS orphan) its own fd keeps the old port
+        answering with no successor coming. NOT A MARK the launch writes
+        either: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and clears it while
+        the holder is still booting.
+
+        The first `_SPAWN_WAIT_S` wait on no signal: between this drain's
+        announce (what lets the launch's `_kill_daemon` return) and its Popen no
+        holder can exist yet. After that the holder is looked for once per
+        `_DRAINING_BEAT_SECONDS`, the last answer carried: the loop passes every
+        50 ms and the read scans `/proc` (a `ps` with a 5 s bound on macOS).
+        A READ THAT FAILS READS AS A HOLDER (``unknown=True``): a `ps` that
+        times out or cannot fork is what a loaded host does, and "no holder"
+        cut every tunnel while the successor's holder ran.
+        The wait ends when the successor publishes (the drain is promoted and
+        takes `_wait_for_tunnels`), when no holder is left, or at
+        `_RELOCATE_WAIT_S`, and the tunnels go as they always did. Only with a
+        tunnel to release; NOT A HELD DAEMON (its holder puts the successor on
+        the socket, T3107's arm).
+        """
+        now = time.monotonic()
+        if (now >= started + _RELOCATE_WAIT_S
+                or held_by_a_holder() or not _PUMP.live_pairs()):
+            return False
+        if now < started + _SPAWN_WAIT_S:
+            return True
+        at, owned = getattr(self, "_due_probe", (float("-inf"), False))
+        if at < started + _SPAWN_WAIT_S or now - at >= _DRAINING_BEAT_SECONDS:
+            owned = _holder_owns(self._certdir, unknown=True)
+            self._due_probe = (now, owned)
+        return owned
 
     def _wait_for_tunnels(self, started: float) -> None:
         """Hold this drain open while a CONNECT tunnel `_PUMP` drives is live,

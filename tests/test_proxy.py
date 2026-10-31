@@ -11813,6 +11813,199 @@ class TestEnsureProxyLifecycle:
         assert got == 52000            # spawned fresh
         assert killed == [os.getpid()]  # stale daemon was recycled
 
+    def _recycle_unheld(self, tmp_path, monkeypatch, *, held=False,
+                        denied=False):
+        """`ensure_proxy` recycling a stale daemon whose pid is a REAL, dead
+        process, through the real `_recycle_daemon` and `_kill_daemon`: only
+        the signal is stubbed, by an `os.kill` spy that reads the record at the
+        instant each TERM is sent. Returns (those records, the port it
+        answers, the ports it wired into `.claude.json`)."""
+        import os, subprocess, sys
+        from cswap_pin import proxy as pin_proxy
+        self._pin(tmp_path)
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        pin_proxy.write_daemon_state(certdir, 40001, dead.pid, "STALE-FP")
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [dead.pid])
+        monkeypatch.setattr(pin_proxy, "_health_body", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", lambda p, k: None)
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: held)
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
+                            lambda *a, **k: denied)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
+        wired = []
+        monkeypatch.setattr(pin_proxy, "wire_global_config",
+                            lambda port, *a, **k: wired.append(port))
+        # A holder's respawn is what the held row waits for.
+        monkeypatch.setattr(
+            pin_proxy, "_read_alive_port",
+            lambda cd, fingerprint=None: 52000 if fingerprint is None else None)
+        at_term, real_kill = [], os.kill
+
+        def kill(pid, sig):
+            if sig == 15 and pid == dead.pid:
+                at_term.append(pin_proxy.read_daemon_state(certdir))
+                return None
+            return real_kill(pid, sig)
+        monkeypatch.setattr(os, "kill", kill)
+        got = (pin_proxy.ensure_proxy(self._Sw(tmp_path)) or (None,))[0]
+        return at_term, got, wired
+
+    def case_the_unheld_recycle_writes_no_mark_before_it_terms(
+            self, tmp_path, monkeypatch):
+        """T3131: the TERM of an unheld daemon starts a signal drain that must
+        wait for a successor, and the signal it reads is a holder existing
+        (`PinProxy._successor_is_due`). A mark written before the
+        TERM was the first try: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and
+        clears it while the holder is still booting, and it outlived a launch
+        that died before the spawn. The record at the TERM is the daemon's
+        own, as it was."""
+        at_term, got, _ = self._recycle_unheld(tmp_path, monkeypatch)
+        assert got == 52000 and len(at_term) == 1, (got, at_term)
+        assert "handover" not in at_term[0], (
+            f"the record at the TERM was {at_term[0]}: a launch-owned mark "
+            "the drain would have to outlive")
+
+    def case_a_denied_host_sends_an_unheld_daemon_no_term(
+            self, tmp_path, monkeypatch, capsys):
+        """T3131: a host that cannot read the Keychain spawns nothing, so the
+        TERM of an unheld daemon cut every tunnel with no successor coming.
+        It is the base behaviour minus the cut: no TERM, the cold-start
+        refusal logged, None returned and nothing wired. Not the port of the
+        daemon left serving: `_read_alive_port` had already refused it (a
+        drainer, a wedged daemon, another account's), so wiring it breaks the
+        session or pins the wrong account. The HELD arm is the holder's
+        respawn and still TERMs."""
+        at_term, got, wired = self._recycle_unheld(
+            tmp_path, monkeypatch, denied=True)
+        assert at_term == [] and got is None and wired == [], (
+            f"TERMs {at_term}, port {got}, wired {wired}: a denied host "
+            "sent a TERM that nothing would follow, or wired a refused port")
+        assert "not spawning the pin daemon from here" in capsys.readouterr().err
+        (tmp_path / "held").mkdir()
+        at_term, got, wired = self._recycle_unheld(
+            tmp_path / "held", monkeypatch, held=True, denied=True)
+        assert len(at_term) == 1 and got == 52000, (at_term, got)
+
+    def case_a_holder_read_that_cannot_tell_answers_what_its_caller_chose(
+            self, tmp_path, monkeypatch):
+        """T3131 review: `_holder_owns` collapsed "cannot tell" into False. For
+        a recycle that is the safe side (recycle the old way; True would skip
+        a recycle that was asked for), for a signal drain it is the unsafe one
+        (False ends the wait and cuts every tunnel while a successor's holder
+        runs), so the caller chooses with ``unknown``. Every failure the read
+        has: a `ps` that times out, cannot fork (EAGAIN under a herd) or
+        prints what the locale cannot decode, and a /proc that cannot be
+        listed. A read that DID answer decides, whatever ``unknown`` says."""
+        import subprocess
+        import types
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+
+        def fails(exc):
+            def run(*a, **k):
+                raise exc
+            return run
+
+        def both(label, want_default=False):
+            assert pin_proxy._holder_owns(certdir) is want_default, label
+            assert pin_proxy._holder_owns(certdir, unknown=True) is True, label
+
+        with monkeypatch.context() as m:
+            m.setattr(pin_proxy.Path, "is_dir", lambda self: False)  # no /proc
+            for exc in (subprocess.TimeoutExpired("ps", 5), OSError("EAGAIN"),
+                        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")):
+                m.setattr(subprocess, "run", fails(exc))
+                both(f"ps raised {exc!r}")
+            m.setattr(subprocess, "run",
+                      lambda *a, **k: types.SimpleNamespace(stdout=""))
+            assert pin_proxy._holder_owns(certdir, unknown=True) is False, (
+                "a ps that answered with no holder in it was read as unknown")
+        if not os.path.isdir("/proc"):
+            return
+        # The calls the scan really makes: `Path.glob` swallows a failed
+        # scandir on Python 3.13+, so it is `os.listdir` that must raise.
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        real_listdir, real_read = os.listdir, pin_proxy.Path.read_bytes
+        reads, every_read_fails = [], False
+
+        def listdir(path="."):
+            if str(path) == "/proc":
+                raise emfile
+            return real_listdir(path)
+
+        def read_bytes(self):
+            if self.name == "cmdline" and self.parent.parent == Path("/proc"):
+                reads.append(self)
+                if len(reads) == 1 or every_read_fails:
+                    raise emfile
+            return real_read(self)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "listdir", listdir)
+            both("/proc could not be listed")
+        with monkeypatch.context() as m:
+            m.setattr(pin_proxy.Path, "read_bytes", read_bytes)
+            # One unreadable entry is skipped and the others decide.
+            assert pin_proxy._holder_owns(certdir, unknown=True) is False
+            assert len(reads) > 1, "the scan stopped at its first unreadable entry"
+            every_read_fails = True
+            both("a daemon out of descriptors could read no /proc entry")
+
+    def case_a_real_holder_argv_from_spawn_daemon_reads_as_owned(
+            self, tmp_path, monkeypatch):
+        """T3131 review: the drain's whole signal is `_holder_owns` matching the
+        argv `_spawn_daemon` really builds for a holder, so it is read from a
+        real process rather than from a hand-written command line. The argv is
+        captured from `_spawn_daemon`'s own Popen for a certdir given as it is
+        and through a symlink, then run by a child that only sleeps (the
+        module swapped, `--hold-port` and the certdir kept). The query goes by
+        the symlink: the argv may carry either form, and a different certdir
+        is no holder. Each is read through /proc and again through the `ps`
+        fallback (macOS has no /proc), so Linux covers both reads."""
+        import subprocess
+        import sys
+        from cswap_pin import proxy as pin_proxy
+
+        real_popen, seen = subprocess.Popen, []
+        certdir = tmp_path / "real" / "pin-proxy"
+        certdir.mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(certdir)
+        # The spy ends with the spawns: `_holder_owns`' macOS `ps` read runs
+        # through `subprocess.run`, which needs the real Popen.
+        with monkeypatch.context() as m:
+            m.setattr(subprocess, "Popen",
+                      lambda argv, **kw: seen.append(list(argv)))
+            for form in (certdir, link):
+                assert pin_proxy._spawn_daemon(
+                    "1", "a@b.c", form, wait_s=0) is None
+        assert len(seen) == 2, seen
+        for argv in seen:
+            assert argv[1:3] == ["-m", pin_proxy._DAEMON_MODULE], argv
+            assert argv[3] == pin_proxy._HOLDER_MODULE_ARG, argv
+        children = []
+        try:
+            for argv, ps_only in [(a, p) for a in seen for p in (False, True)]:
+                with monkeypatch.context() as m:
+                    if ps_only:  # macOS has no /proc: force its `ps` read here
+                        m.setattr(pin_proxy.Path, "is_dir", lambda self: False)
+                    child = real_popen(
+                        [argv[0], "-c", "import time; time.sleep(60)", *argv[3:]])
+                    children.append(child)
+                    assert pin_proxy._holder_owns(link) is True, (argv, ps_only)
+                    assert pin_proxy._holder_owns(tmp_path / "other") is False
+                    child.kill()
+                    child.wait(timeout=5)
+                    assert pin_proxy._holder_owns(link) is False, (
+                        "the holder is gone and still reads as owned", argv)
+        finally:
+            for child in children:
+                child.kill()
+                child.wait(timeout=5)
+
 
 def _watch_blocking_phase(monkeypatch):
     """An Event that fires when `watch_refcount` enters its blocking read.
@@ -16485,6 +16678,58 @@ print("OK", port)
             pin_proxy._HANDOVER_DRAIN_SECONDS], (
             f"exits={exited} released={released} budgets={budgets}: the "
             f"superseded tail is release, drain uncapped, exit 0")
+
+    def case_an_unheld_daemon_already_stopped_hands_nothing_down(
+        self, tmp_path, monkeypatch
+    ):
+        """T3131: an unheld daemon a launch TERMed now drains for up to
+        `_RELOCATE_WAIT_S`, waiting for the successor a launch is starting, and
+        `done` is set only when that drain ends. The watchdog keeps ticking
+        beside it (30 s, against a wait that can last minutes), and a tick on
+        stale code, an orphaned daemon or a blind one took the hand-down: a
+        second release (no socket left to pass), then `_spawn_daemon` with
+        `listen_fd=None`, a SECOND successor beside the launch's that rewrote
+        the first one's record with the handover mark. The starved branch
+        already declines on `_stop`; this declines on it too, under the spawn
+        lock, so a tick queued behind the launch's own spawn is covered."""
+        from cswap_pin import proxy as pin_proxy
+
+        spawned = []
+
+        class _Srv:
+            port = 36301
+            _stop = True
+
+            def release_listener(self, hand_down=False):
+                # A STOPPED server has no socket left to pass down.
+                return 7 if hand_down and not self._stop else None
+
+            def await_inflight(self, budget):
+                pass
+
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon", lambda *a, **k: spawned.append(k) or 1234)
+        monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(
+            SystemExit(code)))
+        monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
+
+        def tick(srv):
+            try:
+                pin_proxy._watch_own_code(
+                    srv, "1", "a@b.c", tmp_path, self._Ticks(),
+                    lambda *a: None, interval=0.01,
+                    _own_fingerprint="never-matches")
+            except SystemExit:
+                pass
+
+        tick(_Srv())
+        assert spawned == [], (
+            f"a daemon already stopped handed down and spawned: {spawned}")
+        # CONTROL: the same tick on a daemon still accepting hands down.
+        control = _Srv()
+        control._stop = False
+        tick(control)
+        assert spawned and spawned[0].get("listen_fd") == 7, spawned
 
     def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
         """WHY the case above is the only shape available, not a preference.
