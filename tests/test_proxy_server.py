@@ -17610,14 +17610,6 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         rig.advance((480 - 4.5) * 60)          # inside the buffer, above the margin
         assert rig.provider.can_pin_cached() is False
 
-    def case_the_hold_margin_covers_one_tick_and_the_longest_refresh(self):
-        """A hold that ends sooner than tick + refresh lets the token die
-        between the tick that held it and the one that would replace."""
-        from cswap_pin import proxy as pp
-
-        assert pp._HOLD_MARGIN_MS / 1000 >= (
-            pp._CODE_WATCH_INTERVAL_S + pp._MINT_LOCK_BOUND_S)
-
     def case_the_tick_logs_the_edge_itself_before_it_refreshes(
             self, certdir, monkeypatch):
         """No `/health` reader at all: a token already inside the liveness

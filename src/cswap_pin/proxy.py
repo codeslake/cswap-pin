@@ -16415,7 +16415,7 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 
 _CODE_WATCH_INTERVAL_S = 30.0
-# A TOKEN INSIDE CSWAP'S 5-MINUTE BUFFER IS NOT DEAD, only due: after a TRANSIENT
+# A TOKEN INSIDE CSWAP'S 5-MINUTE BUFFER IS DUE, NOT DEAD: after a TRANSIENT
 # refresh failure it is still served until this much of it is left (the next
 # tick plus the longest refresh), so that tick can still replace the daemon
 # before the token really expires. See `_held_after_transient`.
