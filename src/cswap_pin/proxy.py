@@ -16668,6 +16668,7 @@ def _watch_own_code(
     # for each one. One shot leaves the machine exactly as it was if it fails,
     # which is the safer of the two ways to be wrong.
     stand_down_asked = False
+    orphan_wait_since = None
     # THE HELD-REPLACE ASK IS NOT ONCE PER PROCESS (T3107), AND NEEDS NO
     # LOOP-CARRIED STATE: a wait that finds no successor keeps serving
     # (`_asked_done`, `continue`), and the next tick finds the holder's sidecar
@@ -16973,7 +16974,27 @@ def _watch_own_code(
                     setattr(server, "_carry_owed", False)
                     server.await_inflight(_HANDOVER_DRAIN_SECONDS)
                     os._exit(0)
+                # THE WAIT ENDS BY THE CLOCK, NOT BY `attempts` (T3169).
+                # `_holder_owns` is "some holder of this certdir", on any port,
+                # so a successor that never serves left this orphan waiting
+                # for ever, still accepting and on stale code. A tick count is
+                # no bound: the fleet ticks 30 s, a test 0.3 s. The figure is
+                # the new holder's own: its watch gives its successor
+                # `_RELOCATE_WAIT_S` and stops, so waiting longer gains
+                # nothing. THE RETURN ENDS THE BEAT, BY DESIGN, as the
+                # attempts ceiling below does: `/health` then says
+                # `code_watch_age_s` null, which a launch reads as a dead
+                # watchdog and repairs itself (T3100).
+                orphan_wait_since = orphan_wait_since or time.monotonic()
+                if time.monotonic() - orphan_wait_since >= _RELOCATE_WAIT_S:
+                    _log_lifecycle(
+                        f"{why}: no successor of the new holder served the "
+                        f"port within {_RELOCATE_WAIT_S:.0f}s, staying on the "
+                        f"current code, still serving"
+                    )
+                    return
                 continue
+            orphan_wait_since = None
             if replace_for_blind:
                 n = note_blind_recycle(certdir, now)
                 _log_lifecycle(
