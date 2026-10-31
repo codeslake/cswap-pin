@@ -25229,7 +25229,7 @@ class TestSessionAffinityOnMessages:
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
         for last_good in (
-                None, {"seven_day": {"pct": 10.0}},
+                None, {"five_hour": {"pct": None}, "seven_day": {"pct": 10.0}},
                 {"five_hour": {"pct": 30.0, "resets_at": self._iso(-3600)}},
                 {"five_hour": {"pct": 30.0}}):
             seen = self._wire(monkeypatch, certdir)
@@ -25240,6 +25240,24 @@ class TestSessionAffinityOnMessages:
             assert auths == ["Bearer tok-B"], (last_good, auths)
             assert pp._affinity_why[self.IDENT] == (
                 "a usage window has no reading"), pp._affinity_why
+
+    def case_a_no_5h_account_is_kept_and_judged_on_its_week(
+            self, monkeypatch, certdir):
+        """An account whose 5h limit is gone stores a week and no 5h window
+        (account 8, 2026-10-31; its `scoped` rides along): its only wall is
+        the week's, so the gap is no "no reading". Kept under its bar,
+        dropped at it."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        for pct, want, why in ((30.0, "tok-A", None),
+                               (95.0, "tok-B", "at its bar")):
+            seen.usage1 = seen.last_good1 = {
+                "seven_day": {"pct": pct}, "scoped": [{"name": "Fable", "pct": 5.0}]}
+            pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pct, auths)
+            assert pp._affinity_why[self.IDENT] == why, pp._affinity_why
 
     def case_a_reading_too_old_to_trust_says_so(self, monkeypatch, certdir):
         from cswap_pin import proxy as pp

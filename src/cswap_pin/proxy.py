@@ -3698,6 +3698,13 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                         w for w, _, at in oauth.relevant_windows(
                             getattr(entry, "last_good", None))
                         if (ts := parse(at)) is not None and ts <= time.time()}
+                last = getattr(entry, "last_good", None)
+                if ("7d" in windows and isinstance(last, dict)
+                        and "five_hour" not in last):
+                    # A stored week and no 5h key at all: the 5h limit is gone
+                    # and the week is the only wall, not a missing reading. A
+                    # key that is there and unreadable stays one.
+                    windows.add("5h")
                 bar = own.get(slot, base)
                 why[ident] = (
                     "walled" if getattr(entry, "walled", False) else
