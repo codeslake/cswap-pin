@@ -19567,7 +19567,7 @@ class TestAHandoverMidDrainDropsTheClock:
     def _drain_for_a_successor(self, tmp_path, monkeypatch, *, holder,
                                port=lambda t: False,
                                publishes=float("inf"), held=False, live=20,
-                               read_fails=lambda t: False):
+                               read_fails=lambda t: False, emfile=False):
         """An UNHELD signal drain with live tunnels and nothing owed, on a clock
         each sleep advances, with the launch's side played as it happens: its
         `_spawn_daemon` gives up at `_SPAWN_WAIT_S`, where the REAL
@@ -19579,7 +19579,9 @@ class TestAHandoverMidDrainDropsTheClock:
         `_superseded_on_the_port` reads it for real. ``read_fails`` says, from
         the clock, that the read itself could not tell (a `ps` that timed out):
         `_holder_owns` then answers what its caller chose for "cannot tell",
-        its ``unknown``. Returns (clock, pump,
+        its ``unknown``. ``emfile`` leaves `_holder_owns` REAL and fails every
+        `/proc/<pid>/cmdline` read with EMFILE, as a daemon out of descriptors
+        gets. Returns (clock, pump,
         log, the clock times `_holder_owns` was read at)."""
         import cswap_pin.proxy as pp
         certdir = tmp_path / "pin-proxy"
@@ -19615,7 +19617,16 @@ class TestAHandoverMidDrainDropsTheClock:
             assert cd == certdir, cd
             reads.append(clock[0])
             return unknown if read_fails(clock[0]) else holder(clock[0])
-        monkeypatch.setattr(pp, "_holder_owns", owns)
+        if emfile:
+            real_read = pp.Path.read_bytes
+
+            def read_bytes(self):
+                if self.name == "cmdline":
+                    raise OSError(errno.EMFILE, "Too many open files")
+                return real_read(self)
+            monkeypatch.setattr(pp.Path, "read_bytes", read_bytes)
+        else:
+            monkeypatch.setattr(pp, "_holder_owns", owns)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
                             upstream=("127.0.0.1", 1))
         proxy.port = 1234
@@ -19697,6 +19708,23 @@ class TestAHandoverMidDrainDropsTheClock:
         assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
         assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
                 < pp._RELOCATE_WAIT_S + 1.0), clock
+
+    def test_a_daemon_out_of_descriptors_does_not_cut_before_the_bound(
+            self, tmp_path, monkeypatch):
+        """T3131 review: with no descriptor to open /proc/<pid>/cmdline, every
+        read of the real `_holder_owns` failed, each was skipped, and the scan
+        answered "no holder": the drain ended its wait at the end of the grace
+        and cut every tunnel while the successor's holder ran. Nothing read is
+        not a reading of nobody, so it waits like any holder, to the bound."""
+        import cswap_pin.proxy as pp
+        if not os.path.isdir("/proc"):
+            pytest.skip("the /proc scan is Linux's")
+        clock, pump, out, _ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=lambda t: False, emfile=True)
+        assert pump.polls == 0 and pump.released == 1, (pump.polls, out)
+        assert (pp._RELOCATE_WAIT_S - 1.0 <= clock
+                < pp._RELOCATE_WAIT_S + 1.0), (
+            f"the tunnels went at {clock:.1f}s, not at the bound: {out}")
 
     def test_CONTROL_no_holder_releases_the_tunnels_when_the_grace_ends(
             self, tmp_path, monkeypatch):

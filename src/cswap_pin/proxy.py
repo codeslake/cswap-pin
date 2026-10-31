@@ -11001,8 +11001,9 @@ def _holder_owns(certdir: Path, unknown: bool = False) -> bool:
     as the fallback rather than the primary.
 
     CANNOT TELL -> ``unknown`` (a `ps` that times out, cannot fork or will
-    not decode, a /proc that cannot be listed; one unreadable /proc entry is
-    skipped), and the CALLER chooses it because the safe side differs. False,
+    not decode; a /proc that cannot be listed or none of whose entries can be
+    read, as with no descriptor left; one unreadable entry is skipped), and
+    the CALLER chooses it because the safe side differs. False,
     the default, is "recycle the old way": guessing True would skip a recycle
     that was asked for. A signal drain waiting for its successor's holder
     passes True (`PinProxy._successor_is_due`): there False cuts every tunnel
@@ -11012,21 +11013,25 @@ def _holder_owns(certdir: Path, unknown: bool = False) -> bool:
 
     proc = Path("/proc")
     if proc.is_dir():
+        # `os.listdir`, not `Path.glob`: glob swallows a failed scandir (3.13+).
         try:
-            entries = list(proc.glob("[0-9]*"))
+            pids = [n for n in os.listdir("/proc") if n.isdigit()]
         except OSError:
             return unknown
-        for entry in entries:
+        read = 0
+        for pid in pids:
             try:
-                argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                argv = (proc / pid / "cmdline").read_bytes().replace(b"\0", b" ")
             except OSError:
                 continue
+            read += 1
             cmd = argv.decode("utf-8", "replace").rstrip()
             if _HOLDER_MODULE_ARG not in cmd:
                 continue
             if any(cmd.endswith(" " + t) for t in targets):
                 return True
-        return False
+        # Entries and not one readable: no descriptor left, not "no holder".
+        return unknown if pids and not read else False
 
     import subprocess
 

@@ -11923,10 +11923,36 @@ class TestEnsureProxyLifecycle:
                       lambda *a, **k: types.SimpleNamespace(stdout=""))
             assert pin_proxy._holder_owns(certdir, unknown=True) is False, (
                 "a ps that answered with no holder in it was read as unknown")
+        if not os.path.isdir("/proc"):
+            return
+        # The calls the scan really makes: `Path.glob` swallows a failed
+        # scandir on Python 3.13+, so it is `os.listdir` that must raise.
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        real_listdir, real_read = os.listdir, pin_proxy.Path.read_bytes
+        reads, every_read_fails = [], False
+
+        def listdir(path="."):
+            if str(path) == "/proc":
+                raise emfile
+            return real_listdir(path)
+
+        def read_bytes(self):
+            if self.name == "cmdline" and self.parent.parent == Path("/proc"):
+                reads.append(self)
+                if len(reads) == 1 or every_read_fails:
+                    raise emfile
+            return real_read(self)
+
         with monkeypatch.context() as m:
-            m.setattr(pin_proxy.Path, "glob", fails(OSError("EMFILE")))
-            if os.path.isdir("/proc"):
-                both("/proc could not be listed")
+            m.setattr(os, "listdir", listdir)
+            both("/proc could not be listed")
+        with monkeypatch.context() as m:
+            m.setattr(pin_proxy.Path, "read_bytes", read_bytes)
+            # One unreadable entry is skipped and the others decide.
+            assert pin_proxy._holder_owns(certdir, unknown=True) is False
+            assert len(reads) > 1, "the scan stopped at its first unreadable entry"
+            every_read_fails = True
+            both("a daemon out of descriptors could read no /proc entry")
 
     def case_a_real_holder_argv_from_spawn_daemon_reads_as_owned(
             self, tmp_path, monkeypatch):
