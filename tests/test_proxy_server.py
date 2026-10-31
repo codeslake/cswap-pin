@@ -16120,6 +16120,19 @@ class TestTheKillGateIdentifiesItsTarget:
         )
         assert pids == [], "a daemon for another backup dir was selected"
 
+    def case_an_undecodable_ps_line_reads_as_no_daemon(self, tmp_path, monkeypatch):
+        # `text=True` raises UnicodeDecodeError (a ValueError) on a non-UTF-8
+        # argv; the watchdog's held branch calls this and must not die of it.
+        import subprocess as _sp
+
+        from cswap_pin import proxy as pp
+
+        def _boom(*a, **k):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr(_sp, "run", _boom)
+        assert pp._pin_daemon_pids(tmp_path) == []
+
 
 def test_mint_lock_bound_covers_the_real_in_lock_ceiling():
     """`_MINT_LOCK_BOUND_S` bounds a WAITER; the work the holder does inside

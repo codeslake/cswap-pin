@@ -10607,7 +10607,9 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # daemon successor-first. A live beat is that tick coming. A miss
             # of the one 1.0 s probe (1007 ms was measured on a loaded host,
             # T1935) or an answer naming another pid proves nothing, and a
-            # wedge is the holder's own port watch's. An answer that names the
+            # wedge is the holder's own port watch's, which does not probe a
+            # successor while a predecessor drains (T3107 owns that gap). An
+            # answer that names the
             # pid with a stale or absent beat IS the proof (a watchdog that
             # died with the daemon serving, or an older daemon with no beat),
             # and nothing else repairs it on a host that only uses `cswap run`:
@@ -11133,7 +11135,7 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
             ["ps", "-ww", "-axo", "pid=,command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return pids
     for line in out.splitlines():
         line = line.strip()
@@ -15905,9 +15907,11 @@ def _successor_serves_the_port(certdir: Path, port) -> bool:
     the listener and exited 0 with nothing behind the port (dark until the
     holder's port watch notices, 90-155 s). `ps` cannot see a pid in another
     namespace: that reads False and the branch asks the holder, as at the base.
-    The drain keeps the loose reading: there the listener is already released
-    and the process already leaving, so a false answer only lifts the wall
-    clock of a drain that is happening anyway.
+    The drain keeps the loose reading, and a false answer there costs more than
+    a clock. It takes a TERM plus a foreign record: the TERMed held daemon then
+    stays past its 30 s ceiling with its listener already released, so nothing
+    serves the port and the holder cannot respawn it until the port watch acts,
+    90-155 s on.
     """
     try:
         st = read_daemon_state(certdir)
@@ -16186,8 +16190,9 @@ def _watch_own_code(
 
     WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
     `ensure_proxy` leaves a stale daemon to this watchdog and recycles it
-    only when `/health` shows no live beat from it, and only when a new
-    session starts. A machine whose sessions are all already running never
+    only when this watchdog provably cannot repair it (no live beat, a mint
+    stall, the self-heal switch off; the last two recycle WITH a live beat),
+    and only when a new session starts. A machine whose sessions are all already running never
     launches, so an upgrade never reaches the process. Measured: a daemon served
     for 22 hours on code that had been replaced 19 hours earlier, across six
     releases, dialling direct instead of chaining — every claude.ai handshake
