@@ -3646,6 +3646,14 @@ def _bounded_put(table: dict, key, value) -> None:
         del table[next(iter(table))]
 
 
+def _row_has_no_5h_key(last_good) -> bool:
+    """A stored usage row (``last_good``) with no `five_hour` key at all: cswap
+    omits it when the usage API sends `five_hour: null`, an account whose 5h
+    limit is gone. The key being THERE and unreadable is an unmeasured window,
+    not this, and no row (an older cswap, a rate-limited one) is no row."""
+    return isinstance(last_good, dict) and "five_hour" not in last_good
+
+
 def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     """Rebuild the snapshot from the store: which slot stores which token, and
     which slots may be kept (a token with an `expiresAt` that is unexpired at
@@ -3654,7 +3662,8 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     has one, else the one cswap's engine switches at for ``strategy`` and
     ``threshold`` (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
     A stored 7d window with no 5h one (an account whose 5h limit is gone) is a
-    whole reading: the week is its only wall. A slot not kept is recorded with the reason, for `_affinity_pick` to say.
+    whole reading: the week is its only wall. A slot not kept is recorded with
+    the reason, for `_affinity_pick` to say.
     Runs on a daemon thread, never a request's: a store or Keychain read can
     hang, and then only this thread does.
 
@@ -3692,16 +3701,16 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                 if isinstance(usage, dict) and not {"5h", "7d"} <= windows:
                     # A fresh reading drops a window that has rolled (cswap's
                     # 439e4043), which restarted near 0%: the last reading
-                    # says which. One never measured stays unknown (78bd597).
+                    # says which. One never measured stays unknown (78bd597),
+                    # bar a 5h key absent from the stored row (below).
                     parse = getattr(require("poll_policy"), "parse_reset_ts",
                                     lambda _at: None)  # older host: no roll known
                     windows |= {
                         w for w, _, at in oauth.relevant_windows(
                             getattr(entry, "last_good", None))
                         if (ts := parse(at)) is not None and ts <= time.time()}
-                last = getattr(entry, "last_good", None)
-                if ("7d" in windows and isinstance(last, dict)
-                        and "five_hour" not in last):
+                if "7d" in windows and _row_has_no_5h_key(
+                        getattr(entry, "last_good", None)):
                     # A stored week and no 5h key at all: the 5h limit is gone
                     # and the week is the only wall, not a missing reading. A
                     # key that is there and unreadable stays one.
@@ -26449,7 +26458,10 @@ def _live_account_headroom(num: str) -> float | None:
     scoped-only account produce a number at all — so BOTH base windows are
     required rather than assumed: `relevant_windows` appends each only when
     the account reports it, so a reading missing one still yields a headroom
-    for a question nobody asked.
+    for a question nobody asked. The one exception is a stored row with no
+    `five_hour` key at all (`_row_has_no_5h_key`, the rule the session-affinity
+    snapshot reads it by): its headroom is the 7d window's and the scoped
+    ones'.
     """
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
@@ -26458,8 +26470,13 @@ def _live_account_headroom(num: str) -> float | None:
             return 0.0
         usage = entry.decision_value(("all",))
         # `relevant_windows` answers [] for anything that is not a window dict,
-        # so a sentinel string and a None reading fail this test too.
-        if not {"5h", "7d"} <= {
+        # so a sentinel string and a None reading fail this test too. An
+        # account whose stored row has no `five_hour` key needs no 5h window:
+        # the week is all it has (`last_good`, not `usage`, which also drops a
+        # rolled 5h window that the row still has).
+        base = {"7d"} if _row_has_no_5h_key(
+            getattr(entry, "last_good", None)) else {"5h", "7d"}
+        if not base <= {
                 label for label, _, _ in oauth.relevant_windows(usage, ("all",))}:
             return None
         return oauth.account_headroom(usage, ("all",))
@@ -26500,6 +26517,20 @@ def _cached_live_account_headroom(reset: bytes, slot: str) -> float | None:
 # for it (`()` when it was empty). They are keyed on the slot NUMBER; a wall
 # belongs to the ACCOUNT, and `cswap move` renumbers.
 _walled_slot_occupant: dict[str, tuple] = {}
+
+
+def _live_slot_has_no_5h_window() -> bool:
+    """True when the slot cswap has live, the one a 429 walls, stores a row
+    with no `five_hour` key (`_row_has_no_5h_key`): the account's wall is its
+    week's. Store rows only (`fetch=set()`); False when anything is unreadable,
+    which is today's `five_hour` default."""
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        entry = sw.usage_entries_by_account(
+            fetch=set())[sw.current_account_number()]
+        return _row_has_no_5h_key(entry.last_good)
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return False
 
 
 def _slot_occupant(num: str, sw=None) -> tuple | None:
@@ -26813,7 +26844,7 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
                 labels = {l for l, ts in walled if ts == reset}
                 stored = {l: pct for l, pct, _ in
                           oauth.relevant_windows(entry.last_good, ("all",))}
-                no_5h = "7d" in stored and "5h" not in stored
+                no_5h = "7d" in stored and _row_has_no_5h_key(entry.last_good)
                 stored_weekly = any(
                     l != "5h" and pct >= 100.0 for l, pct in stored.items())
                 claim = ("five_hour" if not no_5h and (
@@ -27763,14 +27794,18 @@ def _relay_response(
                     # The reset relayed is now this 429's own, so the claim
                     # that comes with it is the upstream's, when it is one
                     # Claude Code retries on (any other name is `other_claim`),
-                    # else `five_hour`: the fleet's claim came from another
-                    # account's window.
+                    # else the window the walled slot has: `seven_day` for an
+                    # account with no 5h window, `five_hour` otherwise. Never
+                    # the fleet's claim, which came from another account's
+                    # window.
                     _up = next(
                         (l.split(b":", 1)[1].strip().decode("latin1") for l in
                          lines[1:] if l.lower().startswith(
                              b"anthropic-ratelimit-unified-representative-claim:")),
                         "")
                     _claim = (_up if _up in ("five_hour", "seven_day")
+                              else "seven_day"
+                              if _live_slot_has_no_5h_window()
                               else "five_hour")
             else:
                 # A PAST own reset is the same case

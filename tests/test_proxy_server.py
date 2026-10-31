@@ -20822,6 +20822,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 ("5h stored, week at 96", 96.0, {
                     "five_hour": {"pct": 60.0, "resets_at": at},
                     "seven_day": {"pct": 96.0, "resets_at": week}},
+                 b"five_hour"),
+                # a 5h key that is there and unreadable is no absent window
+                ("5h unreadable, week at 96", 96.0, {
+                    "five_hour": {"pct": None},
+                    "seven_day": {"pct": 96.0, "resets_at": week}},
                  b"five_hour")):
             self._wire(monkeypatch, switched=False, fleet={"6": {
                 **forced, "seven_day": {
@@ -20853,7 +20858,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         reset, so the claim that goes with it is the upstream's own, accepted
         only as `five_hour` or `seven_day`: any other name is an
         `other_claim` to Claude Code. Missing or foreign, it is `five_hour`
-        and never the fleet's claim, which came from another account."""
+        (`seven_day` for an account with no 5h window, the case below) and
+        never the fleet's claim, which came from another account."""
         now = time.time()
         fleet = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
                        "seven_day": {"pct": 100.0, "resets_at": now + 86400 * 4}}}
@@ -20868,6 +20874,39 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             assert own in got, got
             assert self.CLAIM + relayed + b"\r\n" in got, (upstream, got)
             assert got.count(self.CLAIM) == 1, got
+
+    def case_a_no_5h_accounts_own_reset_winning_defaults_to_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """T3114. The claim default of the case above is `five_hour` for any
+        account, so a 429 from an account whose 5h limit is gone, naming no
+        claim or a foreign one, still reached Claude Code as "Session limit".
+        The walled slot's stored row says which window it has: no `five_hour`
+        key at all defaults to `seven_day`, a stored 5h window keeps
+        `five_hour` (the fleet's claim is `seven_day` here, so neither is the
+        fleet's by chance), and a claim the 429 names still wins."""
+        now = time.time()
+        fleet = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                       "seven_day": {"pct": 100.0,
+                                     "resets_at": now + 86400 * 4}}}
+        own = f"anthropic-ratelimit-unified-reset: {int(now) + 600}".encode()
+        week = {"seven_day": {"pct": 40.0}}
+        both = {**week, "five_hour": {"pct": 10.0}}
+        for what, usage, upstream, relayed in (
+                ("no 5h, claim absent", week, b"", b"seven_day"),
+                ("no 5h, foreign name", week, b"seven_day_opus", b"seven_day"),
+                ("no 5h, names five_hour", week, b"five_hour", b"five_hour"),
+                ("5h stored, claim absent", both, b"", b"five_hour"),
+                ("5h stored, foreign name", both, b"seven_day_opus",
+                 b"five_hour"),
+                ("5h unreadable, claim absent",
+                 {**week, "five_hour": {"pct": None}}, b"", b"five_hour")):
+            self._wire(monkeypatch, switched=False, fleet=fleet, usage=usage)
+            got = self._relay(reset=own, extra_headers=(
+                self.CLAIM + upstream + b"\r\n" if upstream else b""))
+            assert own in got, (what, got)
+            assert self.CLAIM + relayed + b"\r\n" in got, (what, got)
+            assert got.count(self.CLAIM) == 1, (what, got)
 
     def case_an_all_provable_fleet_reset_relays_uncapped_even_days_out(
         self, monkeypatch,
@@ -21950,6 +21989,40 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert not calls, calls
+
+    def case_a_no_5h_account_has_its_headroom_from_its_week(self, monkeypatch):
+        """T3114. The row of an account whose 5h limit is gone has no
+        `five_hour` key (cswap's poller omits it) and a readable week, so its
+        headroom is the week's (and its scoped windows'), as the affinity rule
+        reads the same row: a complete reading, not an unknown one. Unknown
+        stays unknown (fails open, T1178) for a 5h key that is there and
+        unreadable, for no 7d window, and for a 5h window the fresh reading
+        dropped as rolled while `last_good` still has the key."""
+        from cswap_pin import proxy as pp
+        past = time.time() - 3600
+        week = {"seven_day": {"pct": 40.0}}
+        for what, usage, stored, want in (
+                ("week alone", week, None, 60.0),
+                ("week full", {"seven_day": {"pct": 100.0}}, None, 0.0),
+                ("week and scoped", {**week, "scoped": [
+                    {"name": "Fable", "pct": 90.0}]}, None, 10.0),
+                ("5h unreadable", {**week, "five_hour": {"pct": None}},
+                 None, None),
+                ("no 7d window", {"scoped": [{"name": "Fable", "pct": 90.0}]},
+                 None, None),
+                ("5h rolled out of the fresh reading", week,
+                 {"five_hour": {"pct": 30.0, "resets_at": past}, **week},
+                 None)):
+            self._wire(monkeypatch, switched=False, fleet={"6": usage},
+                       stored={"6": stored or usage})
+            assert pp._live_account_headroom("6") == want, what
+        # and through the bearer branch: a full week is a KNOWN wall there,
+        # so the stale bearer is not converted and switch() is asked
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage={"seven_day": {"pct": 100.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
 
     def case_a_scoped_only_reading_converts(self, monkeypatch):
         """INVERTED (T1178): with no 5h/7d measured at all this reading is
