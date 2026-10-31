@@ -20882,24 +20882,29 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         account, so a 429 from an account whose 5h limit is gone, naming no
         claim or a foreign one, still reached Claude Code as "Session limit".
         The walled slot's stored row says which window it has: no `five_hour`
-        key at all defaults to `seven_day`, a stored 5h window keeps
-        `five_hour` (the fleet's claim is `seven_day` here, so neither is the
-        fleet's by chance), and a claim the 429 names still wins."""
+        key at all defaults to `seven_day`, a stored 5h window (or a key that
+        is there and unreadable) keeps `five_hour`, and a claim the 429 names
+        still wins. Each item runs against a fleet whose claim is the OTHER
+        one, so a default taken from the fleet cannot pass."""
         now = time.time()
-        fleet = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
-                       "seven_day": {"pct": 100.0,
-                                     "resets_at": now + 86400 * 4}}}
+        f5h = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                     "seven_day": {"pct": 0.0}}}
+        f7d = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                     "seven_day": {"pct": 100.0,
+                                   "resets_at": now + 86400 * 4}}}
         own = f"anthropic-ratelimit-unified-reset: {int(now) + 600}".encode()
         week = {"seven_day": {"pct": 40.0}}
         both = {**week, "five_hour": {"pct": 10.0}}
-        for what, usage, upstream, relayed in (
-                ("no 5h, claim absent", week, b"", b"seven_day"),
-                ("no 5h, foreign name", week, b"seven_day_opus", b"seven_day"),
-                ("no 5h, names five_hour", week, b"five_hour", b"five_hour"),
-                ("5h stored, claim absent", both, b"", b"five_hour"),
-                ("5h stored, foreign name", both, b"seven_day_opus",
+        for what, fleet, usage, upstream, relayed in (
+                ("no 5h, claim absent", f5h, week, b"", b"seven_day"),
+                ("no 5h, foreign name", f5h, week, b"seven_day_opus",
+                 b"seven_day"),
+                ("no 5h, names five_hour", f7d, week, b"five_hour",
                  b"five_hour"),
-                ("5h unreadable, claim absent",
+                ("5h stored, claim absent", f7d, both, b"", b"five_hour"),
+                ("5h stored, foreign name", f7d, both, b"seven_day_opus",
+                 b"five_hour"),
+                ("5h unreadable, claim absent", f7d,
                  {**week, "five_hour": {"pct": None}}, b"", b"five_hour")):
             self._wire(monkeypatch, switched=False, fleet=fleet, usage=usage)
             got = self._relay(reset=own, extra_headers=(
