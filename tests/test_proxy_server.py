@@ -20884,8 +20884,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         The walled slot's stored row says which window it has: no `five_hour`
         key at all defaults to `seven_day`, a stored 5h window (or a key that
         is there and unreadable) keeps `five_hour`, and a claim the 429 names
-        still wins. Each item runs against a fleet whose claim is the OTHER
-        one, so a default taken from the fleet cannot pass."""
+        still wins. The row is the live slot's, so the default applies only
+        to a 429 on the live bearer: a frozen bearer's belongs to another
+        account (its reset is why `_own_reset` can win at all), so beside a
+        no-5h live account it keeps `five_hour`. Each item runs against a
+        fleet whose claim is the OTHER one, so a default taken from the fleet
+        cannot pass."""
         now = time.time()
         f5h = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
                      "seven_day": {"pct": 0.0}}}
@@ -20895,20 +20899,32 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         own = f"anthropic-ratelimit-unified-reset: {int(now) + 600}".encode()
         week = {"seven_day": {"pct": 40.0}}
         both = {**week, "five_hour": {"pct": 10.0}}
-        for what, fleet, usage, upstream, relayed in (
-                ("no 5h, claim absent", f5h, week, b"", b"seven_day"),
-                ("no 5h, foreign name", f5h, week, b"seven_day_opus",
+        live, frozen = self.LIVE, "frozen-account-token"
+        # a frozen bearer reaches `switch()` only when the live account is
+        # known walled, so those items set `entry_walled`
+        for what, bearer, fleet, usage, upstream, relayed in (
+                ("no 5h, claim absent", live, f5h, week, b"", b"seven_day"),
+                ("no 5h, foreign name", live, f5h, week, b"seven_day_opus",
                  b"seven_day"),
-                ("no 5h, names five_hour", f7d, week, b"five_hour",
+                ("no 5h, names five_hour", live, f7d, week, b"five_hour",
                  b"five_hour"),
-                ("5h stored, claim absent", f7d, both, b"", b"five_hour"),
-                ("5h stored, foreign name", f7d, both, b"seven_day_opus",
+                ("5h stored, claim absent", live, f7d, both, b"", b"five_hour"),
+                ("5h stored, foreign name", live, f7d, both, b"seven_day_opus",
                  b"five_hour"),
-                ("5h unreadable, claim absent", f7d,
-                 {**week, "five_hour": {"pct": None}}, b"", b"five_hour")):
-            self._wire(monkeypatch, switched=False, fleet=fleet, usage=usage)
-            got = self._relay(reset=own, extra_headers=(
+                ("5h unreadable, claim absent", live, f7d,
+                 {**week, "five_hour": {"pct": None}}, b"", b"five_hour"),
+                ("frozen bearer, no 5h live, claim absent", frozen, f7d, week,
+                 b"", b"five_hour"),
+                ("frozen bearer, no 5h live, foreign name", frozen, f7d, week,
+                 b"seven_day_opus", b"five_hour"),
+                ("frozen bearer, no 5h live, names seven_day", frozen, f5h,
+                 week, b"seven_day", b"seven_day")):
+            self._wire(monkeypatch, switched=False, live_token=live,
+                       fleet=fleet, usage=usage, entry_walled=bearer == frozen)
+            got = self._relay(reset=own, auth="Bearer " + bearer,
+                              extra_headers=(
                 self.CLAIM + upstream + b"\r\n" if upstream else b""))
+            assert got.startswith(b"HTTP/1.1 429"), (what, got[:40])
             assert own in got, (what, got)
             assert self.CLAIM + relayed + b"\r\n" in got, (what, got)
             assert got.count(self.CLAIM) == 1, (what, got)

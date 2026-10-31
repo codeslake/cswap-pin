@@ -26519,12 +26519,17 @@ def _cached_live_account_headroom(reset: bytes, slot: str) -> float | None:
 _walled_slot_occupant: dict[str, tuple] = {}
 
 
-def _live_slot_has_no_5h_window() -> bool:
-    """True when the slot cswap has live, the one a 429 walls, stores a row
-    with no `five_hour` key (`_row_has_no_5h_key`): the account's wall is its
-    week's. Store rows only (`fetch=set()`); False when anything is unreadable,
-    which is today's `five_hour` default."""
+def _live_slot_has_no_5h_window(auth: str) -> bool:
+    """True when ``auth`` is the live account's own bearer and the slot cswap
+    has live, the one that 429 walls, stores a row with no `five_hour` key
+    (`_row_has_no_5h_key`): the account's wall is its week's. A frozen bearer's
+    429 is another account's, whose row is not this one. Store rows only
+    (`fetch=set()`); False when anything is unreadable, which is today's
+    `five_hour` default."""
     try:
+        token = _bearer(auth)
+        if not token or token != _active_oauth_token():
+            return False
         sw = require("switcher").ClaudeAccountSwitcher()
         entry = sw.usage_entries_by_account(
             fetch=set())[sw.current_account_number()]
@@ -27794,10 +27799,11 @@ def _relay_response(
                     # The reset relayed is now this 429's own, so the claim
                     # that comes with it is the upstream's, when it is one
                     # Claude Code retries on (any other name is `other_claim`),
-                    # else the window the walled slot has: `seven_day` for an
-                    # account with no 5h window, `five_hour` otherwise. Never
-                    # the fleet's claim, which came from another account's
-                    # window.
+                    # else the window the walled slot has: `seven_day` for a
+                    # live bearer on an account with no 5h window, `five_hour`
+                    # otherwise (a frozen bearer's account is not the live
+                    # slot's). Never the fleet's claim, which came from
+                    # another account's window.
                     _up = next(
                         (l.split(b":", 1)[1].strip().decode("latin1") for l in
                          lines[1:] if l.lower().startswith(
@@ -27805,7 +27811,7 @@ def _relay_response(
                         "")
                     _claim = (_up if _up in ("five_hour", "seven_day")
                               else "seven_day"
-                              if _live_slot_has_no_5h_window()
+                              if _live_slot_has_no_5h_window(auth)
                               else "five_hour")
             else:
                 # A PAST own reset is the same case
