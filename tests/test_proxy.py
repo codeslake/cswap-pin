@@ -11963,36 +11963,44 @@ class TestEnsureProxyLifecycle:
         and through a symlink, then run by a child that only sleeps (the
         module swapped, `--hold-port` and the certdir kept). The query goes by
         the symlink: the argv may carry either form, and a different certdir
-        is no holder."""
+        is no holder. Each is read through /proc and again through the `ps`
+        fallback (macOS has no /proc), so Linux covers both reads."""
         import subprocess
         import sys
         from cswap_pin import proxy as pin_proxy
 
         real_popen, seen = subprocess.Popen, []
-        monkeypatch.setattr(
-            subprocess, "Popen", lambda argv, **kw: seen.append(list(argv)))
         certdir = tmp_path / "real" / "pin-proxy"
         certdir.mkdir(parents=True)
         link = tmp_path / "link"
         link.symlink_to(certdir)
-        for form in (certdir, link):
-            assert pin_proxy._spawn_daemon("1", "a@b.c", form, wait_s=0) is None
+        # The spy ends with the spawns: `_holder_owns`' macOS `ps` read runs
+        # through `subprocess.run`, which needs the real Popen.
+        with monkeypatch.context() as m:
+            m.setattr(subprocess, "Popen",
+                      lambda argv, **kw: seen.append(list(argv)))
+            for form in (certdir, link):
+                assert pin_proxy._spawn_daemon(
+                    "1", "a@b.c", form, wait_s=0) is None
         assert len(seen) == 2, seen
         for argv in seen:
             assert argv[1:3] == ["-m", pin_proxy._DAEMON_MODULE], argv
             assert argv[3] == pin_proxy._HOLDER_MODULE_ARG, argv
         children = []
         try:
-            for argv in seen:
-                child = real_popen(
-                    [argv[0], "-c", "import time; time.sleep(60)", *argv[3:]])
-                children.append(child)
-                assert pin_proxy._holder_owns(link) is True, argv
-                assert pin_proxy._holder_owns(tmp_path / "other") is False
-                child.kill()
-                child.wait(timeout=5)
-                assert pin_proxy._holder_owns(link) is False, (
-                    "the holder is gone and still reads as owned", argv)
+            for argv, ps_only in [(a, p) for a in seen for p in (False, True)]:
+                with monkeypatch.context() as m:
+                    if ps_only:  # macOS has no /proc: force its `ps` read here
+                        m.setattr(pin_proxy.Path, "is_dir", lambda self: False)
+                    child = real_popen(
+                        [argv[0], "-c", "import time; time.sleep(60)", *argv[3:]])
+                    children.append(child)
+                    assert pin_proxy._holder_owns(link) is True, (argv, ps_only)
+                    assert pin_proxy._holder_owns(tmp_path / "other") is False
+                    child.kill()
+                    child.wait(timeout=5)
+                    assert pin_proxy._holder_owns(link) is False, (
+                        "the holder is gone and still reads as owned", argv)
         finally:
             for child in children:
                 child.kill()
