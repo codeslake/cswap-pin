@@ -18,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     # Without this a hung step burns the full 6h GitHub cap and the run reads as
     # "still going" rather than "stuck" — so nothing reports a failure at all.
-    timeout-minutes: 10
+    # 20, not 10: this job runs the full suite before the upload, ~10 min on ubuntu.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
