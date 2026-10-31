@@ -19616,8 +19616,11 @@ class TestAHandoverMidDrainDropsTheClock:
         monkeypatch.setattr(pp, "held_by_a_holder", lambda *a, **k: held)
         real, clock, done, reads = pp.time.monotonic, [0.0], set(), []
         monkeypatch.setattr(pp.time, "monotonic", lambda: real() + clock[0])
+        real_sleep, drain = pp.time.sleep, threading.get_ident()
 
         def sleep(s):
+            if threading.get_ident() != drain:  # not this clock's sleep
+                return real_sleep(s)
             clock[0] += s
             if clock[0] >= pp._SPAWN_WAIT_S and "gave up" not in done:
                 done.add("gave up")
@@ -19804,6 +19807,27 @@ class TestAHandoverMidDrainDropsTheClock:
                 < pp._RELOCATE_WAIT_S + 1.0), clock
         assert len(reads) <= pp._RELOCATE_WAIT_S / pp._DRAINING_BEAT_SECONDS + 1, (
             f"{len(reads)} reads in {clock:.0f}s")
+
+    def test_CONTROL_another_threads_sleep_does_not_move_the_clock(
+            self, tmp_path, monkeypatch):
+        """T3181: `time.sleep` is the process's, so a leaked thread sleeping
+        while a drain here ran moved the clock (CI read 194099 s). A sleep on
+        any thread but the drain's goes to the sleep that was in place."""
+        import cswap_pin.proxy as pp
+        elsewhere, spawned = [], []
+        monkeypatch.setattr(time, "sleep", elsewhere.append)
+
+        def holder(_t):
+            if not spawned:
+                spawned.append(True)
+                other = threading.Thread(target=time.sleep, args=(1e6,))
+                other.start()
+                other.join()
+            return True
+        clock, *_ = self._drain_for_a_successor(
+            tmp_path, monkeypatch, holder=holder)
+        assert clock < pp._RELOCATE_WAIT_S + 1.0, clock
+        assert 1e6 in elsewhere, elsewhere
 
     def test_CONTROL_no_live_tunnel_or_a_held_daemon_waits_for_nothing(
             self, tmp_path, monkeypatch):
