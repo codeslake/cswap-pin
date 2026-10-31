@@ -17515,7 +17515,11 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             self, certdir, monkeypatch):
         """True while the held token is live, because it IS live; false the
         moment it is not. The refresh failing earlier must not flip either
-        way, and must not leave a blind mint on `/health`."""
+        way, and must not leave a blind mint on `/health`. A transient failure
+        keeps the token past the liveness buffer (the next case), but never
+        into the hold margin: a dead token is not hidden."""
+        from cswap_pin import proxy as pp
+
         rig = self._rig(certdir, monkeypatch, outcome="transient")
         self._tick(rig, certdir, monkeypatch, False)
         assert len(rig.calls) == 1, "the tick never tried the refresh"
@@ -17524,8 +17528,95 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         assert rig.provider() == "old", "a live token was refused"
         assert self._transitions(rig) == []
         rig.now += 150                         # 4.5 min left: buffer reached
+        assert rig.provider.can_pin_cached() is True   # held, not hidden
+        assert self._transitions(rig) == []
+        rig.now += 4.5 * 60 - pp._HOLD_MARGIN_MS / 1000 + 5    # inside the hold margin
         assert rig.provider.can_pin_cached() is False
         assert len(self._transitions(rig)) == 1, self._transitions(rig)
+        rig.now += 120                         # expired
+        assert rig.provider.can_pin_cached() is False
+        assert rig.provider() is None, "an expired token was served"
+
+    def case_a_transient_refresh_failure_in_the_buffer_keeps_the_held_token(
+            self, certdir, monkeypatch):
+        """THE FIELD CASE (2026-10-31, 12:14:46Z and 12:15:47Z): the refresh
+        POST fails transiently once the token is inside cswap's 5-minute
+        buffer, and the token is still valid for minutes. It is served, not
+        thrown away: the provider returns it with no `blind_reason`, `can_pin`
+        reads true to `/health` and a launch, and the watchdog replaces
+        nothing, since a successor re-runs the same POST and fails the same
+        way. The failure stays in the log, and the next tick tries again."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, True)    # 7 min: early refresh fails
+        rig.advance(150)                       # 4.5 min left: inside the buffer
+        assert rig.provider.can_pin_cached() is True
+        self._tick(rig, certdir, monkeypatch, True)
+        assert len(rig.calls) == 2, "the tick did not try the refresh again"
+        assert rig.provider() == "old"
+        assert rig.provider.blind_reason == ""
+        assert rig.provider.can_pin_cached() is True
+        assert pp._can_mint(rig.provider) is True
+        assert not [ln for ln in rig.lines if "replacing ourselves" in ln]
+        assert not pp._blind_recycle_path(certdir).exists()
+        assert len([ln for ln in rig.lines
+                    if "refresh transient for slot 2" in ln]) == 1, rig.lines
+        assert self._transitions(rig) == [], self._transitions(rig)
+
+    def case_a_transient_refresh_failure_inside_the_hold_margin_is_blind(
+            self, certdir, monkeypatch):
+        """THE CONTROL: with less than the hold margin left the next tick may
+        be too late to replace, so the failure reads as it always did: no
+        token, the reason, `can_pin` false, and the blind replace."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)
+        rig.advance(7 * 60 - pp._HOLD_MARGIN_MS / 1000 + 5)
+        assert rig.provider.can_pin_cached() is False
+        assert pp._can_mint(rig.provider) is False
+        assert rig.provider.blind_reason == (
+            "refresh transient for slot 2 (pin@example.com)")
+        self._tick(rig, certdir, monkeypatch, True)
+        assert pp._blind_recycle_path(certdir).exists(), "no blind replace"
+        assert [ln for ln in rig.lines if "replacing ourselves" in ln]
+
+    def case_a_failure_that_is_not_transient_in_the_buffer_is_not_held(
+            self, certdir, monkeypatch):
+        """Only a transient failure holds: a dead lineage leaves the token
+        unserved, with its reason, as before."""
+        for outcome in ("invalid_grant", "no_refresh_token"):
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            rig.advance(150)                   # 4.5 min left: inside the buffer
+            assert rig.provider() is None, outcome
+            assert rig.provider.blind_reason == (
+                f"refresh {outcome} for slot 2 (pin@example.com)"), outcome
+            assert rig.provider.can_pin_cached() is False, outcome
+
+    def case_a_transient_failure_belongs_to_the_blob_it_failed_on(
+            self, certdir, monkeypatch):
+        """Another process rotates the slot after the early refresh failed.
+        The daemon adopts the new blob without a refresh of its own, and when
+        that one reaches the buffer nothing has failed on it: not held."""
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)   # "old" fails, quietly
+        rig.advance(150)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        assert rig.provider() == "elsewhere"
+        assert len(rig.calls) == 1, "the adopted blob was refreshed"
+        rig.advance((480 - 4.5) * 60)          # inside the buffer, above the margin
+        assert rig.provider.can_pin_cached() is False
+
+    def case_the_hold_margin_covers_one_tick_and_the_longest_refresh(self):
+        """A hold that ends sooner than tick + refresh lets the token die
+        between the tick that held it and the one that would replace."""
+        from cswap_pin import proxy as pp
+
+        assert pp._HOLD_MARGIN_MS / 1000 >= (
+            pp._CODE_WATCH_INTERVAL_S + pp._MINT_LOCK_BOUND_S)
 
     def case_the_tick_logs_the_edge_itself_before_it_refreshes(
             self, certdir, monkeypatch):
@@ -17587,7 +17678,7 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         self._tick(rig, certdir, monkeypatch, False)       # t = 120
         assert len(rig.calls) == 2, len(rig.calls)
         # NOT THROTTLED: a request's own `provider()` on a dead token refreshes.
-        rig.advance(300)                       # inside the liveness buffer
+        rig.advance(360)                       # 1 min left: inside the hold margin
         assert rig.provider() is None
         assert len(rig.calls) == 3, len(rig.calls)
 
