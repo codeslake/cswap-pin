@@ -20201,6 +20201,27 @@ class TestASpuriousStream404DoesNotEndTheSession:
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
 
 
+def _no_5h_headers(seven="0.96") -> bytes:
+    """The rate-limit headers of a /v1/messages 200 for an account whose 5h
+    limit Anthropic removed (measured 2026-10-31, account 8): a 7d reading and
+    NO `5h-utilization`, `5h-reset`, `5h-status` or `grace-5h-utilization`."""
+    return (
+        b"anthropic-ratelimit-unified-representative-claim: seven_day\r\n"
+        b"anthropic-ratelimit-unified-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-utilization: %s\r\n"
+        b"anthropic-ratelimit-unified-7d-reset: 1793944800\r\n"
+        b"anthropic-ratelimit-unified-7d-status: allowed_warning\r\n"
+        b"anthropic-ratelimit-unified-7d-surpassed-threshold: 0.75\r\n"
+        b"anthropic-ratelimit-unified-fallback: available\r\n"
+        b"anthropic-ratelimit-unified-fallback-percentage: 0.5\r\n"
+        b"anthropic-ratelimit-unified-overage-status: rejected\r\n"
+        b"anthropic-ratelimit-unified-overage-disabled-reason: "
+        b"org_level_disabled\r\n"
+        b"anthropic-ratelimit-unified-upgrade-paths: overage\r\n"
+        % str(seven).encode())
+
+
 class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     """A 429 on /v1/messages sleeps the client for the WHOLE reset window of
     the account it walled; a credential swap underneath that sleep does not
@@ -20784,6 +20805,42 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     in got), (what, got)
             assert self.CLAIM + b"five_hour\r\n" in got, (what, got)
 
+    def case_a_weekly_walled_account_with_no_5h_window_relays_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """T3114. An account whose 5h limit is gone can only be walled by the
+        week, but cswap's walled override still forces its `five_hour` to 100
+        at the wall's deadline, so the decision value alone reads a 5h wall.
+        The entry's own `last_good` says there is no 5h window and a weekly
+        one: the wall is the week's, at any stored weekly figure (96 here, not
+        yet 100) and at 100 alike. With a stored 5h window the tie is the
+        session claim as before."""
+        at = time.time() + 3600
+        week = at + 86400
+        forced = {"five_hour": {"pct": 100.0, "resets_at": at}}
+        for what, seven, stored, claim in (
+                ("no 5h, week at 96", 96.0, {"seven_day": {
+                    "pct": 96.0, "resets_at": week}}, b"seven_day"),
+                ("no 5h, week at 100", 100.0, {"seven_day": {
+                    "pct": 100.0, "resets_at": at}}, b"seven_day"),
+                ("5h stored, week at 96", 96.0, {
+                    "five_hour": {"pct": 60.0, "resets_at": at},
+                    "seven_day": {"pct": 96.0, "resets_at": week}},
+                 b"five_hour"),
+                # a 5h key that is there and unreadable is no absent window
+                ("5h unreadable, week at 96", 96.0, {
+                    "five_hour": {"pct": None},
+                    "seven_day": {"pct": 96.0, "resets_at": week}},
+                 b"five_hour")):
+            self._wire(monkeypatch, switched=False, fleet={"6": {
+                **forced, "seven_day": {
+                    "pct": seven, "resets_at": at if seven >= 100 else week}}},
+                stored={"6": stored})
+            got = self._relay()
+            assert (f"anthropic-ratelimit-unified-reset: {int(at)}".encode()
+                    in got), (what, got)
+            assert self.CLAIM + claim + b"\r\n" in got, (what, got)
+
     def case_the_decision_time_cap_keeps_the_fleet_claim(self, monkeypatch):
         """Not every blocked slot proved a reset, so the announced reset is
         the cap, not any window's: the claim stays the fleet's weekly one."""
@@ -20805,7 +20862,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         reset, so the claim that goes with it is the upstream's own, accepted
         only as `five_hour` or `seven_day`: any other name is an
         `other_claim` to Claude Code. Missing or foreign, it is `five_hour`
-        and never the fleet's claim, which came from another account."""
+        (`seven_day` for an account with no 5h window, the case below) and
+        never the fleet's claim, which came from another account."""
         now = time.time()
         fleet = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
                        "seven_day": {"pct": 100.0, "resets_at": now + 86400 * 4}}}
@@ -20820,6 +20878,60 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             assert own in got, got
             assert self.CLAIM + relayed + b"\r\n" in got, (upstream, got)
             assert got.count(self.CLAIM) == 1, got
+
+    def case_a_no_5h_accounts_own_reset_winning_defaults_to_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """T3114. The claim default of the case above is `five_hour` for any
+        account, so a 429 from an account whose 5h limit is gone, naming no
+        claim or a foreign one, still reached Claude Code as "Session limit".
+        The walled slot's stored row says which window it has: no `five_hour`
+        key at all defaults to `seven_day`, a stored 5h window (or a key that
+        is there and unreadable) keeps `five_hour`, and a claim the 429 names
+        still wins. The row is the live slot's, so the default applies only
+        to a 429 on the live bearer: a frozen bearer's belongs to another
+        account (its reset is why `_own_reset` can win at all), so beside a
+        no-5h live account it keeps `five_hour`. Each item runs against a
+        fleet whose claim is the OTHER one, so a default taken from the fleet
+        cannot pass."""
+        now = time.time()
+        f5h = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                     "seven_day": {"pct": 0.0}}}
+        f7d = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                     "seven_day": {"pct": 100.0,
+                                   "resets_at": now + 86400 * 4}}}
+        own = f"anthropic-ratelimit-unified-reset: {int(now) + 600}".encode()
+        week = {"seven_day": {"pct": 40.0}}
+        both = {**week, "five_hour": {"pct": 10.0}}
+        live, frozen = self.LIVE, "frozen-account-token"
+        # a frozen bearer reaches `switch()` only when the live account is
+        # known walled, so those items set `entry_walled`
+        for what, bearer, fleet, usage, upstream, relayed in (
+                ("no 5h, claim absent", live, f5h, week, b"", b"seven_day"),
+                ("no 5h, foreign name", live, f5h, week, b"seven_day_opus",
+                 b"seven_day"),
+                ("no 5h, names five_hour", live, f7d, week, b"five_hour",
+                 b"five_hour"),
+                ("5h stored, claim absent", live, f7d, both, b"", b"five_hour"),
+                ("5h stored, foreign name", live, f7d, both, b"seven_day_opus",
+                 b"five_hour"),
+                ("5h unreadable, claim absent", live, f7d,
+                 {**week, "five_hour": {"pct": None}}, b"", b"five_hour"),
+                ("frozen bearer, no 5h live, claim absent", frozen, f7d, week,
+                 b"", b"five_hour"),
+                ("frozen bearer, no 5h live, foreign name", frozen, f7d, week,
+                 b"seven_day_opus", b"five_hour"),
+                ("frozen bearer, no 5h live, names seven_day", frozen, f5h,
+                 week, b"seven_day", b"seven_day")):
+            self._wire(monkeypatch, switched=False, live_token=live,
+                       fleet=fleet, usage=usage, entry_walled=bearer == frozen)
+            got = self._relay(reset=own, auth="Bearer " + bearer,
+                              extra_headers=(
+                self.CLAIM + upstream + b"\r\n" if upstream else b""))
+            assert got.startswith(b"HTTP/1.1 429"), (what, got[:40])
+            assert own in got, (what, got)
+            assert self.CLAIM + relayed + b"\r\n" in got, (what, got)
+            assert got.count(self.CLAIM) == 1, (what, got)
 
     def case_an_all_provable_fleet_reset_relays_uncapped_even_days_out(
         self, monkeypatch,
@@ -21272,13 +21384,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert headers["anthropic-ratelimit-unified-5h-utilization"] == "0.42", (
             recorded)
 
-    def case_no_5h_header_never_calls_record(self, monkeypatch):
+    def case_a_reply_with_no_utilization_header_at_all_never_calls_record(
+        self, monkeypatch,
+    ):
         self._run_usage_thread_synchronously(monkeypatch)
         recorded = []
         self._wire(monkeypatch, switched=True, live_token=self.LIVE,
                    record_usage_headers=lambda *a: recorded.append(a))
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE)
         assert not recorded, recorded
+
+    def case_a_200_with_7d_headers_and_no_5h_header_records_the_7d_reading(
+        self, monkeypatch,
+    ):
+        """T3114: an account whose 5h limit is gone replies with a 7d reading
+        and no 5h header. It is a no-5h account, not an unmeasured one: the
+        reading goes to the store call with no 5h value in it (absent, never
+        0)."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   live_num="8",
+                   record_usage_headers=lambda num, headers:
+                       recorded.append((num, headers)))
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=_no_5h_headers())
+        assert len(recorded) == 1, recorded
+        num, headers = recorded[0]
+        assert num == "8", recorded
+        assert headers["anthropic-ratelimit-unified-7d-utilization"] == "0.96", (
+            recorded)
+        assert not [k for k in headers if "5h" in k], headers
+
+    def case_cswap_refusing_a_7d_only_reading_costs_the_reply_nothing(
+        self, monkeypatch,
+    ):
+        """A cswap older than its T3160 answers False for a reading with no 5h
+        value: the reply is relayed and nothing is logged as a raise."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._run_usage_thread_synchronously(monkeypatch)
+        asked = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: asked.append(a) or False)
+        got = self._relay(status=b"200 OK", reset=False,
+                          auth="Bearer " + self.LIVE,
+                          extra_headers=_no_5h_headers())
+        assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        assert len(asked) == 1, asked
+        assert not any("usage-header record raised" in m for m in logged), logged
 
     def case_many_200s_inside_30s_spawn_one_thread(self, monkeypatch):
         """T1178: moving the throttle inside `_run` left NOTHING in front
@@ -21859,6 +22014,40 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert not calls, calls
+
+    def case_a_no_5h_account_has_its_headroom_from_its_week(self, monkeypatch):
+        """T3114. The row of an account whose 5h limit is gone has no
+        `five_hour` key (cswap's poller omits it) and a readable week, so its
+        headroom is the week's (and its scoped windows'), as the affinity rule
+        reads the same row: a complete reading, not an unknown one. Unknown
+        stays unknown (fails open, T1178) for a 5h key that is there and
+        unreadable, for no 7d window, and for a 5h window the fresh reading
+        dropped as rolled while `last_good` still has the key."""
+        from cswap_pin import proxy as pp
+        past = time.time() - 3600
+        week = {"seven_day": {"pct": 40.0}}
+        for what, usage, stored, want in (
+                ("week alone", week, None, 60.0),
+                ("week full", {"seven_day": {"pct": 100.0}}, None, 0.0),
+                ("week and scoped", {**week, "scoped": [
+                    {"name": "Fable", "pct": 90.0}]}, None, 10.0),
+                ("5h unreadable", {**week, "five_hour": {"pct": None}},
+                 None, None),
+                ("no 7d window", {"scoped": [{"name": "Fable", "pct": 90.0}]},
+                 None, None),
+                ("5h rolled out of the fresh reading", week,
+                 {"five_hour": {"pct": 30.0, "resets_at": past}, **week},
+                 None)):
+            self._wire(monkeypatch, switched=False, fleet={"6": usage},
+                       stored={"6": stored or usage})
+            assert pp._live_account_headroom("6") == want, what
+        # and through the bearer branch: a full week is a KNOWN wall there,
+        # so the stale bearer is not converted and switch() is asked
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage={"seven_day": {"pct": 100.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
 
     def case_a_scoped_only_reading_converts(self, monkeypatch):
         """INVERTED (T1178): with no 5h/7d measured at all this reading is
@@ -25138,7 +25327,7 @@ class TestSessionAffinityOnMessages:
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
         for last_good in (
-                None, {"seven_day": {"pct": 10.0}},
+                None, {"five_hour": {"pct": None}, "seven_day": {"pct": 10.0}},
                 {"five_hour": {"pct": 30.0, "resets_at": self._iso(-3600)}},
                 {"five_hour": {"pct": 30.0}}):
             seen = self._wire(monkeypatch, certdir)
@@ -25149,6 +25338,24 @@ class TestSessionAffinityOnMessages:
             assert auths == ["Bearer tok-B"], (last_good, auths)
             assert pp._affinity_why[self.IDENT] == (
                 "a usage window has no reading"), pp._affinity_why
+
+    def case_a_no_5h_account_is_kept_and_judged_on_its_week(
+            self, monkeypatch, certdir):
+        """An account whose 5h limit is gone stores a week and no 5h window
+        (account 8, 2026-10-31; its `scoped` rides along): its only wall is
+        the week's, so the gap is no "no reading". Kept under its bar,
+        dropped at it."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        for pct, want, why in ((30.0, "tok-A", None),
+                               (95.0, "tok-B", "at its bar")):
+            seen.usage1 = seen.last_good1 = {
+                "seven_day": {"pct": pct}, "scoped": [{"name": "Fable", "pct": 5.0}]}
+            pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pct, auths)
+            assert pp._affinity_why[self.IDENT] == why, pp._affinity_why
 
     def case_a_reading_too_old_to_trust_says_so(self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
@@ -26282,6 +26489,42 @@ class TestSessionAffinityOnMessages:
                 reply=self._util(five, seven=seven))
             assert auths == ["Bearer tok-A", "Bearer tok-B"], (
                 five, seven, auths)
+
+    @staticmethod
+    def _no_5h(seven, extra=b""):
+        return (b"HTTP/1.1 200 OK\r\n" + extra + _no_5h_headers(seven)
+                + b"Content-Length: 2\r\n\r\n{}")
+
+    def case_a_kept_accounts_7d_only_reply_is_read_against_its_bar(
+            self, monkeypatch, certdir):
+        """T3114: an account with no 5h limit replies with a 7d reading alone.
+        That reading is the whole of its use, so it drops the slot at the bar
+        and keeps it under, and either way records to the kept slot."""
+        for util, want in ((0.96, "tok-B"), (0.80, "tok-A")):
+            seen = self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-B", "S"), ("tok-B", "S")],
+                reply=self._no_5h(util))
+            assert auths == ["Bearer tok-A", f"Bearer {want}"], (util, auths)
+            assert seen.recorded[:1] == ["1"], (util, seen.recorded)
+
+    def case_a_7d_only_reply_updates_the_last_known_use(
+            self, monkeypatch, certdir):
+        """The snapshot said 10; a kept reply with 7d alone says 88 (bar 90,
+        margin 10): a stale snapshot no longer keeps the slot. A reply whose
+        5h header is there but unreadable is NOT a no-5h account, and its 7d
+        figure alone is no whole reading."""
+        for extra, want in ((b"", "tok-B"), (
+                b"anthropic-ratelimit-unified-5h-utilization: n/a\r\n",
+                "tok-A")):
+            self._stale(monkeypatch, certdir, pct=10.0)
+            _, auths = self._send(certdir, [("tok-A", "S")],
+                                  reply=self._no_5h(0.88, extra))
+            assert auths == ["Bearer tok-A"], auths
+            self._seed("S", "tok-A", age=100)
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (extra, auths)
 
     def case_a_stored_credential_with_no_expiry_is_not_kept(
             self, monkeypatch, certdir):
