@@ -22805,24 +22805,29 @@ class TestAWedgeIsNotTrustedForever:
             "to avoid")
 
     def _stale_fp_daemon_under_a_holder_that_never_publishes(
-            self, tmp_path, monkeypatch):
+            self, tmp_path, monkeypatch, *, wedged=False):
         """Shared setup for the T3108 cases: a daemon serving on a STALE
-        fingerprint under a holder that hears the ask and never publishes a
-        successor. Every `os.kill` is RECORDED, never raised on -- `heal`
-        swallows an exception, so an assertion raised inside it would pass
-        vacuously. Returns (proxy, root, certdir, stale_pid, holder_pid,
+        fingerprint (``wedged``: on the CURRENT one, but refusing the
+        fingerprinted probe) under a holder that hears the ask and never
+        publishes a successor. Every `os.kill` is RECORDED, never raised on --
+        `heal` swallows an exception, so an assertion raised inside it would
+        pass vacuously. Returns (proxy, root, certdir, stale_pid, holder_pid,
         kills, spawn_calls)."""
         from cswap_pin import proxy
 
         root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
         certdir = root / "pin-proxy"
         stale_pid, holder_pid = 55541, 55542
-        proxy.write_daemon_state(certdir, 4100, stale_pid, "STALE-FP")
+        proxy.write_daemon_state(
+            certdir, 4100, stale_pid,
+            proxy.daemon_fingerprint() if wedged else "STALE-FP")
 
         def _fake_read_alive_port(cd, fingerprint=None):
             st = proxy.read_daemon_state(cd)
             if not st or (fingerprint is not None
                           and st.get("fingerprint") != fingerprint):
+                return None
+            if wedged and fingerprint is not None and st["pid"] == stale_pid:
                 return None
             return st.get("port")
 
@@ -22860,6 +22865,22 @@ class TestAWedgeIsNotTrustedForever:
             f"heal signalled a daemon that was already draining: {kills!r}")
         assert not spawn_calls, "heal spawned over a draining daemon"
 
+    def case_a_wedged_daemon_that_announced_its_drain_is_sent_no_signal(
+            self, tmp_path, monkeypatch):
+        """T3108: the drain test above on the WEDGE arm (a matching
+        fingerprint), so restricting the check to `not wedged` goes red. A
+        drainer leaves on its own whatever the probe said."""
+        (proxy, root, certdir, stale_pid, _holder, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch, wedged=True)
+        proxy.draining_marker_path(certdir, stale_pid).write_text(
+            str(time.time()))
+        assert proxy.heal(root) is False
+        assert kills == [], (
+            f"heal signalled a wedged daemon that was already draining: "
+            f"{kills!r}")
+        assert not spawn_calls, "heal spawned over a draining daemon"
+
     def case_an_ask_that_was_delivered_and_not_confirmed_is_not_a_term(
             self, tmp_path, monkeypatch):
         """T3108: the ask reached the holder (SIGUSR1 sent) but no successor
@@ -22884,8 +22905,11 @@ class TestAWedgeIsNotTrustedForever:
         """T3108: the bound. Without it a holder that never publishes leaves
         the stale daemon immortal (bae8ae3, 584cba8). A record naming this
         pid and fingerprint with `asked`, past the watchdog's two intervals
-        (the REAL `_watchdog_had_its_turn`, which must not rewrite it), takes
-        the ordinary ask, wait and TERM."""
+        (the REAL `_watchdog_had_its_turn`, which must not rewrite it), waits
+        and TERMs, and does NOT ask the holder again: `_on_replace_request`
+        has no guard for a live child that has not published, so a second
+        SIGUSR1 over a slow successor still booting spawns another beside it
+        and orphans the first from supervision."""
         (proxy, root, certdir, stale_pid, holder_pid, kills,
          spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
             tmp_path, monkeypatch)
@@ -22895,10 +22919,119 @@ class TestAWedgeIsNotTrustedForever:
         old = time.time() - 3 * proxy._CODE_WATCH_INTERVAL_S
         os.utime(sighting, (old, old))
         assert proxy.heal(root) is True
-        assert kills == [(holder_pid, proxy._REPLACE_ME_SIGNAL),
-                         (stale_pid, 15)], (
-            f"the bounded second pass did not TERM: {kills!r}")
+        assert kills == [(stale_pid, 15)], (
+            f"the bounded second pass re-asked the holder or did not TERM: "
+            f"{kills!r}")
         assert not sighting.exists(), "the sighting outlived the retirement"
+
+    def case_a_drain_announced_during_the_bound_wait_is_not_a_term(
+            self, tmp_path, monkeypatch):
+        """T3108: the wait on the bound pass is up to `_SPAWN_WAIT_S` long, and
+        a watchdog tick can announce the drain inside it. The first
+        `is_draining` read is behind us by then, so it is read again after
+        the wait: no signal at all, and nothing spawned."""
+        (proxy, root, certdir, stale_pid, _holder, kills,
+         spawn_calls) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        sighting = certdir / proxy._HEAL_DEFER_FILE
+        sighting.write_text(json.dumps(
+            {"pid": stale_pid, "fingerprint": "STALE-FP", "asked": True}))
+        old = time.time() - 3 * proxy._CODE_WATCH_INTERVAL_S
+        os.utime(sighting, (old, old))
+
+        def _wait_in_which_the_daemon_announces_its_drain(*a, **k):
+            proxy.draining_marker_path(certdir, stale_pid).write_text(
+                str(time.time()))
+            return False
+        monkeypatch.setattr(proxy, "_await_successor_state",
+                            _wait_in_which_the_daemon_announces_its_drain)
+        assert proxy.heal(root) is False
+        assert kills == [], (
+            f"heal signalled a daemon that announced its drain during the "
+            f"wait: {kills!r}")
+        assert not spawn_calls, "heal spawned over a draining daemon"
+
+    def _a_successor_publishes_after_an_asked_heal_returned(
+            self, tmp_path, monkeypatch, *, mark, successor_fp):
+        """Shared setup for the T3108 late-publish cases: ``mark`` is the
+        sighting heal left behind, the record now names a SUCCESSOR serving on
+        ``successor_fp`` (None: the current fingerprint), and `ps` shows both
+        daemons. `_kill_daemon` is RECORDED, and so is every `os.kill`.
+        Returns (heal's result, pids `_kill_daemon` was called for, the os.kill
+        log, the sighting path, the successor's pid)."""
+        (proxy, root, certdir, stale_pid, _holder, kills,
+         _spawn) = self._stale_fp_daemon_under_a_holder_that_never_publishes(
+            tmp_path, monkeypatch)
+        successor = 55543
+        proxy.write_daemon_state(
+            certdir, 4100, successor, successor_fp or proxy.daemon_fingerprint())
+        sighting = certdir / proxy._HEAL_DEFER_FILE
+        sighting.write_text(json.dumps(dict(mark, pid=stale_pid)))
+        monkeypatch.setattr(proxy, "_pin_daemon_pids",
+                            lambda cd: [stale_pid, successor])
+        killed = []
+        monkeypatch.setattr(
+            proxy, "_kill_daemon",
+            lambda pid, certdir=None, **k: killed.append(pid))
+        monkeypatch.setattr(proxy, "_move_into_this_lineage",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(proxy, "_wired_port", lambda: 4100)
+        return proxy.heal(root), killed, kills, sighting, successor
+
+    def case_a_successor_that_publishes_after_the_ask_retires_the_old_daemon(
+            self, tmp_path, monkeypatch):
+        """T3108: heal asked, nobody confirmed, it left an `asked` mark and
+        returned. The successor then published, so the next heal reads the
+        record as healthy and clears the mark -- and with it the only thing
+        that would ever TERM the old daemon. `_watch_own_code` needs a live
+        watchdog and `watch_refcount` needs no FIFO writer, so the old daemon
+        can keep accepting on stale code beside the successor. heal finishes
+        what it asked, through the sweep `_spawn_daemon` already runs: the old
+        daemon only, never the successor."""
+        result, killed, kills, sighting, successor = (
+            self._a_successor_publishes_after_an_asked_heal_returned(
+                tmp_path, monkeypatch,
+                mark={"fingerprint": "STALE-FP", "asked": True},
+                successor_fp=None))
+        assert result is False
+        assert killed == [55541], (
+            f"expected the old daemon swept and the successor {successor} "
+            f"spared, got {killed!r}")
+        assert kills == [], f"heal signalled directly: {kills!r}"
+        assert not sighting.exists(), "the mark outlived the retirement"
+
+    def case_a_successor_on_another_fingerprint_still_retires_the_old_daemon(
+            self, tmp_path, monkeypatch):
+        """T3108: the same leak when the successor publishes on a fingerprint
+        that is not the one heal read (a second deploy landed in between), so
+        `_await_successor_state` could not confirm it. It is stale too, but it
+        is the daemon on the port: the old one is swept before
+        `_watchdog_had_its_turn` rewrites the mark for the new pid."""
+        result, killed, _kills, sighting, successor = (
+            self._a_successor_publishes_after_an_asked_heal_returned(
+                tmp_path, monkeypatch,
+                mark={"fingerprint": "STALE-FP", "asked": True},
+                successor_fp="NEWER-STALE-FP"))
+        assert result is False
+        assert killed == [55541], (
+            f"expected the old daemon swept and the successor {successor} "
+            f"spared, got {killed!r}")
+        assert json.loads(sighting.read_text()) == {"pid": successor,
+                                        "fingerprint": "NEWER-STALE-FP"}
+
+    def case_a_plain_sighting_sweeps_nothing_when_a_successor_is_serving(
+            self, tmp_path, monkeypatch):
+        """T3108 control: the same state with a mark that holds no `asked` is
+        the watchdog's ordinary deferral. It finished its job without us, and
+        heal retires nobody on its account."""
+        result, killed, kills, sighting, _successor = (
+            self._a_successor_publishes_after_an_asked_heal_returned(
+                tmp_path, monkeypatch,
+                mark={"fingerprint": "STALE-FP"}, successor_fp=None))
+        assert result is False
+        assert killed == [] and kills == [], (
+            f"a plain sighting retired a daemon: {killed!r} {kills!r}")
+        assert not sighting.exists()
 
     def _wedge_replaced_through_the_holder(
             self, tmp_path, monkeypatch, *, term_raises_esrch):

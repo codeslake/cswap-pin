@@ -2036,6 +2036,26 @@ def heal(backup_root: Path, identity: dict | None = None,
     wedged = not fp_stale and not (stale_st or {}).get("unpinnable")
     stale_is_serving = (alive is None and (fp_stale or wedged)
                         and _read_alive_port(certdir) is not None)
+    # READ BEFORE ANYTHING CLEARS OR REWRITES IT: an `asked` mark is the bound
+    # on the unconfirmed ask below. A record naming ANOTHER pid under it means
+    # that ask's successor published after the heal that made it, and the clear
+    # below would take with it the only thing that TERMs the old daemon (its own
+    # retirers are not guaranteed: `_watch_own_code` needs a live watchdog,
+    # `watch_refcount` needs no FIFO writer). So finish the ask through the
+    # sweep `_spawn_daemon` runs once a successor publishes, which spares
+    # drainers and the record's pid. A successor IS on the port, so the TERM's
+    # drain takes the "a successor took the port" uncap, not a cut.
+    sighted = _read_json(Path(certdir) / _HEAL_DEFER_FILE)
+    serving_pid = int((stale_st or {}).get("pid") or 0)
+    if ((alive is not None or stale_is_serving) and (sighted or {}).get("asked")
+            and serving_pid and sighted.get("pid") != serving_pid):
+        _log_lifecycle(
+            f"{serving_pid} took the port after the ask for "
+            f"{sighted.get('pid')} -- retiring the old daemon")
+        try:
+            _sweep_orphan_daemons(certdir, keep_pid=serving_pid)
+        except Exception:  # noqa: BLE001 (a heal must never raise)
+            pass
     if not stale_is_serving:
         # The watchdog did its job (or there was never anything stale), so no
         # sighting is outstanding. This is the COMMON exit -- the deferral
@@ -2069,9 +2089,7 @@ def heal(backup_root: Path, identity: dict | None = None,
                 "The next heal retires it if that did not happen")
             return False
         # Past the deferral: this daemon is being retired, so the sighting has
-        # done its job and must not outlive it. READ FIRST: an `asked` mark on
-        # it is the bound on the unconfirmed ask below.
-        sighted = _read_json(Path(certdir) / _HEAL_DEFER_FILE)
+        # done its job and must not outlive it.
         _clear_heal_defer(certdir)
         try:
             # BOUNDED, BECAUSE A DEPLOY CALLS THIS SYNCHRONOUSLY. The holder
@@ -2170,7 +2188,24 @@ def heal(backup_root: Path, identity: dict | None = None,
                     if asked_holder and not _wedged_daemon_can_be_asked(
                             stale_pid, asked_holder):
                         asked_holder = None
-                    if asked_holder:
+                    # A DELIVERED ASK NOBODY CONFIRMED IS NOT GROUNDS TO TERM A
+                    # SERVING DAEMON: its successor may be slow (56-85 s on a
+                    # loaded host) and with none on the port the TERM cuts every
+                    # tunnel. STALE FINGERPRINT ONLY (a wedge's TERM is its only
+                    # repair). BOUNDED: the first time, leave an `asked` mark on
+                    # this pid AND fingerprint (else `_watchdog_had_its_turn`
+                    # rewrites it and the bound is lost). The next heal is the
+                    # BOUND PASS: it does not ask again (`_on_replace_request`
+                    # has no guard for a live child that has not published, so
+                    # a second ask over a booting successor spawns another
+                    # beside it), waits once more, and TERMs, so a holder that
+                    # never publishes cannot make the stale daemon immortal. A
+                    # successor that publishes after the first pass is not
+                    # TERMed here: the sweep above retires the old daemon.
+                    ask_mark = {"pid": stale_pid, "fingerprint": stale_fp,
+                                "asked": True}
+                    bound_pass = not wedged and sighted == ask_mark
+                    if asked_holder and not bound_pass:
                         try:
                             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
                         except OSError:
@@ -2183,19 +2218,15 @@ def heal(backup_root: Path, identity: dict | None = None,
                             f"{stale_pid} was wedged under a holder — "
                             f"asked the holder for a successor before "
                             f"terminating it")
-                    # A DELIVERED ASK NOBODY CONFIRMED IS NOT GROUNDS TO TERM A
-                    # SERVING DAEMON: its successor may be slow (56-85 s on a
-                    # loaded host) and with none on the port the TERM cuts every
-                    # tunnel. STALE FINGERPRINT ONLY (a wedge's TERM is its only
-                    # repair). BOUNDED: the first time, leave an `asked` mark on
-                    # this pid AND fingerprint (else `_watchdog_had_its_turn`
-                    # rewrites it and the bound is lost); the next heal TERMs as
-                    # before, so a holder that never publishes cannot make the
-                    # stale daemon immortal.
-                    ask_mark = {"pid": stale_pid, "fingerprint": stale_fp,
-                                "asked": True}
+                    # THE WAIT IS UP TO `_SPAWN_WAIT_S` LONG, and the watchdog
+                    # can announce the drain inside it. Read again.
+                    if not confirmed and is_draining(certdir, stale_pid):
+                        _log_lifecycle(
+                            f"{stale_pid} announced its drain while waiting "
+                            f"-- leaving it")
+                        return False
                     if (not wedged and asked_holder and not confirmed
-                            and sighted != ask_mark):
+                            and not bound_pass):
                         try:
                             (Path(certdir) / _HEAL_DEFER_FILE).write_text(
                                 json.dumps(ask_mark))
