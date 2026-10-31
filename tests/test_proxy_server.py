@@ -14749,7 +14749,7 @@ class TestDrainReportsWhatItCut:
             "uncapped arm and the superseded capped one")
         assert 'budget == float("inf")' in drain[:calls[0]][-200:], (
             "the tunnel wait is not confined to the uncapped arm")
-        assert "not _superseded_on_the_port(" in drain[:calls[1]][-200:], (
+        assert "not _superseded_on_the_port(" in drain[calls[0]:calls[1]], (
             "a capped drain waits on tunnels with no successor serving the "
             "port, past a supervisor counting to `_DRAIN_SECONDS + 2`")
 
@@ -19451,6 +19451,8 @@ class TestAHandoverMidDrainDropsTheClock:
             self, tmp_path, monkeypatch):
         out = self._drain(tmp_path, monkeypatch, superseded=True)
         assert "dropping the wall clock" in out, out
+        # THE SUMMARY NAMES THE REGIME IT ENDED IN, not the one it began in.
+        assert "no wall-clock cap" in out and "5s budget" not in out, out
 
     def test_CONTROL_no_successor_means_the_clock_still_binds(
             self, tmp_path, monkeypatch):
@@ -19458,6 +19460,7 @@ class TestAHandoverMidDrainDropsTheClock:
         nothing serving the port, hurrying is correct and the cap stays."""
         out = self._drain(tmp_path, monkeypatch, superseded=False)
         assert "dropping the wall clock" not in out, out
+        assert "a 5s budget" in out, out
 
     def test_CONTROL_the_promotion_happens_at_most_once(
             self, tmp_path, monkeypatch):
@@ -19519,6 +19522,10 @@ class TestAHandoverMidDrainDropsTheClock:
         assert pump.polls >= pump.life and pump.released == 0, (
             f"released {pump.released} live tunnel(s) with a successor "
             f"serving: {out}")
+        # A CHANGE OF REGIME IS SAID WHEREVER IT HAPPENS, once, and the
+        # summary names the ceiling that applied at the end.
+        assert out.count("dropping the wall clock") == 1, out
+        assert "no wall-clock cap" in out and "5s budget" not in out, out
 
     def test_CONTROL_with_no_successor_the_tunnels_are_released_at_the_end(
             self, tmp_path, monkeypatch):
@@ -19560,7 +19567,8 @@ class TestAHandoverMidDrainDropsTheClock:
 
         def owed(_started):
             """Nothing is owed until the tunnel wait has run; then a reply
-            that began during it is, for three looks."""
+            that began during it is owed for three looks, and the next
+            finds it done."""
             looks.append(pump.polls)
             return pump.polls > 0 and len(looks) <= 4
 

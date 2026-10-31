@@ -10557,8 +10557,9 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # A daemon exists but is stale (wrong account, or redeployed code) —
         # recycle it before spawning, so a redeploy/repin takes effect instead
         # of a stale daemon serving forever. A daemon on stale code replaces
-        # itself (held: whatever its beat; unheld: with a live beat), and the
-        # arm below leaves it to that; this launch recycles the rest.
+        # itself (held: unless `/health` proves its watchdog dead; unheld: with
+        # a live beat), and the arm below leaves it to that; this launch
+        # recycles the rest.
         stale = read_daemon_state(certdir)
         # "Alive" is not "still ours". An unclean exit leaves proxy.json
         # behind, and a pid is reused freely — so liveness alone would aim
@@ -10599,19 +10600,23 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # handovers) while the daemon keeps serving, and then nothing
             # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
             # absent (an older daemon) reads as dead.
-            # A HELD DAEMON ON STALE CODE IS LEFT ALONE WHATEVER ITS BEAT, and
-            # whether or not the one 1.0 s `/health` probe answered (T3100): a
-            # launch right after an install lands inside the watchdog's tick,
-            # and its TERM drained capped (30 s, 9 live channels) 4 s before the
-            # watchdog would have replaced the daemon successor-first. The
-            # probe missed on a live daemon (1007 ms on a loaded host, T1935),
-            # so a miss is no permission to TERM. Its watchdog replaces it, a
-            # dead watchdog is `heal`'s (it replaces stale code), and a wedge is
-            # the holder's own port watch's. An UNHELD daemon on stale code is
-            # left alone only with a live beat: its watchdog hands it down
-            # gaplessly (`release_listener(hand_down=True)`, the successor
-            # bound before the drain), and a TERM here would cut what that
-            # hand-down keeps.
+            # A HELD DAEMON ON STALE CODE IS LEFT ALONE UNLESS `/health` PROVES
+            # ITS WATCHDOG DEAD (T3100): a launch right after an install lands
+            # inside the watchdog's tick, and its TERM drained capped (30 s, 9
+            # live channels) 4 s before the watchdog would have replaced the
+            # daemon successor-first. A live beat is that tick coming. A miss
+            # of the one 1.0 s probe (1007 ms was measured on a loaded host,
+            # T1935) or an answer naming another pid proves nothing, and a
+            # wedge is the holder's own port watch's. An answer that names the
+            # pid with a stale or absent beat IS the proof (a watchdog that
+            # died with the daemon serving, or an older daemon with no beat),
+            # and nothing else repairs it on a host that only uses `cswap run`:
+            # `heal` is not reached from there, and the port watch sees a
+            # daemon answering as itself. That one takes the recycle below.
+            # An UNHELD daemon on stale code is left alone only with a live
+            # beat: its watchdog hands it down gaplessly
+            # (`release_listener(hand_down=True)`, the successor bound before
+            # the drain), and a TERM here would cut what that hand-down keeps.
             # A missing clause takes the path below (`_recycle_daemon`: a TERM,
             # and under a holder the capped signal drain; T3107 owns it): a
             # STALL, unmarked or marked (the watchdog never replaces on a busy
@@ -10621,21 +10626,23 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # watchdog never repairs current code), one whose `/health` does
             # not name its pid (wedged), one whose watchdog beat is stale or
             # absent (an older daemon); the last two for an unheld daemon on
-            # stale code too.
+            # stale code too, and for a held one on stale code only when
+            # `/health` DID name its pid.
             port_ok = isinstance(stale.get("port"), int)
             stale_code = stale.get("fingerprint") != fp
             held = _wedged_parent_holder(
                 int(stale["pid"]), certdir) is not None
             health = (_health_body(stale["port"])
                       if port_ok and (held or stale_code) else None)
+            named = (health is not None
+                     and health.get("pid") == int(stale["pid"]))
             if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
                  or "").lower() not in ("off", "0", "no")
                     and port_ok
                     and not (health is not None and _mint_stalled(health))
-                    and ((held and stale_code)
+                    and ((held and stale_code and not named)
                          or ((held or stale_code)
-                             and health is not None
-                             and health.get("pid") == int(stale["pid"])
+                             and named
                              and isinstance(
                                  beat_age := health.get("code_watch_age_s"),
                                  (int, float))
@@ -15887,6 +15894,30 @@ def _superseded_on_the_port(certdir: Path) -> bool:
     return pid != os.getpid() and _pid_alive(pid)
 
 
+def _successor_serves_the_port(certdir: Path, port) -> bool:
+    """Whether ``proxy.json`` names a pin daemon of THIS certdir, not us, that
+    serves ``port``: `_superseded_on_the_port` narrowed to what releasing the
+    listener can act on.
+
+    That one reads "a live pid that is not me", so a record from a second
+    lineage on another port, a reused pid or a pid-namespace neighbour sharing
+    $HOME all read as a successor, and the watchdog's held branch then released
+    the listener and exited 0 with nothing behind the port (dark until the
+    holder's port watch notices, 90-155 s). `ps` cannot see a pid in another
+    namespace: that reads False and the branch asks the holder, as at the base.
+    The drain keeps the loose reading: there the listener is already released
+    and the process already leaving, so a false answer only lifts the wall
+    clock of a drain that is happening anyway.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        pid = int(st["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (pid != os.getpid() and st["port"] == port
+            and pid in _pin_daemon_pids(certdir))
+
+
 def _release_daemon_state(certdir: Path) -> bool:
     """Drop ``proxy.json`` if it still names us. True when it names SOMEONE
     ELSE — i.e. we were superseded and must touch nothing further.
@@ -16154,8 +16185,8 @@ def _watch_own_code(
     """Hand over to a successor when this module's code is replaced on disk.
 
     WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
-    `ensure_proxy` leaves a held stale daemon to this watchdog and recycles
-    an unheld one only when the watchdog is not beating, and only when a new
+    `ensure_proxy` leaves a stale daemon to this watchdog and recycles it
+    only when `/health` shows no live beat from it, and only when a new
     session starts. A machine whose sessions are all already running never
     launches, so an upgrade never reaches the process. Measured: a daemon served
     for 22 hours on code that had been replaced 19 hours earlier, across six
@@ -16485,7 +16516,11 @@ def _watch_own_code(
                 # spawn another). Beside a TERM drain this is harmless:
                 # `release_listener` tolerates a second call, and two uncapped
                 # drains over the same replies and tunnels end together.
-                if _superseded_on_the_port(certdir):
+                # A PIN DAEMON ON OUR PORT, NOT A LIVE PID: exit 0 here with
+                # nobody behind the port is an outage, so a record of another
+                # port, a reused pid or a pid that is no pin daemon asks.
+                if _successor_serves_the_port(
+                        certdir, getattr(server, "port", None)):
                     _log_lifecycle(
                         f"{why}: a successor already serves the port, so "
                         "nothing is asked: leaving it the port while we "
@@ -20943,6 +20978,10 @@ class PinProxy:
                       quiet=self.content_free_seconds(),
                       streams=streams, bridges=self.held_bridge_ids())
         beat_at = started
+        # THE REGIME THIS DRAIN IS IN, which the loop below can change: a
+        # successor taking the port drops the wall clock mid-wait, and the
+        # summary names the ceiling that applied at the END.
+        promoted = budget == float("inf")
         try:
             # AND THE TUNNELS: `_wait_for_tunnels`, on the uncapped arm here and
             # on a capped one a successor superseded, inside the loop below.
@@ -20969,7 +21008,6 @@ class PinProxy:
                 # this and CANNOT: `_HELD_DRAIN_SECONDS` is `_DRAIN_SECONDS`,
                 # so all four combinations of its arguments return 30.0. The
                 # fact has to be re-read HERE, where it can change mid-wait.
-                promoted = budget == float("inf")
                 # WHAT THE PREDICATE BUYS ON A CAPPED ARM, because
                 # `_HELD_DRAIN_SECONDS` < `_DRAIN_STALL_SECONDS` invites the
                 # reading that it buys nothing and a careful reader reached
@@ -21004,6 +21042,11 @@ class PinProxy:
                         if tunnels_waited or not _superseded_on_the_port(
                                 self._certdir):
                             break
+                        if not promoted:
+                            _log_lifecycle(
+                                "a successor took the port while this drain "
+                                "was running: dropping the wall clock so the "
+                                "replies already owed can finish")
                         self._wait_for_tunnels(started)
                         tunnels_waited = promoted = True
                         deadline = float("inf")
@@ -21087,7 +21130,7 @@ class PinProxy:
         # infinite, and "of a infs budget" reads as a quantity nobody can act
         # on — this is the one line a later session reads to decide whether a
         # departure cost anybody a reply, so it says which regime it ran in.
-        ceiling = ("no wall-clock cap" if budget == float("inf")
+        ceiling = ("no wall-clock cap" if promoted
                    else f"a {budget:.0f}s budget")
         if cut:
             _log_lifecycle(
