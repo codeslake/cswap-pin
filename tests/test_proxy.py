@@ -11819,7 +11819,7 @@ class TestEnsureProxyLifecycle:
         process, through the real `_recycle_daemon` and `_kill_daemon`: only
         the signal is stubbed, by an `os.kill` spy that reads the record at the
         instant each TERM is sent. Returns (those records, the port it
-        answers)."""
+        answers, the ports it wired into `.claude.json`)."""
         import os, subprocess, sys
         from cswap_pin import proxy as pin_proxy
         self._pin(tmp_path)
@@ -11834,6 +11834,9 @@ class TestEnsureProxyLifecycle:
         monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
                             lambda *a, **k: denied)
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
+        wired = []
+        monkeypatch.setattr(pin_proxy, "wire_global_config",
+                            lambda port, *a, **k: wired.append(port))
         # A holder's respawn is what the held row waits for.
         monkeypatch.setattr(
             pin_proxy, "_read_alive_port",
@@ -11847,36 +11850,41 @@ class TestEnsureProxyLifecycle:
             return real_kill(pid, sig)
         monkeypatch.setattr(os, "kill", kill)
         got = (pin_proxy.ensure_proxy(self._Sw(tmp_path)) or (None,))[0]
-        return at_term, got
+        return at_term, got, wired
 
     def case_the_unheld_recycle_writes_no_mark_before_it_terms(
             self, tmp_path, monkeypatch):
         """T3131: the TERM of an unheld daemon starts a signal drain that must
-        wait for a successor, and the signal it reads is the old port
-        answering (`PinProxy._successor_is_due`). A mark written before the
+        wait for a successor, and the signal it reads is a holder existing
+        (`PinProxy._successor_is_due`). A mark written before the
         TERM was the first try: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and
         clears it while the holder is still booting, and it outlived a launch
         that died before the spawn. The record at the TERM is the daemon's
         own, as it was."""
-        at_term, got = self._recycle_unheld(tmp_path, monkeypatch)
+        at_term, got, _ = self._recycle_unheld(tmp_path, monkeypatch)
         assert got == 52000 and len(at_term) == 1, (got, at_term)
         assert "handover" not in at_term[0], (
             f"the record at the TERM was {at_term[0]}: a launch-owned mark "
             "the drain would have to outlive")
 
     def case_a_denied_host_sends_an_unheld_daemon_no_term(
-            self, tmp_path, monkeypatch):
+            self, tmp_path, monkeypatch, capsys):
         """T3131: a host that cannot read the Keychain spawns nothing, so the
         TERM of an unheld daemon cut every tunnel with no successor coming.
-        The daemon is left serving and its port returned, as the leave-alone
-        clause does. The HELD arm is the holder's respawn and still TERMs."""
-        at_term, got = self._recycle_unheld(
+        It is the base behaviour minus the cut: no TERM, the cold-start
+        refusal logged, None returned and nothing wired. Not the port of the
+        daemon left serving: `_read_alive_port` had already refused it (a
+        drainer, a wedged daemon, another account's), so wiring it breaks the
+        session or pins the wrong account. The HELD arm is the holder's
+        respawn and still TERMs."""
+        at_term, got, wired = self._recycle_unheld(
             tmp_path, monkeypatch, denied=True)
-        assert at_term == [] and got == 40001, (
-            f"TERMs {at_term}, port {got}: a denied host sent a TERM that "
-            "nothing would follow")
+        assert at_term == [] and got is None and wired == [], (
+            f"TERMs {at_term}, port {got}, wired {wired}: a denied host "
+            "sent a TERM that nothing would follow, or wired a refused port")
+        assert "not spawning the pin daemon from here" in capsys.readouterr().err
         (tmp_path / "held").mkdir()
-        at_term, got = self._recycle_unheld(
+        at_term, got, wired = self._recycle_unheld(
             tmp_path / "held", monkeypatch, held=True, denied=True)
         assert len(at_term) == 1 and got == 52000, (at_term, got)
 

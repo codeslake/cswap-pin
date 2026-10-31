@@ -2190,8 +2190,12 @@ def heal(backup_root: Path, identity: dict | None = None,
                         asked_holder = None
                     # A DELIVERED ASK NOBODY CONFIRMED IS NOT GROUNDS TO TERM A
                     # SERVING DAEMON: its successor may be slow (56-85 s on a
-                    # loaded host) and with none on the port the TERM cuts every
-                    # tunnel. STALE FINGERPRINT ONLY (a wedge's TERM is its only
+                    # loaded host) and with none on the port a HELD daemon's
+                    # TERM cuts every tunnel (T3107's arm). An UNHELD daemon's
+                    # drain waits while a holder for this certdir exists
+                    # (`PinProxy._successor_is_due`, T3131); only a lock wait
+                    # that pushes the Popen below past `_SPAWN_WAIT_S` still
+                    # cuts. STALE FINGERPRINT ONLY (a wedge's TERM is its only
                     # repair). BOUNDED: the first time, leave an `asked` mark on
                     # this pid AND fingerprint (else `_watchdog_had_its_turn`
                     # rewrites it and the bound is lost). The next heal is the
@@ -10183,6 +10187,13 @@ def _keychain_denied_here(confirm: bool = True) -> bool:
     return True
 
 
+_DENIED_NO_SPAWN = (
+    "not spawning the pin daemon from here: this process cannot "
+    "read the Keychain (security rc=36), and a daemon it starts "
+    "could never mint. Start it from the login session -- the TUI "
+    "does, and so does `cswap pin --ensure` in a terminal there")
+
+
 def _note_keychain_denial(server) -> None:
     """Read ONCE, from the daemon's own process, whether this lineage is
     refused the Keychain, and let `/health` say so (`keychain_denied`, present
@@ -10724,14 +10735,16 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                 return port, ca
             # A HOST THAT CANNOT READ THE KEYCHAIN SPAWNS NOTHING BELOW, so the
             # TERM of an UNHELD daemon (T3131) cut every tunnel with no
-            # successor coming. Leave it serving and return its port, as the
-            # clause above does: the move into this lineage is moot, this
-            # lineage is refused too. A held daemon's successor is the
-            # holder's, not ours, so that arm is unchanged.
-            if (port_ok and not held and _keychain_denied_here()
+            # successor coming. Send none: log the refusal the cold start
+            # logs, return None, wire nothing. NOT the stale daemon's port:
+            # `_read_alive_port` already refused it (a drainer, a wedged
+            # daemon, another account's), and wiring it is the outage or the
+            # wrong account. A held daemon's successor is the holder's, not
+            # ours, so that arm is unchanged.
+            if (not held and _keychain_denied_here()
                     and not _holder_owns(certdir)):
-                wire_global_config(stale["port"], ca)
-                return stale["port"], ca
+                _log_lifecycle(_DENIED_NO_SPAWN)
+                return None
             # Save the port BEFORE the kill: the daemon unlinks its own state
             # on TERM, so afterwards there is nothing left to reclaim from and
             # the successor would take a fresh port — stranding every session
@@ -10763,11 +10776,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             wire_global_config(stale["port"], ca)
             return stale["port"], ca
         if _keychain_denied_here():
-            _log_lifecycle(
-                "not spawning the pin daemon from here: this process cannot "
-                "read the Keychain (security rc=36), and a daemon it starts "
-                "could never mint. Start it from the login session -- the TUI "
-                "does, and so does `cswap pin --ensure` in a terminal there")
+            _log_lifecycle(_DENIED_NO_SPAWN)
             return None
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
@@ -21122,7 +21131,8 @@ class PinProxy:
                 # already on the port (`_successor_is_due`): the exit tests
                 # below fire on the first look when nothing is owed, which for
                 # a TERM of an unheld daemon is before the successor's holder
-                # has started, and they then released every tunnel.
+                # has started, and they then released every tunnel. The wait
+                # is for a HOLDER of this certdir, not for a port to answer.
                 tunnels_waited = promoted
                 while True:
                     if ((time.monotonic() >= deadline
@@ -21263,22 +21273,27 @@ class PinProxy:
         A launch that recycles an UNHELD daemon TERMs it before any successor
         exists, and `_superseded_on_the_port` cannot say one is coming until it
         has PUBLISHED, 56-85 s on a loaded host (T1935). The signal read here is
-        the OLD PORT ANSWERING: `release_listener` has closed it, so an answer
-        is a successor's holder that has bound it, true from the moment the
-        holder exists with nothing for a launch to keep alive. NOT A MARK the
-        launch writes: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and clears
-        it while the holder is still booting.
+        A HOLDER EXISTING for this certdir (`_holder_owns`, a `--hold-port`
+        process): true from the holder's exec, before it imports this module or
+        binds anything, whichever port the successor takes, and gone when the
+        holder dies. NOT A PORT PROBE: a connect to a booting holder can time
+        out with its backlog unserved, and the file's rule is that only a
+        refusal means nobody (`_port_refuses`); and where this daemon runs on
+        an inherited listener (a macOS orphan) its own fd keeps the old port
+        answering with no successor coming. NOT A MARK the launch writes
+        either: `_spawn_daemon` gives up at `_SPAWN_WAIT_S` and clears it while
+        the holder is still booting.
 
         The first `_SPAWN_WAIT_S` wait on no signal: between this drain's
-        announce (what lets the launch's `_kill_daemon` return) and its Popen
-        nothing can answer yet. After that the port is asked once per
-        `_DRAINING_BEAT_SECONDS`, the last answer carried: the loop passes
-        every 50 ms and the connect is up to 0.5 s. The wait ends when the
-        successor publishes (the drain is promoted and takes
-        `_wait_for_tunnels`), when the port stops answering (the holder died),
-        or at `_RELOCATE_WAIT_S`, and the tunnels go as they always did. Only
-        with a tunnel to release; NOT A HELD DAEMON (its holder puts the
-        successor on the socket, T3107's arm).
+        announce (what lets the launch's `_kill_daemon` return) and its Popen no
+        holder can exist yet. After that the holder is looked for once per
+        `_DRAINING_BEAT_SECONDS`, the last answer carried: the loop passes every
+        50 ms and the read scans `/proc` (a `ps` with a 5 s bound on macOS).
+        The wait ends when the successor publishes (the drain is promoted and
+        takes `_wait_for_tunnels`), when no holder is left, or at
+        `_RELOCATE_WAIT_S`, and the tunnels go as they always did. Only with a
+        tunnel to release; NOT A HELD DAEMON (its holder puts the successor on
+        the socket, T3107's arm).
         """
         now = time.monotonic()
         if (now >= started + _RELOCATE_WAIT_S
@@ -21286,11 +21301,11 @@ class PinProxy:
             return False
         if now < started + _SPAWN_WAIT_S:
             return True
-        at, answered = getattr(self, "_due_probe", (float("-inf"), False))
+        at, owned = getattr(self, "_due_probe", (float("-inf"), False))
         if at < started + _SPAWN_WAIT_S or now - at >= _DRAINING_BEAT_SECONDS:
-            answered = _port_answers(self.port)
-            self._due_probe = (now, answered)
-        return answered
+            owned = _holder_owns(self._certdir)
+            self._due_probe = (now, owned)
+        return owned
 
     def _wait_for_tunnels(self, started: float) -> None:
         """Hold this drain open while a CONNECT tunnel `_PUMP` drives is live,
