@@ -16926,6 +16926,32 @@ def _watch_own_code(
                         f"{why}: the holder's successor is still booting, so "
                         "nothing is asked again")
                     continue
+            # AN ORPHAN WHOSE HANDOVER ALREADY PUT A HOLDER ON THE SOCKET WAITS
+            # FOR IT (T3132). Its successor publishes after `_SPAWN_WAIT_S`, so
+            # the spawn below reads "no successor came" and resumes, and the
+            # next tick is still an orphan: a holder and a successor per tick
+            # until `_HANDOVER_ATTEMPTS`, all accepting on one socket. The
+            # sidecar cannot say so (a cold start writes none, and its holder is
+            # not ours), so ask what the standby revive asks: does a holder own
+            # this certdir? The dead holder's pid is gone from /proc, so only a
+            # live one answers. No holder: the spawn below, unchanged.
+            if orphaned and _holder_owns(certdir):
+                if _successor_serves_the_port(
+                        certdir, getattr(server, "port", None)):
+                    _log_lifecycle(
+                        f"{why}: the new holder's successor serves the port, "
+                        "so nothing is handed over: leaving it the port while "
+                        "we finish what we hold")
+                    # `hand_down`, NOT A PLAIN RELEASE: an orphan's plain
+                    # release shuts the socket down, and the successor accepts
+                    # on this very open socket. Detached, it stays listening.
+                    server.release_listener(hand_down=True)
+                    with contextlib.suppress(Exception):  # never costs the leave
+                        _carry_out(certdir)
+                    setattr(server, "_carry_owed", False)
+                    server.await_inflight(_HANDOVER_DRAIN_SECONDS)
+                    os._exit(0)
+                continue
             if replace_for_blind:
                 n = note_blind_recycle(certdir, now)
                 _log_lifecycle(
@@ -18180,6 +18206,18 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # (seconds): a concurrent launch that found this daemon through the record
     # below read `null` as a dead watchdog and TERMed a fresh successor.
     proxy._code_watch_beat = time.monotonic()
+    # A SUCCESSOR WHOSE HOLDER DIED WHILE IT BOOTED HAS NO SOCKET TO TAKE
+    # (T3132). The parent guard in `_handed_down_listener` refuses the
+    # descriptor, so `start()` would bind its own: measured, EADDRINUSE on the
+    # pin's port, then a random one, which it publishes. The daemon above it,
+    # orphaned by the same death, puts a successor of its own on the pin's
+    # socket, so leaving before the bind is all this one owes. The parent
+    # moves to init the moment the holder dies and never moves back.
+    if os.environ.get(_HANDDOWN_FROM_ENV) and _orphaned_from_its_holder():
+        _log_lifecycle(
+            "the holder that spawned this daemon died before it took the "
+            "socket: leaving without binding, the daemon above replaces us")
+        return
     proxy.start()
     # `_OWN_FINGERPRINT`, NOT a fresh read. This record is an IDENTITY — it is
     # what `runtime_health`, a deploy check or a human answers "is the running

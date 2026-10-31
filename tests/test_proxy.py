@@ -38784,6 +38784,39 @@ else:
             assert t.log().count("further asks are declined") == 1, t.log()
             self._the_successor_served_and_nothing_was_cut(t, booting)
 
+    def case_a_holder_that_dies_mid_carry_leaves_one_serving_successor(
+            self, monkeypatch):
+        """The holder is gone (a stale-holder SIGHUP) while the successor it
+        spawned is still booting, longer than any wait. Its parent is not its
+        holder any more, so it refused the hand-down and bound a RANDOM port;
+        and the orphaned daemon handed over on every tick (the new holder's
+        successor is in no sidecar), a holder and a successor each, all on one
+        socket. Exactly one successor serves the pin's port, the held reply is
+        not cut and nothing exits 75."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, slow_s=self.BOOT_S) as t:
+            os.kill(t.holder, signal.SIGUSR1)
+            booting = self._booting(t)
+            os.kill(t.holder, signal.SIGHUP)
+            late = self._until(
+                "no successor ever served after the holder died",
+                lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                         else None)(t.serving()), 60)
+            rest = t.finish()
+            log = t.log()
+            assert int(late["port"]) == t.port, f"the port moved: {late}\n{log}"
+            assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+                f"the held reply was cut: {rest!r}\n{log}")
+            assert not re.search(r"cut \d+ in-flight", log), log
+            assert "exiting for the holder to replace us" not in log, log
+            serving = int(late["pid"])
+            self._until(f"exactly daemon {serving} is left, not {booting}",
+                        lambda: pp._pin_daemon_pids(t.certdir) == [serving], 30)
+            assert pp._health_pid(t.port) == serving, log
+
 
 class TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses:
     """T3107: the supervisor is parked on a predecessor that drains for hours
