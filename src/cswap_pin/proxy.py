@@ -14745,6 +14745,16 @@ class PortHolder:
                     f"replace request for port {self.port} ignored: a "
                     f"successor is still booting")
                 return
+            # THE CARRY BEGINS HERE, BEFORE THE HAND-OFF CHECK AND THE SPAWN:
+            # a SIGUSR1 nested in the check's glob and stat, or in the Popen,
+            # finds the carry and declines, and a launch in another process
+            # finds the sidecar (`_note_carry`) while the fork runs.
+            # THE DAEMON THAT SERVES, never a dead child: it is what a give-up
+            # hands the supervision back to and what a publish retires. A dead
+            # `self._proc` is the supervisor's to respawn, not ours to replace.
+            prior = getattr(self, "_proc", None)
+            before = prior if _child_running(prior) else None
+            self._carry = {"before": before, "at": time.time()}
             # ponytail: a SIGTERM (`_cleanup`, see `_install_signal_teardown`)
             # nested INSIDE this call, between `_spawn`'s `Popen()` and its
             # `self._proc = proc` (T1401), leaves the successor unassigned
@@ -14772,21 +14782,13 @@ class PortHolder:
             handed = self._hand_to_the_caller() if signum is not None else None
             if handed is not None:
                 self._handed_off = handed
+                self._end_carry(None, before, False)
                 return
             # THE WATCH OUTLASTS THE DAEMON'S WAIT: the daemon polls
             # `proxy.json` for `_SPAWN_WAIT_S` and then keeps serving (T3107),
             # a successor measured 56-85 s to publish. `_RELOCATE_WAIT_S` is
             # the figure the other long wait uses, and the sidecar's ceiling.
             deadline = time.monotonic() + _RELOCATE_WAIT_S
-            # THE DAEMON THAT SERVES, never a dead child: it is what a give-up
-            # hands the supervision back to and what a publish retires. A dead
-            # `self._proc` is the supervisor's to respawn, not ours to replace.
-            prior = getattr(self, "_proc", None)
-            before = prior if _child_running(prior) else None
-            # THE CARRY BEGINS HERE, BEFORE THE SPAWN, and the sidecar with it:
-            # a SIGUSR1 nested in the Popen finds the one, and a launch in
-            # another process finds the other while the fork runs.
-            self._carry = {"before": before, "at": time.time()}
             self._note_carry(None)
             try:
                 self._spawn()
@@ -14877,9 +14879,11 @@ class PortHolder:
                 _log_lifecycle(
                     f"no successor published for port {self.port}: daemon "
                     f"{before.pid} serves it again")
-            self._carry = None
+            # THE SIDECAR FIRST: an ask nested between the two would write its
+            # own, which this would then delete.
             if certdir is not None:
                 write_carry_file(certdir, _SUCCESSOR_FLIGHT_FILE, None)
+            self._carry = None
         if not published:
             self._terminate_proc(proc)
 
@@ -15143,14 +15147,17 @@ class PortHolder:
             with self._replace_lock:
                 # WHO IS SILENT: `proc`, or, once a successor took the port
                 # while `proc` drains (the supervisor stays parked on it, a
-                # drain can last hours), that successor, but only a PUBLISHED
-                # one: a booting successor answers nothing yet and is the
-                # respawn watch's (`_respawn_until_published`), not a wedge.
+                # drain can last hours), that successor: a published one is
+                # wedged, a DEAD one is a watch that gave up (its predecessor
+                # was gone, so `_end_carry` left `self._proc` on it) and
+                # nothing else would put a daemon on the port before `proc`
+                # exits. Only a LIVE unpublished one is spared: it answers
+                # nothing yet and is the respawn watch's
+                # (`_respawn_until_published`), not a wedge.
                 target = self._proc
-                if target is not proc and not (
-                        getattr(target, "returncode", 0) is None
+                if (target is not proc and _child_running(target)
                         and (read_daemon_state(self._certdir) or {}).get(
-                            "pid") == target.pid):
+                            "pid") != target.pid):
                     continue
                 _log_lifecycle(
                     f"daemon {target.pid} has not answered on port "
@@ -15473,6 +15480,10 @@ class PortHolder:
         # successor that landed in between.
         with self._replace_lock:
             self._terminate_proc(getattr(self, "_proc", None))
+            # A WATCH ASLEEP IN A BACKOFF LONGER THAN THE JOIN restores its
+            # predecessor to `_proc` only after the socket closed: ended here,
+            # or it survives with its inherited descriptor.
+            self._terminate_proc((self._carry or {}).get("before"))
             self._release_standby(getattr(self, "_standby", None))
             try:
                 self._srv.close()

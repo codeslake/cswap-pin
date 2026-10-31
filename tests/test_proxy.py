@@ -38270,6 +38270,16 @@ def _code_is_current(own):
         pass
     return _current(own)
 p._code_is_current = _code_is_current
+_ask = p.PortHolder._on_replace_request
+def _on_replace_request(self, *args):
+    # THE HOLDER'S WATCH GIVES UP IN SECONDS once the file exists, read at each
+    # ask so the first successor is not held to it.
+    try:
+        p._RELOCATE_WAIT_S = float((_root / "relocate").read_text())
+    except (OSError, ValueError):
+        pass
+    return _ask(self, *args)
+p.PortHolder._on_replace_request = _on_replace_request
 a = sys.argv
 if a[1:2] == [p._HOLDER_MODULE_ARG]:
     p.holder_main(a[3], a[4], Path(a[5]), port=int(a[2]))
@@ -38577,6 +38587,60 @@ class TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses:
                 "the sidecar outlived the carry")
 
 
+    def case_a_repair_that_gave_up_is_repaired_again_before_the_predecessor_exits(
+            self, monkeypatch):
+        """The wedged published successor is KILLed, its replacement never
+        publishes inside the watch's limit and is ended with it, so
+        `self._proc` is a dead child that is not the draining predecessor the
+        supervisor waits on. The port watch skipped any non-predecessor that
+        was not a live published daemon, so nothing repaired the port again:
+        dark until the predecessor exited, which a held reply makes hours."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        with self._lineage(monkeypatch, nowatch=True, oldfp=True,
+                           fastwatch=True) as t:
+            os.kill(t.holder, signal.SIGUSR1)
+            first = int(self._until(
+                "the first successor never served",
+                lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                         else None)(t.serving()), 40)["pid"])
+            assert t.daemon in pp._pin_daemon_pids(t.certdir), (
+                "premise: the predecessor drains")
+            (t.base / "relocate").write_text("8")
+            (t.base / "slow").write_text("60")      # the repair never publishes
+            os.kill(first, signal.SIGSTOP)
+            known = {t.daemon, first}
+            second = self._until(
+                "the wedged successor was never replaced",
+                lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                              if p not in known), None), 60)
+            os.kill(first, signal.SIGKILL)      # dead before the watch gives up
+            self._until("the repair never gave up",
+                        lambda: "did not publish for port" in t.log(), 30)
+            (t.base / "slow").unlink()          # the next one boots at once
+            known.add(second)
+            third = self._until(
+                "the port stayed dark after the repair gave up",
+                lambda: next((p for p in pp._pin_daemon_pids(t.certdir)
+                              if p not in known), None), 30)
+            late = self._until(
+                "the repair that followed never published",
+                lambda: (lambda st: st if st and int(st["pid"]) == third
+                         else None)(t.serving()), 40)
+            assert int(late["port"]) == t.port, "the port moved"
+            assert t.daemon in pp._pin_daemon_pids(t.certdir), (
+                "the port was served only after the predecessor exited")
+            rest = t.finish()
+            assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+                f"the held reply was cut: {rest!r}\n{t.log()}")
+            self._until(f"exactly daemon {third} is left",
+                        lambda: pp._pin_daemon_pids(t.certdir) == [third], 60)
+            assert pp.successor_in_flight(t.certdir) is None, (
+                "the sidecar outlived the carry")
+
+
 class TestASuccessorInFlightIsNamedByASidecar:
     """T3107: the sidecar and what reads it, with real child processes for the
     pids (liveness is a pid's, never a clock's) and no process of the pin's."""
@@ -38837,6 +38901,87 @@ class TestASuccessorInFlightIsNamedByASidecar:
                     lambda: len(h.spawned) == 2, 10)
         assert h._proc is h.spawned[1]
         h._stop = True
+
+    def test_a_signal_ask_nested_in_the_hand_off_check_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """The hand-off check (`_hand_to_the_caller`: a glob and a stat) runs
+        between the decline check and the spawn, and a SIGUSR1 landing in it
+        saw no carry and spawned a successor the outer ask then spawned
+        beside. The carry is set before it. A hand-off that is made ends the
+        carry on its return: no spawn, no sidecar, nothing left to decline."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        h = self._holder(tmp_path, kid(), kid)
+        real, nested = type(h)._hand_to_the_caller, []
+
+        def hand(self):
+            if not nested:
+                nested.append(1)
+                self._on_replace_request(signal.SIGUSR1, None)
+            return real(self)
+
+        monkeypatch.setattr(type(h), "_hand_to_the_caller", hand)
+        h._on_replace_request(signal.SIGUSR1, None)
+        h._stop = True      # ends the watch the outer ask started
+        assert nested and len(h.spawned) == 1, (
+            f"the nested ask spawned beside the outer one: {h.spawned}")
+
+        seen, other = [], tmp_path / "other"
+        other.mkdir()
+        h2 = self._holder(other, kid(), kid)
+        monkeypatch.setattr(
+            type(h2), "_hand_to_the_caller",
+            lambda self: seen.append(self._carry) or True)
+        h2._on_replace_request(signal.SIGUSR1, None)
+        assert seen and seen[0] is not None, "no carry during the hand-off"
+        assert h2._handed_off and h2._carry is None and not h2.spawned
+        assert not (other / pp._SUCCESSOR_FLIGHT_FILE).exists()
+
+    def test_a_signal_ask_nested_in_the_end_of_a_carry_is_declined(
+            self, tmp_path, kid, monkeypatch):
+        """The sidecar goes BEFORE the carry is cleared: an ask nested between
+        the two (the main thread's handler) wrote its own sidecar, which the
+        end then deleted."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        pred = kid()
+        h = self._holder(tmp_path, pred, kid)
+        h._carry = {"before": pred, "at": time.time()}
+        real, nested = pp.write_carry_file, []
+
+        def write(certdir, name, rec):
+            if rec is None and not nested:
+                nested.append(1)
+                h._on_replace_request(signal.SIGUSR1, None)
+            return real(certdir, name, rec)
+
+        monkeypatch.setattr(pp, "write_carry_file", write)
+        h._end_carry(None, pred, False)
+        h._stop = True
+        assert nested and not h.spawned and h._carry is None, (
+            f"an ask nested in the end of the carry spawned: {h.spawned}")
+
+    def test_stop_ends_the_daemon_a_carry_was_to_hand_back(
+            self, tmp_path, kid, monkeypatch):
+        """A watch asleep in a backoff longer than `stop()`'s join restores
+        the predecessor after the socket closed, and it survives with its
+        inherited descriptor. The locked pass ends it too."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda msg: None)
+        pred, succ = kid(), kid()
+        h = self._holder(tmp_path, succ, kid)
+        h._carry = {"before": pred, "at": time.time()}
+        h._srv = socket.socket()
+        h.stop()
+        assert succ.poll() is not None and pred.poll() is not None, (
+            "stop() left a daemon of this holder running")
 
     def test_a_sidecar_that_could_not_be_written_is_said_and_the_ask_still_declines(
             self, tmp_path, kid, monkeypatch):
