@@ -15385,8 +15385,9 @@ class TestDrainReportsWhatItCut:
         assert named, (
             "no `await_inflight(<CONSTANT>)` call found at all — the scan is "
             "broken, and a broken scan passes every assertion below it")
-        # FOUR HAND OVER: the code watchdog's held branch twice (its own ask,
-        # and a port a successor already serves), its unheld branch, and the
+        # FIVE HAND OVER: the code watchdog's held branch twice (its own ask,
+        # and a port a successor already serves), its orphan branch once a new
+        # holder's successor serves (T3132), its unheld branch, and the
         # caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
         # successor is serving before it drains exactly as the held branch's.
         # ONE EXITS so a holder can start the successor the slow way (no holder
@@ -15394,10 +15395,10 @@ class TestDrainReportsWhatItCut:
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS",
+            "_HANDOVER_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
         ], (
             "the exit paths no longer drain on the ceilings that fit them. "
-            "Four hand over to a successor that is already serving (free to "
+            "Five hand over to a successor that is already serving (free to "
             "wait) and one exits so a holder can start the successor the slow "
             "way (every second is an unserved port). Got: "
             + ", ".join(sorted(named))
