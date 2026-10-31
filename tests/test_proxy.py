@@ -20928,6 +20928,66 @@ class TestTheDaemonWatchesItsOwnCode:
         assert [e for e in events if e[0] == "teardown"], events
         assert done.is_set(), "a daemon that gave up must release daemon_main"
 
+    def case_an_orphan_stops_waiting_on_a_successor_that_never_serves(
+        self, tmp_path, monkeypatch
+    ):
+        """T3169: THE ORPHAN'S WAIT FOR A HOLDER'S SUCCESSOR HAS A CEILING.
+
+        `_holder_owns` answers "some holder of this certdir exists", on any
+        port, so a holder whose successor never publishes (degraded, or a
+        holder of another port) kept the orphan waiting for ever: accepting,
+        and serving stale code. The wait ends at `_RELOCATE_WAIT_S`, the
+        longest the new holder's own watch gives its successor, and the
+        watchdog returns without touching the listener, so the daemon goes on
+        serving as it was.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events, owns, lines = [], [], []
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: "fp-same")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c, **k: events.append(("spawn", n)) or 1)
+        monkeypatch.setattr(pin_proxy, "_holder_owns",
+                            lambda cd: owns.append(cd) or True)
+        monkeypatch.setattr(pin_proxy, "_successor_serves_the_port",
+                            lambda cd, port: False)
+        monkeypatch.setattr(pin_proxy, "_RELOCATE_WAIT_S", 0.2)
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getpid() + 1_000_000))
+        assert not pin_proxy.held_by_a_holder(), (
+            "the fixture failed to look orphaned, so this case proves nothing"
+        )
+
+        _Srv = _recording_server(events)
+
+        certdir = self._certdir(tmp_path)
+        done = threading.Event()
+        # The backstop of a watchdog that does NOT give up: it ends the run
+        # from the outside, and `done` set is then the failure.
+        backstop = threading.Timer(1.0, done.set)
+        backstop.start()
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@example.com", certdir,
+                done, teardown=lambda reason: events.append(("teardown", reason)),
+                interval=0.01, _own_fingerprint="fp-same",
+            )
+        finally:
+            backstop.cancel()
+
+        assert not done.is_set(), (
+            "the watchdog waited on the holder's successor until the backstop "
+            f"ended the run: no ceiling on the orphan wait, log {lines}"
+        )
+        assert len(owns) > 1, "the wait was never exercised across ticks"
+        assert events == [], (
+            "the give-up must neither spawn, nor stop, nor unwire", events)
+        assert any("staying on the current code, still serving" in line
+                   and "successor" in line for line in lines), lines
+
     def case_resume_refuses_a_port_the_live_sessions_are_not_using(
         self, tmp_path
     ):
