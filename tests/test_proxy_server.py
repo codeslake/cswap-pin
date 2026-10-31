@@ -26383,16 +26383,15 @@ class TestSessionAffinityOnMessages:
             self, monkeypatch, certdir):
         """T3114: an account with no 5h limit replies with a 7d reading alone.
         That reading is the whole of its use, so it drops the slot at the bar
-        (and records to the slot, past the throttles) and keeps it under."""
-        for util, want, recorded in ((0.96, "tok-B", ["1"]),
-                                     (0.80, "tok-A", [])):
+        and keeps it under, and either way records to the kept slot."""
+        for util, want in ((0.96, "tok-B"), (0.80, "tok-A")):
             seen = self._wire(monkeypatch, certdir)
             self._seed("S", "tok-A")
             _, auths = self._send(
-                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                certdir, [("tok-B", "S"), ("tok-B", "S")],
                 reply=self._no_5h(util))
             assert auths == ["Bearer tok-A", f"Bearer {want}"], (util, auths)
-            assert seen.recorded[:1] == recorded, (util, seen.recorded)
+            assert seen.recorded[:1] == ["1"], (util, seen.recorded)
 
     def case_a_7d_only_reply_updates_the_last_known_use(
             self, monkeypatch, certdir):
