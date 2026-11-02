@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import datetime as _dt
 import errno
 import functools
@@ -18750,7 +18751,7 @@ def _sweep_witness() -> "dict | None":
             "account": label}
 
 
-def _verifying_context() -> "ssl.SSLContext":
+def _verifying_context(certdir: "Path | None" = None) -> "ssl.SSLContext":
     """A context that trusts what the daemon's own egress can present.
 
     The daemon's fetches go out through the pin, which re-signs the API host
@@ -18766,14 +18767,38 @@ def _verifying_context() -> "ssl.SSLContext":
     clears VERIFY_X509_STRICT, which Python 3.13 turns on and a released
     re-signing CA (no keyUsage) fails. This trusts a superset of the helper
     and narrows nothing.
+
+    ``certdir`` is the daemon's own when the caller has one (`_HopOpener`: the
+    hop and its CA then come from one record); else the switcher's.
     """
-    try:
-        certdir = require("switcher").ClaudeAccountSwitcher().backup_dir \
-            / "pin-proxy"
-    except Exception:  # noqa: BLE001 — an unpinned machine has no certdir
-        return _verifying_ctx()
+    if certdir is None:
+        try:
+            certdir = require("switcher").ClaudeAccountSwitcher().backup_dir \
+                / "pin-proxy"
+        except Exception:  # noqa: BLE001: an unpinned machine has no certdir
+            return _verifying_ctx()
     return _verifying_ctx(certdir / "ca.pem", read_upstream_ca(certdir),
                           certdir / "ca-bundle.pem")
+
+
+class _HopProxyHandler(urllib.request.ProxyHandler):
+    """CONNECT through one recorded hop, whatever the env's ``no_proxy`` says.
+
+    ``ProxyHandler.proxy_open`` returns early when ``no_proxy`` names the host
+    (``NO_PROXY=*`` too), which would send the refresh direct into the MITM
+    again; the relay reads no such variable. A ``ProxyHandler`` subclass, so
+    ``build_opener`` adds no env-driven one beside it.
+    """
+
+    def __init__(self, hop: _Chain) -> None:
+        super().__init__({})
+        self._hop = hop
+
+    def https_open(self, req):
+        host = f"[{self._hop.host}]" if ":" in self._hop.host else self._hop.host
+        req.set_proxy(f"{host}:{self._hop.port}", "http")
+        if self._hop.auth:
+            req.add_header("Proxy-authorization", self._hop.auth)
 
 
 class _HopOpener(urllib.request.OpenerDirector):
@@ -18792,27 +18817,37 @@ class _HopOpener(urllib.request.OpenerDirector):
     No usable hop leaves the env proxies exactly as ``urlopen`` would have used
     them. A hop that names this daemon is dropped, as `_chain_candidates` drops
     it, or the call would dial itself.
+
+    A hop that cannot be reached falls through to the next recorded one, as
+    `_walk_chain_once` does. A hop whose server ANSWERED (HTTPError) or whose
+    certificate failed verification does not: that is a verdict on the request
+    or the route, not a dead hop.
     """
 
     def __init__(self, daemon: "PinProxy") -> None:
         super().__init__()
         self._daemon = daemon
 
-    def open(self, *args, **kwargs):
-        handlers = []
-        for key in ("proxy", "next"):
-            raw = _read_upstream(self._daemon._certdir, key)
-            hop = parse_upstream_proxy(raw)
-            # shortcut: urllib CONNECTs in the clear, so an https:// hop is
-            # skipped (the next one, else the env proxies); upgrade when a host
-            # records one.
-            if hop and not hop.tls and not self._daemon._is_me(hop):
-                # The raw URL, so a credential in it reaches the hop as
-                # Proxy-Authorization.
-                handlers = [urllib.request.ProxyHandler({"https": raw}),
-                            urllib.request.HTTPSHandler(context=_verifying_context())]
-                break
-        return urllib.request.build_opener(*handlers).open(*args, **kwargs)
+    def open(self, fullurl, *args, **kwargs):
+        # shortcut: urllib CONNECTs in the clear, so an https:// hop is
+        # skipped (the next one, else the env proxies); upgrade when a host
+        # records one.
+        hops = [h for h in _chain_hops(self._daemon._certdir)
+                if not h.tls and not self._daemon._is_me(h)]
+        if not hops:
+            return urllib.request.build_opener().open(fullurl, *args, **kwargs)
+        ctx = _verifying_context(self._daemon._certdir)
+        for i, hop in enumerate(hops, 1):
+            opener = urllib.request.build_opener(
+                _HopProxyHandler(hop), urllib.request.HTTPSHandler(context=ctx))
+            try:
+                # A COPY: the attempt rewrites the request's host, tunnel and
+                # Proxy-Authorization, which the next hop must not inherit.
+                return opener.open(copy.deepcopy(fullurl), *args, **kwargs)
+            except urllib.error.URLError as exc:
+                if (i == len(hops) or not isinstance(exc.reason, OSError)
+                        or isinstance(exc.reason, ssl.SSLError)):
+                    raise
 
 
 def policy_limits_for(token: "str | None") -> "dict | None":

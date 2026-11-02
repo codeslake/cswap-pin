@@ -24934,7 +24934,7 @@ class TestTheRefreshPostFollowsTheRecordedHop:
                         "expires_in": 3600}).encode()
 
     @contextlib.contextmanager
-    def _world(self, tmp_path, monkeypatch):
+    def _world(self, tmp_path, monkeypatch, certdir=None):
         """A daemon-shaped PinProxy with `_HopOpener` installed and an EMPTY
         proxy env, the token host (a leaf `signer` signed) and a CONNECT hop
         in front of it. Nothing may dial anything but loopback: a refresh that
@@ -24944,7 +24944,8 @@ class TestTheRefreshPostFollowsTheRecordedHop:
         from cswap_pin import proxy
 
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                    "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS"):
+                    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+                    "NODE_EXTRA_CA_CERTS"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(urllib.request, "_opener", None)
         real = socket.create_connection
@@ -24961,7 +24962,8 @@ class TestTheRefreshPostFollowsTheRecordedHop:
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             b"Content-Length: %d\r\n\r\n" % len(self.TOKEN) + self.TOKEN))
         hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
-        daemon = proxy.PinProxy(_pin_dir(), lambda: None, rediscover_chain=True)
+        daemon = proxy.PinProxy(certdir or _pin_dir(), lambda: None,
+                                rediscover_chain=True)
         urllib.request.install_opener(proxy._HopOpener(daemon))
         try:
             yield daemon, signer, upstream, hop
@@ -25005,6 +25007,89 @@ class TestTheRefreshPostFollowsTheRecordedHop:
         assert hop.connects == 1, "the refresh did not go through the hop"
         assert upstream.heads_seen == [], "a request crossed an unverified hop"
 
+    @staticmethod
+    def _dead_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def case_a_dead_hop_falls_through_to_the_next(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://alice:s3cr3t@127.0.0.1:{self._dead_port()}",
+                str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{hop.port}")
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "the refresh did not fall through to `next`"
+        assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
+        assert b"Proxy-Authorization" not in hop.head, "the dead hop's credential"
+
+    def case_a_hop_that_fails_verification_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, _signer, upstream, hop):
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "walked past a TLS failure"
+
+    def case_a_hop_whose_server_answered_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.reply = (b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                with pytest.raises(urllib.error.HTTPError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+            finally:
+                behind.stop()
+        assert (hop.connects, behind.connects) == (1, 0), "walked past an answer"
+
+    def case_no_proxy_in_the_env_does_not_bypass_the_hop(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            monkeypatch.setenv("NO_PROXY", "*")
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "NO_PROXY sent the refresh around the hop"
+
+    def case_the_hop_and_its_ca_come_from_the_daemons_own_certdir(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        own = _mkdir(tmp_path / "own-certdir")
+        with self._world(tmp_path, monkeypatch, certdir=own) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                own, f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1
+
     def _env_route_unchanged(self, tmp_path, monkeypatch, record, port=None):
         """The refresh takes the env proxy, because `record` leaves the opener
         no hop it can use. The env proxy's leaf verifies by the default trust."""
@@ -25040,9 +25125,12 @@ class TestTheRefreshPostFollowsTheRecordedHop:
         from cswap_pin import proxy
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(proxy.daemon_main)))
+        installs = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and getattr(n.func, "attr", "") == "install_opener"]
         assert any(
-            isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "install_opener"
-            for n in ast.walk(tree)), "daemon_main never installs the hop opener"
+            c.args and isinstance(c.args[0], ast.Call)
+            and getattr(c.args[0].func, "id", "") == "_HopOpener"
+            for c in installs), "daemon_main never installs a _HopOpener"
 
 
 class TestPumpBackpressure:
