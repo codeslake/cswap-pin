@@ -97,6 +97,8 @@ class _FakeUpstream:
         self.seen_head: str = ""
         # seconds a reply's connection stays open after its last byte
         self.linger = 0.0
+        # hangup: read the whole request, answer nothing, close
+        self.hangup = False
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
         self._srv = socket.socket()
@@ -143,6 +145,9 @@ class _FakeUpstream:
                 self.auths_seen.append(self.seen_auth)
                 self.bodies_seen.append(bytes(rest))
                 self.heads_seen.append(head)
+                if self.hangup:
+                    tls.close()
+                    continue
                 key = next((l.split(":", 1)[1].strip() for l in lines[1:]
                             if l.lower().startswith("x-api-key:")), None)
                 if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
@@ -25025,6 +25030,50 @@ class TestTheRefreshPostFollowsTheRecordedHop:
         assert hop.connects == 1, "the refresh did not fall through to `next`"
         assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
         assert b"Proxy-Authorization" not in hop.head, "the dead hop's credential"
+
+    def case_a_hop_that_hangs_up_after_the_post_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.hangup = True
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "re-POSTed a spent grant"
+        assert len(upstream.heads_seen) == 1, upstream.heads_seen
+
+    def case_a_failed_send_does_not_fall_through(self, tmp_path, monkeypatch):
+        # urllib wraps only the connect and the send in URLError (a failed
+        # `getresponse`, the case above, escapes raw), and a send that failed
+        # may have left bytes: a re-POST of a spent grant invalid_grants a slot.
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"),
+                next_hop=f"http://127.0.0.1:{self._dead_port()}")
+            for exc in (ConnectionResetError, BrokenPipeError, TimeoutError):
+                sent = []
+
+                def open_(self, fullurl, *a, _exc=exc, **k):
+                    sent.append(fullurl)
+                    raise urllib.error.URLError(_exc())
+
+                monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_)
+                with pytest.raises(urllib.error.URLError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+                assert len(sent) == 1, f"{exc.__name__}: sent twice"
 
     def case_a_hop_that_fails_verification_does_not_fall_through(
         self, tmp_path, monkeypatch

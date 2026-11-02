@@ -18818,10 +18818,11 @@ class _HopOpener(urllib.request.OpenerDirector):
     them. A hop that names this daemon is dropped, as `_chain_candidates` drops
     it, or the call would dial itself.
 
-    A hop that cannot be reached falls through to the next recorded one, as
-    `_walk_chain_once` does. A hop whose server ANSWERED (HTTPError) or whose
-    certificate failed verification does not: that is a verdict on the request
-    or the route, not a dead hop.
+    A hop that REFUSED the connection falls through to the next recorded one:
+    the request never left. Anything else does not (a reset or timeout, a hop
+    whose server ANSWERED, a certificate that failed verification): the POST
+    may have reached the token endpoint, and a re-POST of a spent grant
+    invalid_grants a live slot.
     """
 
     def __init__(self, daemon: "PinProxy") -> None:
@@ -18845,8 +18846,8 @@ class _HopOpener(urllib.request.OpenerDirector):
                 # Proxy-Authorization, which the next hop must not inherit.
                 return opener.open(copy.deepcopy(fullurl), *args, **kwargs)
             except urllib.error.URLError as exc:
-                if (i == len(hops) or not isinstance(exc.reason, OSError)
-                        or isinstance(exc.reason, ssl.SSLError)):
+                if (i == len(hops)
+                        or not isinstance(exc.reason, ConnectionRefusedError)):
                     raise
 
 
