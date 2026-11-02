@@ -1055,8 +1055,9 @@ a deployment that would rather set it in the environment.
 Each line splits the round trip three ways — inside the pin, waiting for the
 server, and getting the request out through the chain — because the total
 alone cannot say whose problem a stall is. The pin's own share names the
-stage the time went to (`probe`, `lock`, `store`, `refresh`, `bridge`, `retry`,
-`target`, largest first, and `other` for what no stage covers), as in
+stage the time went to (`probe`, `lock`, `store`, `refresh`, `cfglock`,
+`splice`, `carry`, `deaf`, `retry`, `target`, largest first, and `other` for
+what no stage covers), as in
 `8451ms of it inside the pin (probe 8400ms, other 51ms)`. The route is logged
 without its query string or session id.
 
