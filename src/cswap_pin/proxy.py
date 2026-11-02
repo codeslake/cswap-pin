@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import datetime as _dt
 import errno
 import functools
@@ -18325,6 +18326,8 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
         rediscover_chain=True,
     )
+    # The host's refresh POST is a context-less urlopen: route it by the hop.
+    urllib.request.install_opener(_HopOpener(proxy))
     # BORN BEATING. `/health` publishes this as `code_watch_age_s`, and the
     # watchdog thread stamps it only once it starts, after `ensure_wired_to`
     # (seconds): a concurrent launch that found this daemon through the record
@@ -18748,7 +18751,7 @@ def _sweep_witness() -> "dict | None":
             "account": label}
 
 
-def _verifying_context() -> "ssl.SSLContext":
+def _verifying_context(certdir: "Path | None" = None) -> "ssl.SSLContext":
     """A context that trusts what the daemon's own egress can present.
 
     The daemon's fetches go out through the pin, which re-signs the API host
@@ -18764,14 +18767,88 @@ def _verifying_context() -> "ssl.SSLContext":
     clears VERIFY_X509_STRICT, which Python 3.13 turns on and a released
     re-signing CA (no keyUsage) fails. This trusts a superset of the helper
     and narrows nothing.
+
+    ``certdir`` is the daemon's own when the caller has one (`_HopOpener`: the
+    hop and its CA then come from one record); else the switcher's.
     """
-    try:
-        certdir = require("switcher").ClaudeAccountSwitcher().backup_dir \
-            / "pin-proxy"
-    except Exception:  # noqa: BLE001 — an unpinned machine has no certdir
-        return _verifying_ctx()
+    if certdir is None:
+        try:
+            certdir = require("switcher").ClaudeAccountSwitcher().backup_dir \
+                / "pin-proxy"
+        except Exception:  # noqa: BLE001: an unpinned machine has no certdir
+            return _verifying_ctx()
     return _verifying_ctx(certdir / "ca.pem", read_upstream_ca(certdir),
                           certdir / "ca-bundle.pem")
+
+
+class _HopProxyHandler(urllib.request.ProxyHandler):
+    """CONNECT through one recorded hop, whatever the env's ``no_proxy`` says.
+
+    ``ProxyHandler.proxy_open`` returns early when ``no_proxy`` names the host
+    (``NO_PROXY=*`` too), which would send the refresh direct into the MITM
+    again; the relay reads no such variable. A ``ProxyHandler`` subclass, so
+    ``build_opener`` adds no env-driven one beside it.
+    """
+
+    def __init__(self, hop: _Chain) -> None:
+        super().__init__({})
+        self._hop = hop
+
+    def https_open(self, req):
+        host = f"[{self._hop.host}]" if ":" in self._hop.host else self._hop.host
+        req.set_proxy(f"{host}:{self._hop.port}", "http")
+        if self._hop.auth:
+            req.add_header("Proxy-authorization", self._hop.auth)
+
+
+class _HopOpener(urllib.request.OpenerDirector):
+    """The daemon's global urllib opener: a context-less ``urlopen`` goes out
+    through the pin's own recorded hop, not the proxy env its spawner had.
+
+    The host's refresh POST (``oauth.try_refresh_oauth_credentials``) is
+    ``urlopen(req)`` with no context and no proxy, so its route was whatever
+    HTTPS_PROXY the daemon was spawned with. Spawned with none, it went DIRECT
+    into a TLS-decrypting network and failed verification every 120 s, while
+    every other egress of the daemon follows ``upstream.json``. Re-read per
+    call, as the relay re-reads it per connection, and verified with
+    `_verifying_context`, which ADDS the hop's CA to the roots: never
+    CERT_NONE, and never `_upstream_ctx`'s loopback branch.
+
+    No usable hop leaves the env proxies exactly as ``urlopen`` would have used
+    them. A hop that names this daemon is dropped, as `_chain_candidates` drops
+    it, or the call would dial itself.
+
+    A hop that REFUSED the connection falls through to the next recorded one:
+    the request never left. Anything else does not (a reset or timeout, a hop
+    whose server ANSWERED, a certificate that failed verification): the POST
+    may have reached the token endpoint, and a re-POST of a spent grant
+    invalid_grants a live slot.
+    """
+
+    def __init__(self, daemon: "PinProxy") -> None:
+        super().__init__()
+        self._daemon = daemon
+
+    def open(self, fullurl, *args, **kwargs):
+        # shortcut: urllib CONNECTs in the clear, so an https:// hop is
+        # skipped (the next one, else the env proxies); upgrade when a host
+        # records one.
+        hops = [h for h in _chain_hops(self._daemon._certdir)
+                if not h.tls and not self._daemon._is_me(h)]
+        if not hops:
+            return urllib.request.build_opener().open(fullurl, *args, **kwargs)
+        ctx = _verifying_context(self._daemon._certdir)
+        for i, hop in enumerate(hops, 1):
+            opener = urllib.request.build_opener(
+                _HopProxyHandler(hop), urllib.request.HTTPSHandler(context=ctx))
+            try:
+                # A COPY: the attempt rewrites the request's host, tunnel and
+                # Proxy-Authorization, which the next hop must not inherit.
+                return opener.open(copy.deepcopy(fullurl), *args, **kwargs)
+            except urllib.error.URLError as exc:
+                if (i == len(hops)
+                        or not isinstance(exc.reason, ConnectionRefusedError)):
+                    raise
 
 
 def policy_limits_for(token: "str | None") -> "dict | None":

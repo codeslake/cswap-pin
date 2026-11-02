@@ -97,6 +97,8 @@ class _FakeUpstream:
         self.seen_head: str = ""
         # seconds a reply's connection stays open after its last byte
         self.linger = 0.0
+        # hangup: read the whole request, answer nothing, close
+        self.hangup = False
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
         self._srv = socket.socket()
@@ -143,6 +145,9 @@ class _FakeUpstream:
                 self.auths_seen.append(self.seen_auth)
                 self.bodies_seen.append(bytes(rest))
                 self.heads_seen.append(head)
+                if self.hangup:
+                    tls.close()
+                    continue
                 key = next((l.split(":", 1)[1].strip() for l in lines[1:]
                             if l.lower().startswith("x-api-key:")), None)
                 if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
@@ -2317,13 +2322,14 @@ class _LoopbackConnectProxy:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self.connects = 0
+        self.head = b""   # the CONNECT it took, request line and headers
         self._stopped = threading.Event()
         self._thr = threading.Thread(target=self._loop, daemon=True)
         self._thr.start()
 
     def _loop(self):
         try:
-            conn, _ = _accept_head(self._srv, stop=self._stopped)
+            conn, self.head = _accept_head(self._srv, stop=self._stopped)
             self.connects += 1
             up = socket.create_connection(self._target, timeout=10)
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -24914,6 +24920,266 @@ class TestTheVerifyingContextTrustsTheHop:
 
         monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
         assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT
+
+
+class TestTheRefreshPostFollowsTheRecordedHop:
+    """T3212: the fork's refresh POST is a context-less `urlopen`, so its route
+    was the proxy env the daemon's spawner had. Spawned with none, it went
+    direct into a TLS-decrypting network and failed verification every 120 s,
+    while the pin's own API traffic, routed by upstream.json, was fine. The
+    daemon installs `_HopOpener`, which sends it through the recorded hop and
+    verifies with the pin's own context."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    CREDS = json.dumps({"claudeAiOauth": {"refreshToken": "rt-old",
+                                          "accessToken": "at-old"}})
+    TOKEN = json.dumps({"access_token": "at-new", "refresh_token": "rt-new",
+                        "expires_in": 3600}).encode()
+
+    @contextlib.contextmanager
+    def _world(self, tmp_path, monkeypatch, certdir=None):
+        """A daemon-shaped PinProxy with `_HopOpener` installed and an EMPTY
+        proxy env, the token host (a leaf `signer` signed) and a CONNECT hop
+        in front of it. Nothing may dial anything but loopback: a refresh that
+        misses its route shows as a hop that saw nothing, not as traffic."""
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+                    "NODE_EXTRA_CA_CERTS"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(urllib.request, "_opener", None)
+        real = socket.create_connection
+
+        def loopback_only(address, *a, **k):
+            assert address[0] == "127.0.0.1", f"dialled {address} directly"
+            return real(address, *a, **k)
+
+        monkeypatch.setattr(socket, "create_connection", loopback_only)
+        signer = tmp_path / "hop"
+        signer.mkdir()
+        ensure_ca(signer, "platform.claude.com")
+        upstream = _FakeUpstream(signer, reply=(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(self.TOKEN) + self.TOKEN))
+        hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+        daemon = proxy.PinProxy(certdir or _pin_dir(), lambda: None,
+                                rediscover_chain=True)
+        urllib.request.install_opener(proxy._HopOpener(daemon))
+        try:
+            yield daemon, signer, upstream, hop
+        finally:
+            hop.stop()
+            upstream.stop()
+
+    def _refresh(self):
+        from cswap_pin import proxy
+
+        return proxy.oauth.try_refresh_oauth_credentials(self.CREDS)
+
+    def case_the_refresh_goes_through_the_recorded_hop(
+        self, tmp_path, monkeypatch
+    ):
+        import base64
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://alice:s3cr3t@127.0.0.1:{hop.port}",
+                str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert json.loads(out.credentials)["claudeAiOauth"]["accessToken"] == "at-new"
+        assert hop.connects == 1
+        assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
+        auth = base64.b64encode(b"alice:s3cr3t").decode()
+        assert f"Proxy-Authorization: Basic {auth}".encode() in hop.head, hop.head
+
+    def case_a_hop_that_re_signs_without_its_ca_recorded_is_transient(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, _signer, upstream, hop):
+            proxy.write_upstream_hint(_pin_dir(), f"http://127.0.0.1:{hop.port}")
+            out = self._refresh()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert hop.connects == 1, "the refresh did not go through the hop"
+        assert upstream.heads_seen == [], "a request crossed an unverified hop"
+
+    @staticmethod
+    def _dead_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def case_a_dead_hop_falls_through_to_the_next(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://alice:s3cr3t@127.0.0.1:{self._dead_port()}",
+                str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{hop.port}")
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "the refresh did not fall through to `next`"
+        assert hop.head.startswith(b"CONNECT platform.claude.com:443 "), hop.head
+        assert b"Proxy-Authorization" not in hop.head, "the dead hop's credential"
+
+    def case_a_hop_that_hangs_up_after_the_post_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.hangup = True
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "re-POSTed a spent grant"
+        assert len(upstream.heads_seen) == 1, upstream.heads_seen
+
+    def case_a_failed_send_does_not_fall_through(self, tmp_path, monkeypatch):
+        # urllib wraps only the connect and the send in URLError (a failed
+        # `getresponse`, the case above, escapes raw), and a send that failed
+        # may have left bytes: a re-POST of a spent grant invalid_grants a slot.
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"),
+                next_hop=f"http://127.0.0.1:{self._dead_port()}")
+            for exc in (ConnectionResetError, BrokenPipeError, TimeoutError):
+                sent = []
+
+                def open_(self, fullurl, *a, _exc=exc, **k):
+                    sent.append(fullurl)
+                    raise urllib.error.URLError(_exc())
+
+                monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_)
+                with pytest.raises(urllib.error.URLError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+                assert len(sent) == 1, f"{exc.__name__}: sent twice"
+
+    def case_a_hop_that_fails_verification_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, _signer, upstream, hop):
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    next_hop=f"http://127.0.0.1:{behind.port}")
+                out = self._refresh()
+            finally:
+                behind.stop()
+        assert (out.credentials, out.error) == (None, "transient"), out
+        assert (hop.connects, behind.connects) == (1, 0), "walked past a TLS failure"
+
+    def case_a_hop_whose_server_answered_does_not_fall_through(
+        self, tmp_path, monkeypatch
+    ):
+        import urllib.error
+        import urllib.request
+
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            upstream.reply = (b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            behind = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            try:
+                proxy.write_upstream_hint(
+                    _pin_dir(), f"http://127.0.0.1:{hop.port}",
+                    str(signer / "ca.pem"), next_hop=f"http://127.0.0.1:{behind.port}")
+                with pytest.raises(urllib.error.HTTPError):
+                    urllib.request.urlopen("https://platform.claude.com/x", timeout=5)
+            finally:
+                behind.stop()
+        assert (hop.connects, behind.connects) == (1, 0), "walked past an answer"
+
+    def case_no_proxy_in_the_env_does_not_bypass_the_hop(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (_, signer, upstream, hop):
+            monkeypatch.setenv("NO_PROXY", "*")
+            proxy.write_upstream_hint(
+                _pin_dir(), f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "NO_PROXY sent the refresh around the hop"
+
+    def case_the_hop_and_its_ca_come_from_the_daemons_own_certdir(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        own = _mkdir(tmp_path / "own-certdir")
+        with self._world(tmp_path, monkeypatch, certdir=own) as (_, signer, _, hop):
+            proxy.write_upstream_hint(
+                own, f"http://127.0.0.1:{hop.port}", str(signer / "ca.pem"))
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1
+
+    def _env_route_unchanged(self, tmp_path, monkeypatch, record, port=None):
+        """The refresh takes the env proxy, because `record` leaves the opener
+        no hop it can use. The env proxy's leaf verifies by the default trust."""
+        from cswap_pin import proxy
+
+        with self._world(tmp_path, monkeypatch) as (daemon, signer, _, hop):
+            monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{hop.port}")
+            monkeypatch.setenv("SSL_CERT_FILE", str(signer / "ca.pem"))
+            if port:
+                daemon.port = port
+            if record:
+                proxy.write_upstream_hint(_pin_dir(), record)
+            out = self._refresh()
+        assert out.error is None, out
+        assert hop.connects == 1, "the env proxy was not used"
+
+    def case_no_hop_recorded_keeps_the_env_proxy(self, tmp_path, monkeypatch):
+        self._env_route_unchanged(tmp_path, monkeypatch, None)
+
+    def case_a_hop_that_is_the_daemon_is_dropped(self, tmp_path, monkeypatch):
+        self._env_route_unchanged(
+            tmp_path, monkeypatch, "http://127.0.0.1:59123", port=59123)
+
+    def case_a_tls_hop_is_left_to_the_env_proxy(self, tmp_path, monkeypatch):
+        # urllib CONNECTs in the clear, which an https:// hop would not take.
+        self._env_route_unchanged(tmp_path, monkeypatch, "https://127.0.0.1:59123")
+
+    def case_daemon_main_installs_the_opener(self):
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(proxy.daemon_main)))
+        installs = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and getattr(n.func, "attr", "") == "install_opener"]
+        assert any(
+            c.args and isinstance(c.args[0], ast.Call)
+            and getattr(c.args[0].func, "id", "") == "_HopOpener"
+            for c in installs), "daemon_main never installs a _HopOpener"
 
 
 class TestPumpBackpressure:
