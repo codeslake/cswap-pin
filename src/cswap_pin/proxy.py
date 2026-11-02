@@ -8574,26 +8574,43 @@ def splice_config_identity(identity: dict | None,
     # A lock we cannot take is a SKIPPED write, never a raise: the field stays
     # drifted until the next launch, which is the fail-open this whole path
     # already has.
+    #
+    # NO LOCK TO LEARN THERE IS NOTHING TO DO. The create path asks before
+    # every bridge, and on a healthy machine the answer is "already named":
+    # the lock is a cross-process wait (contended retries sleep 0.25 to 0.5 s)
+    # and it came before the file was even read (T3209, 1720 ms in one
+    # create). A no-op decided from a read cannot lose a write, because it
+    # writes nothing; anything else, a torn read included, is decided again
+    # under the lock.
+    #
+    # THE WAIT FOR THE LOCK IS TIMED APART FROM THE IO DONE UNDER IT, and the
+    # stages never nest: `_note_slow_request` prints `other = pin_ms -
+    # sum(stages)`, so a stage inside another would read as a negative share.
     try:
-        with require("claude_locks").claude_config_lock(
-                timeout=lock_timeout):
-            return _splice_config_identity_locked(cfg, identity)
+        with _stage("splice"):
+            try:
+                data = json.loads(cfg.read_text())
+            except (OSError, ValueError, TypeError):
+                data = None
+            if isinstance(data, dict) and _splice_verdict(
+                    data, identity) == "noop":
+                return False
+        with contextlib.ExitStack() as held:
+            with _stage("cfglock"):
+                held.enter_context(require("claude_locks").claude_config_lock(
+                    timeout=lock_timeout))
+            with _stage("splice"):
+                return _splice_config_identity_locked(cfg, identity)
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         return False
 
 
-def _splice_config_identity_locked(cfg, identity: dict) -> bool:
-    """The read-modify-write half of :func:`splice_config_identity`.
+def _splice_verdict(data: dict, identity: dict) -> str:
+    """What the config's ``oauthAccount`` needs: "noop", "freshen" or "write".
 
-    Split out so the lock is held across BOTH halves rather than around a
-    call that re-reads afterwards.
+    ONE DECISION FOR BOTH THE READ THAT SKIPS THE LOCK AND THE READ THAT
+    HOLDS IT, so the two cannot disagree about what a no-op is.
     """
-    try:
-        data = json.loads(cfg.read_text())
-    except (OSError, ValueError, TypeError):
-        return False
-    if not isinstance(data, dict):
-        return False
     # DECIDE ON THE ACCOUNT, NOT ON THE DICT. Comparing whole dicts can never
     # be equal when the host hands over a roster SYNTHESIS — three keys, built
     # when the machine has never switched into the pinned account so no stored
@@ -8616,18 +8633,36 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
     # matching everything.
     here = data.get("oauthAccount")
     keys = [k for k in ("accountUuid", "organizationUuid") if identity.get(k)]
-    freshening = False
-    if isinstance(here, dict) and keys and all(
-        here.get(k) == identity[k] for k in keys
-    ):
-        # NAMES THE PIN ALREADY. Rewrite only to carry a FRESHER profile
-        # stamp: Claude Code re-fetches its profile as the ACTIVE account once
-        # the stamp is a day old, and that fetch is what moves this field off
-        # the pin. Strictly newer, so two writers can never ping-pong -- CC
-        # only ever writes a newer stamp than the one it read.
-        if _profile_stamp_ms(identity) <= _profile_stamp_ms(here):
-            return False
-        freshening = True
+    if not (isinstance(here, dict) and keys and all(
+            here.get(k) == identity[k] for k in keys)):
+        return "write"
+    # NAMES THE PIN ALREADY. Rewrite only to carry a FRESHER profile
+    # stamp: Claude Code re-fetches its profile as the ACTIVE account once
+    # the stamp is a day old, and that fetch is what moves this field off
+    # the pin. Strictly newer, so two writers can never ping-pong -- CC
+    # only ever writes a newer stamp than the one it read.
+    if _profile_stamp_ms(identity) <= _profile_stamp_ms(here):
+        return "noop"
+    return "freshen"
+
+
+def _splice_config_identity_locked(cfg, identity: dict) -> bool:
+    """The read-modify-write half of :func:`splice_config_identity`.
+
+    Split out so the lock is held across BOTH halves rather than around a
+    call that re-reads afterwards.
+    """
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    verdict = _splice_verdict(data, identity)
+    if verdict == "noop":
+        return False
+    here = data.get("oauthAccount")
+    freshening = verdict == "freshen"
     was = here.get("accountUuid") if isinstance(here, dict) else here
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse
@@ -20678,10 +20713,11 @@ class PinProxy:
         keychain), the remainder belongs to the chain below us.
 
         `stages` says where `pin_ms` went (probe, lock, store, refresh,
-        bridge, retry, target), largest first, "other" being what no stamp
-        covers. Without it a heartbeat that spent 8451ms inside the pin could
-        not say whether that was the identity probe or the `refresh_lock`
-        wait. None (the beat thread, an unstamped request) prints today's text.
+        cfglock, splice, carry, deaf, retry, target), largest first, "other"
+        being what no stamp covers. Without it a heartbeat that spent 8451ms
+        inside the pin could not say whether that was the identity probe or
+        the `refresh_lock` wait. None (the beat thread, an unstamped request)
+        prints today's text.
 
         `wait_ms` SPLITS THAT REMAINDER, and it is the number that decides
         whose problem this is. It runs from the moment the whole request was
@@ -22179,27 +22215,29 @@ class PinProxy:
         came back under the wrong account.
 
         ON THE CREATE, WHICH IS WHEN THE OWNER IS STAMPED and which does not
-        recur, so this costs one read-modify-write per bridge and nothing on
-        the steady-state path.
+        recur, so this costs one read per bridge when the field already names
+        the pin, and a read-modify-write when it does not.
         """
         ident = remembered_pin_identity(self._certdir)
         if not ident:
             return
         try:
-            splice_config_identity(ident)
-            # AND EVERY SESSION ALREADY RUNNING, because the splice above moves
-            # the field CC compares their pointers against. Ordered correctly
-            # for the bridge being minted and not for them: theirs were stamped
-            # against the pre-splice account, so each is vetoed into a fresh
-            # mint on its next reattach. This is the site that fires most --
-            # once per create -- so leaving it uncarried keeps producing
-            # unclaimed bridges after the launch path is fixed.
-            #
-            # A no-op once they agree: the carry writes only on a difference,
-            # so the steady-state cost is one read per live session.
-            _live = _pointer_owner(self._certdir)
-            if _live:
-                carry_live_pointers(_live)
+            if splice_config_identity(ident):
+                # AND EVERY SESSION ALREADY RUNNING, because the splice above
+                # moved the field CC compares their pointers against. Ordered
+                # correctly for the bridge being minted and not for them:
+                # theirs were stamped against the pre-splice account, so each
+                # is vetoed into a fresh mint on its next reattach.
+                #
+                # ONLY WHEN THE SPLICE CHANGED SOMETHING (T3209). Once per
+                # create this was two registry passes and a transcript glob to
+                # find that nothing moved. A field that did not move leaves
+                # the pointers agreeing, and any move of the login field is
+                # carried by `_carry_on_login_change` and the 300 s beat.
+                with _stage("carry"):
+                    _live = _pointer_owner(self._certdir)
+                    if _live:
+                        carry_live_pointers(_live)
         except Exception:  # noqa: BLE001 — a bridge must never fail on the pin
             pass
         # VERIFY, BECAUSE THE RETURN CANNOT CARRY IT. `splice_config_identity`
@@ -22212,7 +22250,8 @@ class PinProxy:
         # unmeasured, and a log that carries the value is what makes the next
         # occurrence a diagnosis instead of another mystery. No retry until
         # that log says which cause it is.
-        live, holds = live_pin_identity_state(ident)
+        with _stage("splice"):
+            live, holds = live_pin_identity_state(ident)
         if live:
             return
         _log_lifecycle(
@@ -24292,9 +24331,12 @@ class PinProxy:
             # this same config field to decide whose pointers to restamp, so a
             # sweep run against a drifted field stamps the wrong owner — the
             # veto this exists to prevent. Same ordering as `heal`.
-            with _stage("bridge"):
-                if path == "/v1/code/sessions":
-                    self._reassert_pin_identity()
+            # THE REASSERT STAMPS ITS OWN STAGES (`cfglock`, `splice`,
+            # `carry`), so none is opened around it: that would count them
+            # twice.
+            if path == "/v1/code/sessions":
+                self._reassert_pin_identity()
+            with _stage("deaf"):
                 self._report_deaf_bridges()
             _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
