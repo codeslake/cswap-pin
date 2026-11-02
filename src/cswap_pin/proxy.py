@@ -18325,6 +18325,8 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
         rediscover_chain=True,
     )
+    # The host's refresh POST is a context-less urlopen: route it by the hop.
+    urllib.request.install_opener(_HopOpener(proxy))
     # BORN BEATING. `/health` publishes this as `code_watch_age_s`, and the
     # watchdog thread stamps it only once it starts, after `ensure_wired_to`
     # (seconds): a concurrent launch that found this daemon through the record
@@ -18772,6 +18774,45 @@ def _verifying_context() -> "ssl.SSLContext":
         return _verifying_ctx()
     return _verifying_ctx(certdir / "ca.pem", read_upstream_ca(certdir),
                           certdir / "ca-bundle.pem")
+
+
+class _HopOpener(urllib.request.OpenerDirector):
+    """The daemon's global urllib opener: a context-less ``urlopen`` goes out
+    through the pin's own recorded hop, not the proxy env its spawner had.
+
+    The host's refresh POST (``oauth.try_refresh_oauth_credentials``) is
+    ``urlopen(req)`` with no context and no proxy, so its route was whatever
+    HTTPS_PROXY the daemon was spawned with. Spawned with none, it went DIRECT
+    into a TLS-decrypting network and failed verification every 120 s, while
+    every other egress of the daemon follows ``upstream.json``. Re-read per
+    call, as the relay re-reads it per connection, and verified with
+    `_verifying_context`, which ADDS the hop's CA to the roots: never
+    CERT_NONE, and never `_upstream_ctx`'s loopback branch.
+
+    No usable hop leaves the env proxies exactly as ``urlopen`` would have used
+    them. A hop that names this daemon is dropped, as `_chain_candidates` drops
+    it, or the call would dial itself.
+    """
+
+    def __init__(self, daemon: "PinProxy") -> None:
+        super().__init__()
+        self._daemon = daemon
+
+    def open(self, *args, **kwargs):
+        handlers = []
+        for key in ("proxy", "next"):
+            raw = _read_upstream(self._daemon._certdir, key)
+            hop = parse_upstream_proxy(raw)
+            # shortcut: urllib CONNECTs in the clear, so an https:// hop is
+            # skipped (the next one, else the env proxies); upgrade when a host
+            # records one.
+            if hop and not hop.tls and not self._daemon._is_me(hop):
+                # The raw URL, so a credential in it reaches the hop as
+                # Proxy-Authorization.
+                handlers = [urllib.request.ProxyHandler({"https": raw}),
+                            urllib.request.HTTPSHandler(context=_verifying_context())]
+                break
+        return urllib.request.build_opener(*handlers).open(*args, **kwargs)
 
 
 def policy_limits_for(token: "str | None") -> "dict | None":
