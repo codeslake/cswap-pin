@@ -20706,8 +20706,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     @classmethod
     def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
                auth="", session="", extra_headers=b"", body=b"no", withhold=0,
-               framed=True, method="POST"):
-        """``withhold`` holds back that many trailing body bytes and sends
+               framed=True, method="POST", ua=""):
+        """``ua`` is the request's User-Agent, as `_forward` hands it on.
+        ``withhold`` holds back that many trailing body bytes and sends
         them after a delay, so the head read ends before the body does.
         ``framed=False`` omits `Content-Length`.
 
@@ -20769,7 +20770,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             reader.start()
             st0 = _os.fstat(cl_a.fileno())
             pp._relay_response(up_a, cl_a, 0, method=method, path=path,
-                               auth=auth, session=session)
+                               auth=auth, session=session, ua=ua)
             cl_a.shutdown(_s.SHUT_WR)
             reader.join(cls.EOF_GRACE)
             if reader.is_alive():
@@ -21567,6 +21568,41 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert pp._fleet_exhausted == (0.0, "five_hour"), pp._fleet_exhausted
+
+    def case_a_cswap_probe_429_is_relayed_as_upstream_sent_it(
+        self, monkeypatch,
+    ):
+        """cswap's usage-header probe (`claude-swap/` User-Agent, no session
+        header) reads the upstream's own `rejected` and rate-limit headers. The
+        wall logic is a live session's, so a probe's 429 changes no pin state
+        and is relayed untouched, for a bearer that is not the live one and
+        for the live one alike. The control is the case above: the same
+        request under any other User-Agent is converted."""
+        from cswap_pin import proxy as pp
+        rejected = b"anthropic-ratelimit-unified-status: rejected"
+        monkeypatch.setattr(type(self), "UNIFIED_STATUS", rejected)
+        real = pp._switch_off_walled_account
+        for bearer in ("stale-account-token", self.LIVE):
+            self._wire(monkeypatch, switched=True,
+                       live_token=self.LIVE, usage=self.HEADROOM)
+            asked = []
+            monkeypatch.setattr(
+                pp, "_switch_off_walled_account",
+                lambda *a, **k: asked.append(a) or real(*a, **k))
+            fleet = (time.time() + 500, "seven_day")
+            pp._fleet_exhausted = fleet
+            got = self._relay(auth="Bearer " + bearer, ua="claude-swap/1.0")
+            assert got.startswith(b"HTTP/1.1 429"), (bearer, got[:60])
+            low = got.lower()
+            for header in (self.RESET_HEADER, self.RETRY_AFTER,
+                           self.SHOULD_RETRY, rejected):
+                assert header in low, (bearer, header, got[:300])
+            assert low.count(b"unified-status") == 1, (bearer, got[:300])
+            assert not asked, (bearer, asked)
+            assert pp._fleet_exhausted == fleet, pp._fleet_exhausted
+            assert not pp._walled_switch_seen, pp._walled_switch_seen
+            assert not pp._walled_switch_seen_by_session
+            assert not pp._walled_slots, pp._walled_slots
 
     def case_a_debounced_repeat_of_an_exhausted_wall_still_carries_the_headers(
         self, monkeypatch,
@@ -23905,6 +23941,23 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         for path in ("/v1/messages/count_tokens", "/v1/other"):
             assert self._r403(path=path) == self._untouched(), path
         assert not log, f"a switch() was asked for a non-grant 403: {log}"
+
+    def case_a_cswap_probe_grant_403_is_relayed_untouched(self, monkeypatch):
+        """The same client-blind predicate as the 429 arm: cswap's own probe
+        (`claude-swap/` User-Agent) is not a session the grant conversion can
+        rebuild, so its 403 is relayed byte for byte and nothing is read,
+        switched or remembered. The control is
+        `case_a_grant_403_becomes_a_401_after_exactly_one_switch`: the same
+        403 under any other User-Agent converts."""
+        from cswap_pin import proxy as pp
+        log = []
+        self._wire(monkeypatch, log=log)
+        got = self._r403(ua="claude-swap/1.0")
+        assert got == self._untouched(), got[:200]
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not log, f"a switch() was asked for a probe's 403: {log}"
+        assert not pp._walled_switch_seen, pp._walled_switch_seen
+        assert not pp._walled_switch_seen_by_session
 
     def case_an_older_cswap_relays_the_grant_403_unchanged_and_reads_no_body(
         self, monkeypatch,
