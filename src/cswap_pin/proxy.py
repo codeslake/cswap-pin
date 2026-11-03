@@ -25067,7 +25067,7 @@ class PinProxy:
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
                 drop_request_id=swapped and _is_profile_route(path),
-                affinity=affinity, follow=follow,
+                affinity=affinity, follow=follow, ua=_ua,
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
@@ -28124,6 +28124,7 @@ def _relay_response(
     drop_request_id: bool = False,
     follow: bool = False,
     tee: "_ReplyTee | None" = None,
+    ua: str = "",
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -28234,6 +28235,9 @@ def _relay_response(
     following = follow and not affinity
     # True when the pin turns this answer into a 401 (a switch off the account)
     _walled_401 = False
+    # cswap's own probe records the upstream's reply itself; the pin's wall
+    # and grant state belongs to live sessions, so neither arm below sees it.
+    _probe = ua.startswith("claude-swap/")
     # AN ACCESS-GRANT 403 on a healthy bearer (2026-10-06: 11 relayed unchanged
     # over 2m22s, every session drawing "Please run /login"). The
     # same 401 conversion as the wall below, but nothing is stripped on a
@@ -28241,7 +28245,7 @@ def _relay_response(
     # capability is read BEFORE any body is, and the body is read only to
     # match it, raw bytes kept in `rest` (see `_grant_refusal`).
     _grant = False
-    if (status_line.startswith(b"HTTP/1.1 403")
+    if (status_line.startswith(b"HTTP/1.1 403") and not _probe
             and not (reject_on_auth_error or affinity)
             and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
             and not _status_has_no_body(status_line, method)
@@ -28298,7 +28302,7 @@ def _relay_response(
     # 429, but its rate-limit headers are stripped below so it backs off
     # instead of sleeping the wall's own reset window.
     _wall_relay = False
-    if (status_line.startswith(b"HTTP/1.1 429")
+    if (status_line.startswith(b"HTTP/1.1 429") and not _probe
             and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"):
         reset = next(
             (l.split(b":", 1)[1].strip() for l in lines[1:]
@@ -28541,7 +28545,7 @@ def _relay_response(
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
                 on_hop_trouble=on_hop_trouble, affinity=affinity,
-                drop_request_id=drop_request_id, follow=follow, tee=tee,
+                drop_request_id=drop_request_id, follow=follow, tee=tee, ua=ua,
             )
         return _relay_response(
             up, client, cid,
@@ -28549,7 +28553,7 @@ def _relay_response(
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             on_hop_trouble=on_hop_trouble, affinity=affinity,
-            drop_request_id=drop_request_id, follow=follow, tee=tee,
+            drop_request_id=drop_request_id, follow=follow, tee=tee, ua=ua,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
