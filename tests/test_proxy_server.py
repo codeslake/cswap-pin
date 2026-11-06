@@ -25691,7 +25691,7 @@ class TestSessionAffinityOnMessages:
         sw = types.SimpleNamespace(
             _get_sequence_data=lambda: {"accounts": {
                 n: {"email": cls.EMAIL.format(n)} for n in cls.TOKENS}},
-            read_account_credentials=_creds,
+            backup_dir=certdir, read_account_credentials=_creds,
             usage_entries_by_account=_entries,
             record_usage_headers=_record,
             consume_backup_grant=lambda *a, **k: seen.consumed.append(a),
@@ -25723,7 +25723,7 @@ class TestSessionAffinityOnMessages:
         (certdir / pp._AFFINITY_CARRY_FILE).unlink(missing_ok=True)
         pp._affinity_snap.update(
             tried=float("-inf"), at=float("-inf"), busy=False, stuck=0,
-            failures=0, ms=None)
+            failures=0, ms=None, switch=None)
         pp._affinity_pings.update(sent=0, hit=0)
         pp._affinity_ping_cost.update(dict.fromkeys(pp._affinity_ping_cost, 0))
         pp._affinity_pings["refused"].clear()
@@ -25748,6 +25748,9 @@ class TestSessionAffinityOnMessages:
         # means to the installed claude-swap
         monkeypatch.setattr(autoswitch, "proactive_switch_bar_pct",
                             lambda _strategy, t: t, raising=False)
+        # cswap's last engine switch (T3320): none unless a case says
+        monkeypatch.setattr(autoswitch, "last_engine_switch",
+                            lambda _dir: None, raising=False)
         return seen
 
     @staticmethod
@@ -26333,13 +26336,14 @@ class TestSessionAffinityOnMessages:
         an older host and used to fall back in silence (T3312: three weeks of
         every slot on the global bar). One line per daemon names the hooks; the
         fallbacks still run."""
-        from claude_swap import poll_policy
+        from claude_swap import autoswitch, poll_policy
         from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir, pct=75.0,
                           policies={"1": self._pol(70.0)})
         sw = pp.require("switcher").ClaudeAccountSwitcher()
         del sw.account_policies, sw.is_account_disabled
         monkeypatch.delattr(poll_policy, "parse_reset_ts")
+        monkeypatch.delattr(autoswitch, "last_engine_switch")
         for _ in range(3):
             pp._affinity_snap.update(tried=float("-inf"), busy=False)
             pp._affinity_kick(90.0, "dynamic")
@@ -26347,7 +26351,8 @@ class TestSessionAffinityOnMessages:
         for hook, fallback in (
                 ("account_policies", "the global bar for every slot"),
                 ("is_account_disabled", "no slot disabled"),
-                ("parse_reset_ts", "no window roll known")):
+                ("parse_reset_ts", "no window roll known"),
+                ("last_engine_switch", "no switch is honoured")):
             assert f"{hook} (falls back to {fallback})" in line, line
         assert "proactive_switch_bar_pct" not in line, line
         assert "threshold as the bar" not in line, line
@@ -26373,6 +26378,43 @@ class TestSessionAffinityOnMessages:
             self._seed("S", "tok-A")
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert auths == [f"Bearer {want}"], (strategy, pct, auths)
+
+    def case_an_expiring_window_switch_moves_the_warm_session(
+            self, monkeypatch, certdir):
+        """A cswap engine switch chosen by its `expiring-window` rule is meant
+        to move the work: the session warm on slot 1 follows a client that
+        sends the target slot's bearer (T3321; measured on lmd42, the keep held
+        2375 replies on the old slot and 48 on the new). Any other trigger, a
+        target that is not the client's slot, and no switch keep it."""
+        from claude_swap import autoswitch
+        for pair, want in ((("2", "expiring-window"), "tok-B"),
+                           (("2", "alternation"), "tok-A"),
+                           (("1", "expiring-window"), "tok-A"),
+                           (None, "tok-A")):
+            seen = self._wire(monkeypatch, certdir)
+            monkeypatch.setattr(autoswitch, "last_engine_switch",
+                                lambda _dir: pair, raising=False)
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, [("tok-B", "S")])
+            assert auths == [f"Bearer {want}"], (pair, auths)
+            lines = [l for l in seen.logs if "for an expiring window" in l]
+            assert len(lines) == (want == "tok-B"), (pair, seen.logs)
+
+    def case_a_last_switch_hook_that_raises_keeps_the_session(
+            self, monkeypatch, certdir):
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+
+        def boom(_dir):
+            raise OSError("state file")
+
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(autoswitch, "last_engine_switch", boom,
+                            raising=False)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        assert pp._affinity_snap["failures"] == 0, "the rebuild raised"
 
     def case_a_disabled_slot_is_not_kept(self, monkeypatch, certdir):
         for disabled, want in (({"1"}, "tok-B"), ({"2"}, "tok-A")):

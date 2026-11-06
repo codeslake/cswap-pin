@@ -39842,10 +39842,12 @@ def test_the_host_has_every_hook_session_affinity_reads():
     assert not missing, f"the host lacks what session affinity reads: {missing}"
 
 
-# `proactive_switch_bar_pct` is the fork's (#321), on neither upstream/main nor
-# the released host; the pin falls back to the threshold without it.
+# `proactive_switch_bar_pct` and `last_engine_switch` are the fork's (#321), on
+# neither upstream/main nor the released host; the pin falls back to the
+# threshold, and to honouring no switch, without them.
 @pytest.mark.needs_host_seam
 def test_the_host_has_the_strategy_bar_hook():
     from claude_swap import autoswitch
 
     assert callable(getattr(autoswitch, "proactive_switch_bar_pct", None))
+    assert callable(getattr(autoswitch, "last_engine_switch", None))

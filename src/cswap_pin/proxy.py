@@ -3544,7 +3544,7 @@ _affinity_rest: dict[tuple, float] = {}
 # snapshot's read started (`at`), whether one is running, and how many
 # abandoned ones have still not returned
 _affinity_snap = {"tried": -math.inf, "at": -math.inf, "busy": False,
-                  "stuck": 0, "failures": 0, "ms": None}
+                  "stuck": 0, "failures": 0, "ms": None, "switch": None}
 # (slot, code) -> (monotonic time of its last lifecycle line, take-backs
 # folded into the next one)
 _affinity_logged: dict[tuple, tuple] = {}
@@ -3710,6 +3710,8 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                 "is_account_disabled": (sw, "no slot disabled"),
                 "proactive_switch_bar_pct": (require("autoswitch"),
                                              "the threshold as the bar"),
+                "last_engine_switch": (require("autoswitch"),
+                                       "no switch is honoured"),
                 "parse_reset_ts": (require("poll_policy"),
                                    "no window roll known")}
         lacks = {n for n, (o, _) in read.items() if not hasattr(o, n)}
@@ -3725,6 +3727,11 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
         # an older host has no such function: its bar is the threshold
         base = getattr(require("autoswitch"), "proactive_switch_bar_pct",
                        lambda _strategy, t: t)(strategy, threshold)
+        try:  # (slot, trigger) of the engine's last switch, or None
+            switch = getattr(require("autoswitch"), "last_engine_switch",
+                             lambda _dir: None)(sw.backup_dir)
+        except Exception:  # noqa: BLE001 — no switch is honoured
+            switch = None
         entries = sw.usage_entries_by_account(fetch=set())
         idents, kept, why, owed = {}, {}, {}, []
         for num, info in sw._get_sequence_data()["accounts"].items():
@@ -3803,6 +3810,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                 _affinity_why.clear()
                 _affinity_why.update(why)
                 _affinity_snap["at"] = started
+                _affinity_snap["switch"] = switch
                 now = time.monotonic()
                 _affinity_snap["ms"] = round(1000 * (now - started))
                 # THE FIRST SNAPSHOT LANDS WHAT A PREDECESSOR CARRIED: a row
@@ -4132,7 +4140,14 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         # to the window's reset, hours long
         resting = (held != mine and held in _affinity_kept
                    and _affinity_rest.get(held, 0.0) > now)
-        stored = (held and mine and held != mine and not resting
+        # An `expiring-window` switch moves the work to its target: a session
+        # whose client now sends the target's bearer is not held back on the
+        # slot the engine left (T3321). Any other trigger keeps.
+        switch = _affinity_snap["switch"]
+        moved = (held in _affinity_kept and mine and switch
+                 and switch[1] == "expiring-window"
+                 and str(switch[0]) == mine[0])
+        stored = (held and mine and held != mine and not resting and not moved
                   and _affinity_kept.get(held))
         # A snapshot too old to trust may still rule for a slot it read far
         # under its bar (and the replies since agree: `_affinity_note_usage`).
@@ -4160,6 +4175,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
             why = ("the snapshot is too old to rule" if not (fresh or ruled)
                    else "the client's token is in no snapshot yet" if not mine
                    else "resting after a refusal" if resting
+                   else f"the engine moved to slot {mine[0]} for an "
+                   "expiring window" if moved
                    else "its stored token has expired" if stored
                    else _affinity_why.get(held) or "it is in no snapshot")
             more = _affinity_due(_affinity_declined, why, now)
