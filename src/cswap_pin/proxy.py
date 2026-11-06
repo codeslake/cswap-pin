@@ -3533,6 +3533,8 @@ _affinity_dropped: dict[tuple, tuple[float, float]] = {}
 # (slot, email) -> why the last snapshot did not keep it (None: it did)
 _affinity_why: dict[tuple, "str | None"] = {}
 _AFFINITY_DROPPED_WHY = "dropped at its bar, no newer reading since"
+# cswap hooks the snapshot reads that this host lacks, already said once
+_affinity_hooks_warned: set = set()
 # reason -> (monotonic time of its last lifecycle line, declines folded into
 # the next one): `_affinity_pick` saying why a warm session was not kept
 _affinity_declined: dict[str, tuple] = {}
@@ -3684,9 +3686,10 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     """Rebuild the snapshot from the store: which slot stores which token, and
     which slots may be kept (a token with an `expiresAt` that is unexpired at
     pick time, not walled, not disabled, every window under the slot's bar,
-    kept with that bar). The bar is the slot's own `switchThreshold` when it
-    has one, else the one cswap's engine switches at for ``strategy`` and
-    ``threshold`` (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
+    kept with that bar). The bar is the slot's own policy `threshold`
+    (`account_policies`), lowered to its `weekly_cap` when it has one, else the
+    one cswap's engine switches at for ``strategy`` and ``threshold``
+    (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
     A stored 7d window with no 5h one (an account whose 5h limit is gone) is a
     whole reading: the week is its only wall. A slot not kept is recorded with
     the reason, for `_affinity_pick` to say.
@@ -3703,7 +3706,21 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     leaves the old snapshot to age out."""
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
-        own = getattr(sw, "account_switch_thresholds", dict)()
+        read = {"account_policies": (sw, "the global bar for every slot"),
+                "is_account_disabled": (sw, "no slot disabled"),
+                "proactive_switch_bar_pct": (require("autoswitch"),
+                                             "the threshold as the bar"),
+                "parse_reset_ts": (require("poll_policy"),
+                                   "no window roll known")}
+        lacks = {n for n, (o, _) in read.items() if not hasattr(o, n)}
+        lacks -= _affinity_hooks_warned
+        if lacks:  # a hook cswap dropped reads like an older host (T3312)
+            _affinity_hooks_warned.update(lacks)
+            _log_lifecycle(
+                "WARNING session affinity: this cswap has no "
+                + ", ".join(f"{n} (falls back to {read[n][1]})"
+                            for n in sorted(lacks)))
+        policies = getattr(sw, "account_policies", dict)()
         disabled = getattr(sw, "is_account_disabled", lambda _n: False)
         # an older host has no such function: its bar is the threshold
         base = getattr(require("autoswitch"), "proactive_switch_bar_pct",
@@ -3741,7 +3758,15 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                     # and the week is the only wall, not a missing reading. A
                     # key that is there and unreadable stays one.
                     windows.add("5h")
-                bar = own.get(slot, base)
+                policy = policies.get(slot)
+                bar = getattr(policy, "threshold", None)
+                bar = base if bar is None else bar
+                cap = getattr(policy, "weekly_cap", None)  # the fork's
+                if cap is not None and cap < 100.0:
+                    # shortcut: weekly_cap applied to all-window headroom
+                    # (stricter than cswap's weekly-only veto), upgrade to
+                    # lines.weekly_capped when the pin requires a fork cswap
+                    bar = min(bar, cap)
                 why[ident] = (
                     "walled" if getattr(entry, "walled", False) else
                     "disabled" if disabled(slot) else
