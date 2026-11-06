@@ -3706,17 +3706,20 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     leaves the old snapshot to age out."""
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
-        read = {"account_policies": sw, "is_account_disabled": sw,
-                "proactive_switch_bar_pct": require("autoswitch"),
-                "parse_reset_ts": require("poll_policy")}
-        lacks = {n for n, o in read.items() if not hasattr(o, n)}
+        read = {"account_policies": (sw, "the global bar for every slot"),
+                "is_account_disabled": (sw, "no slot disabled"),
+                "proactive_switch_bar_pct": (require("autoswitch"),
+                                             "the threshold as the bar"),
+                "parse_reset_ts": (require("poll_policy"),
+                                   "no window roll known")}
+        lacks = {n for n, (o, _) in read.items() if not hasattr(o, n)}
         lacks -= _affinity_hooks_warned
         if lacks:  # a hook cswap dropped reads like an older host (T3312)
             _affinity_hooks_warned.update(lacks)
             _log_lifecycle(
                 "WARNING session affinity: this cswap has no "
-                + ", ".join(sorted(lacks)) + "; each falls back (the global "
-                "bar, no disabled slot, the threshold, no known roll)")
+                + ", ".join(f"{n} (falls back to {read[n][1]})"
+                            for n in sorted(lacks)))
         policies = getattr(sw, "account_policies", dict)()
         disabled = getattr(sw, "is_account_disabled", lambda _n: False)
         # an older host has no such function: its bar is the threshold

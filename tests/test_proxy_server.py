@@ -26344,10 +26344,13 @@ class TestSessionAffinityOnMessages:
             pp._affinity_snap.update(tried=float("-inf"), busy=False)
             pp._affinity_kick(90.0, "dynamic")
         (line,) = [l for l in seen.logs if "WARNING" in l]
-        for hook in ("account_policies", "is_account_disabled",
-                     "parse_reset_ts"):
-            assert hook in line, line
+        for hook, fallback in (
+                ("account_policies", "the global bar for every slot"),
+                ("is_account_disabled", "no slot disabled"),
+                ("parse_reset_ts", "no window roll known")):
+            assert f"{hook} (falls back to {fallback})" in line, line
         assert "proactive_switch_bar_pct" not in line, line
+        assert "threshold as the bar" not in line, line
         assert ("1", self.EMAIL.format("1")) in pp._affinity_kept, (
             "the global bar keeps it: the fallback ran")
 
