@@ -39,6 +39,16 @@ from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
 from conftest import PIN_STAMP, run_cases, short_root
 
+# A pid no process can hold, for a record the code under test probes with a
+# real `os.kill(pid, 0)`. A bare 999999 is below this box's pid_max (4194304)
+# and the pid counter wraps through it, so it is sometimes a live process.
+# Without /proc (macOS, pid_max 99998) 999999 is already out of range.
+try:
+    DEAD_PID = max(999999, int(
+        pathlib.Path("/proc/sys/kernel/pid_max").read_text()) + 1)
+except (OSError, ValueError):
+    DEAD_PID = 999999
+
 # A REAL zero-serial root CA (GoDaddy Root Certificate Authority - G2),
 # extracted from this box's ambient `/etc/ssl/certs/ca-certificates.crt`.
 # Embedded rather than read from the ambient store so the guard tests below
@@ -11281,7 +11291,7 @@ class TestEnsureProxy:
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
-        pin_proxy.write_daemon_state(certdir, 1, 999999, "OTHER-FINGERPRINT")
+        pin_proxy.write_daemon_state(certdir, 1, DEAD_PID, "OTHER-FINGERPRINT")
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
         spawned = []
         monkeypatch.setattr(
@@ -13410,7 +13420,7 @@ class TestDaemonPortStability:
         s.bind(("127.0.0.1", 0))
         recorded = s.getsockname()[1]
         s.close()
-        write_daemon_state(tmp_path, recorded, 999999, "fp")
+        write_daemon_state(tmp_path, recorded, DEAD_PID, "fp")
 
         proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
         proxy.start()
@@ -15483,7 +15493,7 @@ print("OK", port)
         squatter.bind(("127.0.0.1", 0))
         squatter.listen(1)
         taken = squatter.getsockname()[1]
-        write_daemon_state(tmp_path, taken, 999999, "fp")
+        write_daemon_state(tmp_path, taken, DEAD_PID, "fp")
 
         proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
         proxy.start()
@@ -20196,7 +20206,7 @@ class TestUnwireWhenDead:
         cfg, certdir = self._cfg(tmp_path, monkeypatch,
                                  {"HTTPS_PROXY": "http://127.0.0.1:59999"})
         (certdir / "proxy.json").write_text(
-            json.dumps({"pid": 999999, "port": 59999, "fingerprint": "x"}))
+            json.dumps({"pid": DEAD_PID, "port": 59999, "fingerprint": "x"}))
         assert unwire_if_dead(certdir) is True
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
@@ -22123,7 +22133,7 @@ class TestHealRestoresWithoutRestart:
             certdir, pin_proxy._SUCCESSOR_FLIGHT_FILE,
             {"holder": os.getpid(), "successor": None, "predecessor": 1,
              "port": 4100, "spawned_at": time.time()})
-        for record in (None, 999999):
+        for record in (None, DEAD_PID):
             if record:
                 pin_proxy.write_daemon_state(certdir, 1, record, "FP")
             assert pin_proxy.heal(root) is False
@@ -29201,7 +29211,7 @@ class TestTheSweepClosesADeadCreatorsTwin:
         (home / "jobs" / "jdead").mkdir(parents=True)
         (home / "jobs" / "jdead" / "state.json").write_text(json.dumps({
             "bridgeSessionId": "cse_dead_creator",
-            pin_proxy._CREATOR_PID_KEY: 999999,  # not a real pid on this box
+            pin_proxy._CREATOR_PID_KEY: DEAD_PID,
         }))
         monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
                             lambda: home)
@@ -29279,7 +29289,7 @@ class TestTheSweepClosesAReplacedTwin:
         home = self._home(tmp_path, monkeypatch)
         self._live_job(home, "j1", os.getpid(), "s1-new")
         (home / "sessions" / "s1-old.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "jobId": "j1", "sessionId": "s1-old",
             "bridgeSessionId": "cse_twin"}))
         monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
@@ -29364,7 +29374,7 @@ class TestTheSweepClosesAReplacedTwin:
         # Names cse_twin, but for an UNRELATED job -- proof 1 must not
         # reach for it just because the bridge id happens to match.
         (home / "sessions" / "s-other.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "jobId": "j-other", "sessionId": "s-other",
             "bridgeSessionId": "cse_twin"}))
         # Names cse_twin too, but in an UNRELATED session's transcript --
@@ -29677,7 +29687,7 @@ class TestTheSweepArchivesATranscriptProvenTwin:
         scan. Negative row for the `_pid_alive` guard."""
         home = self._home(tmp_path, monkeypatch)
         (home / "sessions" / "s-dead.json").write_text(json.dumps({
-            "pid": 999999,  # not a real pid on this box
+            "pid": DEAD_PID,
             "sessionId": "s-dead", "name": "work",
             "bridgeSessionId": "cse_local_new"}))
         (home / "projects" / "proj" / "s-dead.jsonl").write_text(
@@ -34849,7 +34859,7 @@ class TestADeadMarkerIsReapedOnALivePath:
     def case_a_drain_start_reaps_a_dead_marker(self, tmp_path, monkeypatch):
         import cswap_pin.proxy as m
         cd = tmp_path
-        stale = m.draining_marker_path(cd, 999999)
+        stale = m.draining_marker_path(cd, DEAD_PID)
         stale.write_text("dead\n")
         import os, time
         old = time.time() - (m._DRAINING_MARKER_TTL + 60)
