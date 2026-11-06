@@ -4140,12 +4140,13 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         # to the window's reset, hours long
         resting = (held != mine and held in _affinity_kept
                    and _affinity_rest.get(held, 0.0) > now)
-        # An `expiring-window` switch moves the work to its target: a session
-        # whose client now sends the target's bearer is not held back on the
-        # slot the engine left (T3321). Any other trigger keeps.
+        # An `expiring-window` switch or a hand switch (`manual`) moves the
+        # work to its target: a session whose client now sends the target's
+        # bearer is not held back on the slot that was left (T3321). Any other
+        # trigger keeps.
         switch = _affinity_snap["switch"]
         moved = (held in _affinity_kept and mine and switch
-                 and switch[1] == "expiring-window"
+                 and switch[1] in ("expiring-window", "manual")
                  and str(switch[0]) == mine[0])
         stored = (held and mine and held != mine and not resting and not moved
                   and _affinity_kept.get(held))
@@ -4175,6 +4176,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
             why = ("the snapshot is too old to rule" if not (fresh or ruled)
                    else "the client's token is in no snapshot yet" if not mine
                    else "resting after a refusal" if resting
+                   else f"a hand switch moved to slot {mine[0]}"
+                   if moved and switch[1] == "manual"
                    else f"the engine moved to slot {mine[0]} for an "
                    "expiring window" if moved
                    else "its stored token has expired" if stored

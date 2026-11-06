@@ -26379,26 +26379,33 @@ class TestSessionAffinityOnMessages:
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert auths == [f"Bearer {want}"], (strategy, pct, auths)
 
-    def case_an_expiring_window_switch_moves_the_warm_session(
+    def case_an_engine_or_hand_switch_moves_the_warm_session(
             self, monkeypatch, certdir):
-        """A cswap engine switch chosen by its `expiring-window` rule is meant
-        to move the work: the session warm on slot 1 follows a client that
-        sends the target slot's bearer (T3321; measured on lmd42, the keep held
-        2375 replies on the old slot and 48 on the new). Any other trigger, a
-        target that is not the client's slot, and no switch keep it."""
+        """A cswap switch chosen by its `expiring-window` rule, or made by
+        hand (`manual`), is meant to move the work: the session warm on slot 1
+        follows a client that sends the target slot's bearer (T3321; measured
+        on lmd42, the keep held 2375 replies on the old slot and 48 on the
+        new after a hand switch). Any other trigger, a target that is not the
+        client's slot, and no switch keep it. The decline line names the
+        trigger."""
         from claude_swap import autoswitch
-        for pair, want in ((("2", "expiring-window"), "tok-B"),
-                           (("2", "alternation"), "tok-A"),
-                           (("1", "expiring-window"), "tok-A"),
-                           (None, "tok-A")):
+        for pair, want, why in (
+                (("2", "expiring-window"), "tok-B",
+                 "the engine moved to slot 2 for an expiring window"),
+                (("2", "manual"), "tok-B", "a hand switch moved to slot 2"),
+                (("2", "alternation"), "tok-A", None),
+                (("1", "expiring-window"), "tok-A", None),
+                (("1", "manual"), "tok-A", None),
+                (None, "tok-A", None)):
             seen = self._wire(monkeypatch, certdir)
             monkeypatch.setattr(autoswitch, "last_engine_switch",
                                 lambda _dir: pair, raising=False)
             self._seed("S", "tok-A")
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert auths == [f"Bearer {want}"], (pair, auths)
-            lines = [l for l in seen.logs if "for an expiring window" in l]
-            assert len(lines) == (want == "tok-B"), (pair, seen.logs)
+            lines = [l for l in seen.logs if "a warm session was not kept" in l]
+            assert (len(lines) == 1 and why in lines[0]) if why else (
+                not lines), (pair, seen.logs)
 
     def case_a_last_switch_hook_that_raises_keeps_the_session(
             self, monkeypatch, certdir):
