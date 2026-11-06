@@ -25620,13 +25620,14 @@ class TestSessionAffinityOnMessages:
 
     @classmethod
     def _wire(cls, monkeypatch, certdir, armed=True, pct=10.0, walled=False,
-              expires=None, thresholds=None, disabled=None, fail=False,
+              expires=None, policies=None, disabled=None, fail=False,
               no_expiry=False, carry=False):
         """A fake switcher over two slots; returns what it was asked.
         ``pct`` is slot 1's usage on both windows (None: no reading).
-        ``thresholds`` / ``disabled`` give the switcher the per-slot threshold
-        and disabled-slot methods; left None it has neither, as an older
-        claude-swap host. ``fail``: the usage read raises. ``no_expiry``:
+        ``policies`` (slot -> an object with `threshold` and maybe
+        `weekly_cap`, cswap's `account_policies()`) / ``disabled`` (slots)
+        say what the switcher's per-slot methods answer; left None they
+        answer for no slot. ``fail``: the usage read raises. ``no_expiry``:
         slot 1's stored credential carries no `expiresAt`. ``carry``: a
         started pin's tick writes the bindings for a successor; off, so that
         the next pin built in this process (a stand-in for a handover only in
@@ -25700,10 +25701,8 @@ class TestSessionAffinityOnMessages:
                 {"claudeAiOauth": {"accessToken": cls.TOKENS["2"]}}),
             resolve_account=lambda n: (n, cls.EMAIL.format(n), "org"),
         )
-        if thresholds is not None:
-            sw.account_switch_thresholds = lambda: dict(thresholds)
-        if disabled is not None:
-            sw.is_account_disabled = lambda n: n in disabled
+        sw.account_policies = lambda: dict(policies or {})
+        sw.is_account_disabled = lambda n: n in (disabled or ())
         real_require = pp.require
         monkeypatch.setattr(pp, "require", lambda name: (
             types.SimpleNamespace(ClaudeAccountSwitcher=lambda: sw)
@@ -25718,7 +25717,7 @@ class TestSessionAffinityOnMessages:
                       pp._affinity_dropped, pp._affinity_why,
                       pp._affinity_declined, pp._AFFINITY_CACHE,
                       pp._affinity_last, pp._affinity_carried,
-                      pp._affinity_unseen,
+                      pp._affinity_unseen, pp._affinity_hooks_warned,
                       pp._usage_header_seen, pp._usage_header_spawn_seen):
             state.clear()
         (certdir / pp._AFFINITY_CARRY_FILE).unlink(missing_ok=True)
@@ -26285,17 +26284,72 @@ class TestSessionAffinityOnMessages:
         assert auths == ["Bearer tok-A"], auths
         assert seen.recorded == ["1"], seen.recorded
 
+    @staticmethod
+    def _pol(threshold=None, weekly_cap=None):
+        """One slot of cswap's `account_policies()`. The released host's has
+        no `weekly_cap`; the fork's does."""
+        return types.SimpleNamespace(threshold=threshold, weekly_cap=weekly_cap)
+
     def case_the_slots_own_switch_threshold_applies(self, monkeypatch, certdir):
-        """The engine leaves a slot at its own `switchThreshold`, whichever
+        """The engine leaves a slot at its own policy `threshold`, whichever
         side of the global 90 that is, so the pin keeps a session there only
         under that slot's own bar."""
-        for thresholds, pct, want in (
-                ({"1": 60.0}, 70.0, "tok-B"), ({"1": 60.0}, 50.0, "tok-A"),
-                ({"1": 95.0}, 92.0, "tok-A"), ({"2": 60.0}, 70.0, "tok-A")):
-            self._wire(monkeypatch, certdir, pct=pct, thresholds=thresholds)
+        for policies, pct, want in (
+                ({"1": self._pol(60.0)}, 70.0, "tok-B"),
+                ({"1": self._pol(60.0)}, 50.0, "tok-A"),
+                ({"1": self._pol(95.0)}, 92.0, "tok-A"),
+                ({"2": self._pol(60.0)}, 70.0, "tok-A")):
+            self._wire(monkeypatch, certdir, pct=pct, policies=policies)
             self._seed("S", "tok-A")
             _, auths = self._send(certdir, [("tok-B", "S")])
-            assert auths == [f"Bearer {want}"], (thresholds, pct, auths)
+            assert auths == [f"Bearer {want}"], (policies, pct, auths)
+
+    def case_a_slot_policy_sets_the_bar_it_is_kept_under(
+            self, monkeypatch, certdir):
+        """cswap's one policy store (`account_policies`, T3312): a slot's
+        `threshold` is its bar, else the global 90; a `weekly_cap` under 100
+        lowers it, 100 or none does not, and a slot the store does not name
+        has the global bar. Read off the snapshot, which holds the bar."""
+        from cswap_pin import proxy as pp
+        ident = ("1", self.EMAIL.format("1"))
+        for policies, pct, bar in (
+                ({"1": self._pol(70.0)}, 65.0, 70.0),
+                ({"1": self._pol(70.0)}, 75.0, None),
+                ({"1": self._pol(weekly_cap=80.0)}, 75.0, 80.0),
+                ({"1": self._pol(weekly_cap=80.0)}, 85.0, None),
+                ({"1": self._pol(95.0, weekly_cap=80.0)}, 85.0, None),
+                ({"1": self._pol(weekly_cap=100.0)}, 85.0, 90.0),
+                ({"1": self._pol()}, 85.0, 90.0),
+                ({"2": self._pol(60.0)}, 85.0, 90.0)):
+            self._wire(monkeypatch, certdir, pct=pct, policies=policies)
+            pp._affinity_kick(90.0, "dynamic")
+            got = pp._affinity_kept.get(ident, (None, None, None))[2]
+            assert got == bar, (policies, pct, got, pp._affinity_why)
+            assert (pp._affinity_why[ident] == "at its bar") == (bar is None)
+
+    def case_a_hook_the_host_lacks_is_said_once_and_falls_back(
+            self, monkeypatch, certdir):
+        """A cswap that dropped or renamed a hook the snapshot reads looks like
+        an older host and used to fall back in silence (T3312: three weeks of
+        every slot on the global bar). One line per daemon names the hooks; the
+        fallbacks still run."""
+        from claude_swap import poll_policy
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir, pct=75.0,
+                          policies={"1": self._pol(70.0)})
+        sw = pp.require("switcher").ClaudeAccountSwitcher()
+        del sw.account_policies, sw.is_account_disabled
+        monkeypatch.delattr(poll_policy, "parse_reset_ts")
+        for _ in range(3):
+            pp._affinity_snap.update(tried=float("-inf"), busy=False)
+            pp._affinity_kick(90.0, "dynamic")
+        (line,) = [l for l in seen.logs if "WARNING" in l]
+        for hook in ("account_policies", "is_account_disabled",
+                     "parse_reset_ts"):
+            assert hook in line, line
+        assert "proactive_switch_bar_pct" not in line, line
+        assert ("1", self.EMAIL.format("1")) in pp._affinity_kept, (
+            "the global bar keeps it: the fallback ran")
 
     def case_the_dynamic_strategys_bar_applies(self, monkeypatch, certdir):
         """Under `dynamic` the engine switches at 97, not at the configured
@@ -26982,17 +27036,18 @@ class TestSessionAffinityOnMessages:
         """The snapshot lags a crossing by up to a rebuild cycle. A reply's own
         utilization header, already in hand, is read in memory: no store
         read, no wait for the next snapshot."""
-        for thresholds, util, want in (
+        for policies, util, want in (
                 (None, 0.95, "tok-B"), (None, 0.90, "tok-B"),
-                (None, 0.89, "tok-A"), ({"1": 60.0}, 0.65, "tok-B"),
-                ({"1": 60.0}, 0.55, "tok-A"), ({"2": 60.0}, 0.65, "tok-A")):
-            seen = self._wire(monkeypatch, certdir, thresholds=thresholds)
+                (None, 0.89, "tok-A"), ({"1": self._pol(60.0)}, 0.65, "tok-B"),
+                ({"1": self._pol(60.0)}, 0.55, "tok-A"),
+                ({"2": self._pol(60.0)}, 0.65, "tok-A")):
+            seen = self._wire(monkeypatch, certdir, policies=policies)
             self._seed("S", "tok-A")
             _, auths = self._send(
                 certdir, [("tok-A", "S"), ("tok-B", "S")],
                 reply=self._util(util))
             assert auths == ["Bearer tok-A", f"Bearer {want}"], (
-                thresholds, util, auths)
+                policies, util, auths)
             assert len(seen.fetches) == 1, "the drop read the store"
 
     def case_a_drop_at_the_bar_names_itself_in_the_decline_line(

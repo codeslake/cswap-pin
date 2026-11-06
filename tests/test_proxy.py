@@ -39817,3 +39817,35 @@ class TestASuccessorInFlightIsNamedByASidecar:
         (certdir / pp._SUCCESSOR_FLIGHT_FILE).unlink()
         assert pp.ensure_proxy(sw)[0] == 9955 and len(spawned) == 1, (
             "CONTROL: with no sidecar the launch spawns")
+
+
+def test_the_host_has_every_hook_session_affinity_reads():
+    """`_affinity_rebuild` reads these off cswap through `getattr` with a
+    fallback, so a cswap that loses one runs on the fallback and nothing
+    fails. T3312: a cswap merge deleted `account_switch_thresholds`, the pin
+    fell back to `dict()` for three weeks, and its test faked the hook on a
+    SimpleNamespace. This one asks the installed claude-swap itself."""
+    import dataclasses
+
+    from claude_swap import models, poll_policy, switcher
+
+    host = switcher.ClaudeAccountSwitcher
+    missing = [f"ClaudeAccountSwitcher.{n}" for n in (
+        "account_policies", "is_account_disabled", "usage_entries_by_account",
+        "read_account_credentials", "_get_sequence_data")
+        if not callable(getattr(host, n, None))]
+    if not callable(getattr(poll_policy, "parse_reset_ts", None)):
+        missing.append("poll_policy.parse_reset_ts")
+    if "threshold" not in {f.name for f in dataclasses.fields(
+            models.AccountPolicy)}:
+        missing.append("AccountPolicy.threshold")
+    assert not missing, f"the host lacks what session affinity reads: {missing}"
+
+
+# `proactive_switch_bar_pct` is the fork's (#321), on neither upstream/main nor
+# the released host; the pin falls back to the threshold without it.
+@pytest.mark.needs_host_seam
+def test_the_host_has_the_strategy_bar_hook():
+    from claude_swap import autoswitch
+
+    assert callable(getattr(autoswitch, "proactive_switch_bar_pct", None))
