@@ -24641,6 +24641,35 @@ class TestTheEvidenceSurvivesAHandover:
             pp._worker_alive), (len(pp._worker_alive_written),
                                 len(pp._worker_alive))
 
+    def _write_beside_a_stamp(self, certdir, age):
+        """Another session's stamp `age` s old sits in the file; this
+        session's heartbeat then writes it. Returns what the file holds."""
+        import json
+        import time as _t
+        from cswap_pin import proxy as pp
+        self._cold()
+        other = "cse_anidlesession0000000"
+        pp._alive_path(certdir).write_text(json.dumps(
+            {other: _t.time() - age, f"{other}@4242": _t.time() - age}))
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        return other, pp._alive_load(certdir)
+
+    def case_an_idle_sessions_stamp_survives_anothers_write(self, certdir):
+        """THE FILE'S RETENTION IS NOT THE READERS' WINDOW. An idle session's
+        worker 2xx arrives every ~280 s, so a prune at the 90 s liveness window
+        emptied its key between heartbeats and a reader outside the pin saw no
+        evidence. Every reader cuts at its own age, so keeping the stamp longer
+        changes no verdict."""
+        other, got = self._write_beside_a_stamp(certdir, 300)
+        assert other in got and f"{other}@4242" in got, sorted(got)
+
+    def case_CONTROL_a_stamp_past_the_retention_is_still_pruned(self, certdir):
+        from cswap_pin import proxy as pp
+        other, got = self._write_beside_a_stamp(
+            certdir, pp._ALIVE_KEEP_SECONDS + 60)
+        assert other not in got and f"{other}@4242" not in got, sorted(got)
+        assert self.SID in got, sorted(got)
+
     def case_concurrent_stampers_never_tear_the_file_or_lose_a_stamp(
             self, certdir):
         """EVERY RELAY THREAD WRITES THIS FILE. One shared temp name let two

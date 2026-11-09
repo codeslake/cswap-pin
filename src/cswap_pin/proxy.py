@@ -26779,6 +26779,12 @@ _ALIVE_FILE = "worker-alive.json"
 #: One write per session per interval. This sits on the request path, and a
 #: heartbeat every ~33s does not need a write every time.
 _ALIVE_WRITE_EVERY = 10.0
+#: How long a stamp STAYS in the file, apart from how long it counts as proof
+#: (`_STREAM_LIVE_SECONDS`, which every reader applies to the age it reads). An
+#: idle session's worker 2xx arrives about every 280 s, so pruning at the 90 s
+#: window emptied its key between heartbeats for any reader that asks outside
+#: the pin. The cswap gate's `_WORKER_ALIVE_S` follows this value.
+_ALIVE_KEEP_SECONDS = 900.0
 
 
 def _alive_path(certdir) -> "Path | None":
@@ -26867,7 +26873,7 @@ def _note_worker_status(path: str | None, status_line: bytes,
         # write here. A lost update costs one entry and fails toward "no
         # evidence", which is the direction that lets the 404 through.
         shared = {k: v for k, v in shared.items()
-                  if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
+                  if isinstance(v, (int, float)) and now - v <= _ALIVE_KEEP_SECONDS}
         try:
             tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(shared))
