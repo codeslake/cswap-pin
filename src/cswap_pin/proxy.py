@@ -3690,6 +3690,10 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     (`account_policies`), lowered to its `weekly_cap` when it has one, else the
     one cswap's engine switches at for ``strategy`` and ``threshold``
     (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
+    The engine spends its primary to cswap's PRIMARY_WALL_PCT (99%), and that
+    wall is not mirrored: nothing the pin reads names which slot is the
+    primary. The decline line names the keep bar's number so it is not read as
+    the engine's departure (T3406).
     A stored 7d window with no 5h one (an account whose 5h limit is gone) is a
     whole reading: the week is its only wall. A slot not kept is recorded with
     the reason, for `_affinity_pick` to say.
@@ -3782,7 +3786,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                     if not {"5h", "7d"} <= windows else
                     "its stored token has no expiry"
                     if not isinstance(data.get("expiresAt"), (int, float))
-                    else "at its bar"
+                    else f"at its keep bar, {bar:g}%"
                     if oauth.account_headroom(usage, ("all",)) <= 100.0 - bar
                     else None)
                 if why[ident] is None:

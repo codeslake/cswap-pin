@@ -25980,7 +25980,7 @@ class TestSessionAffinityOnMessages:
         from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir)
         for pct, want, why in ((30.0, "tok-A", None),
-                               (95.0, "tok-B", "at its bar")):
+                               (95.0, "tok-B", "at its keep bar, 90%")):
             seen.usage1 = seen.last_good1 = {
                 "seven_day": {"pct": pct}, "scoped": [{"name": "Fable", "pct": 5.0}]}
             pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
@@ -26344,20 +26344,22 @@ class TestSessionAffinityOnMessages:
         has the global bar. Read off the snapshot, which holds the bar."""
         from cswap_pin import proxy as pp
         ident = ("1", self.EMAIL.format("1"))
-        for policies, pct, bar in (
-                ({"1": self._pol(70.0)}, 65.0, 70.0),
-                ({"1": self._pol(70.0)}, 75.0, None),
-                ({"1": self._pol(weekly_cap=80.0)}, 75.0, 80.0),
-                ({"1": self._pol(weekly_cap=80.0)}, 85.0, None),
-                ({"1": self._pol(95.0, weekly_cap=80.0)}, 85.0, None),
-                ({"1": self._pol(weekly_cap=100.0)}, 85.0, 90.0),
-                ({"1": self._pol()}, 85.0, 90.0),
-                ({"2": self._pol(60.0)}, 85.0, 90.0)):
+        for policies, pct, bar, said in (
+                ({"1": self._pol(70.0)}, 65.0, 70.0, None),
+                ({"1": self._pol(70.0)}, 75.0, None, 70),
+                ({"1": self._pol(weekly_cap=80.0)}, 75.0, 80.0, None),
+                ({"1": self._pol(weekly_cap=80.0)}, 85.0, None, 80),
+                ({"1": self._pol(95.0, weekly_cap=80.0)}, 85.0, None, 80),
+                ({"1": self._pol(weekly_cap=100.0)}, 85.0, 90.0, None),
+                ({"1": self._pol()}, 85.0, 90.0, None),
+                ({"2": self._pol(60.0)}, 85.0, 90.0, None)):
             self._wire(monkeypatch, certdir, pct=pct, policies=policies)
             pp._affinity_kick(90.0, "dynamic")
             got = pp._affinity_kept.get(ident, (None, None, None))[2]
             assert got == bar, (policies, pct, got, pp._affinity_why)
-            assert (pp._affinity_why[ident] == "at its bar") == (bar is None)
+            # a drop names the bar it was judged at (T3406), not "at its bar"
+            assert pp._affinity_why[ident] == (
+                said and f"at its keep bar, {said}%"), pp._affinity_why
 
     def case_a_hook_the_host_lacks_is_said_once_and_falls_back(
             self, monkeypatch, certdir):
@@ -27345,7 +27347,8 @@ class TestSessionAffinityOnMessages:
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
         for opts, why in (
-                (dict(pct=95.0), "at its bar"), (dict(walled=True), "walled"),
+                (dict(pct=95.0), "(at its keep bar, 90%)"),
+                (dict(walled=True), "walled"),
                 (dict(disabled={"1"}), "disabled"),
                 (dict(no_expiry=True), "no expiry"),
                 (dict(pct=None), "too old to trust"),
