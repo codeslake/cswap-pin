@@ -27140,15 +27140,22 @@ class TestSessionAffinityOnMessages:
         for the drop, and its line says so (the slot's reason in the snapshot
         is None, it was kept, and a None must not print or key the fold)."""
         from cswap_pin import proxy as pp
-        seen = self._wire(monkeypatch, certdir)
-        self._seed("S", "tok-A")
-        _, auths = self._send(
-            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.95))
-        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
-        lines = [l for l in seen.logs if "a warm session was not kept" in l]
-        assert len(lines) == 1 and "dropped at its bar" in lines[0], seen.logs
-        assert "None" not in lines[0] and None not in pp._affinity_declined, (
-            lines, pp._affinity_declined)
+        for policies, util, bar in ((None, 0.95, "90"),
+                                    ({"1": self._pol(60.0)}, 0.65, "60")):
+            seen = self._wire(monkeypatch, certdir, policies=policies)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(util))
+            assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+            lines = [l for l in seen.logs if "a warm session was not kept" in l]
+            # the bar the slot was judged at (T3406), not "at its bar"
+            assert len(lines) == 1 and (
+                f"dropped at its keep bar, {bar}%, no newer reading since"
+                in lines[0]), seen.logs
+            assert "None" not in lines[0] and (
+                None not in pp._affinity_declined), (
+                lines, pp._affinity_declined)
 
     def case_a_snapshot_started_before_a_drop_does_not_undo_it(
             self, monkeypatch, certdir):
@@ -27206,7 +27213,8 @@ class TestSessionAffinityOnMessages:
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert len(seen.fetches) == 2, "no rebuild started after the drop"
             assert auths == [f"Bearer {want}"], (age, auths)
-            assert any("dropped at its bar" in l for l in seen.logs) == (
+            assert any("dropped at its keep bar, 90%, no newer" in l
+                       for l in seen.logs) == (
                 want == "tok-B"), (age, seen.logs)
 
     def case_a_drop_on_the_slots_own_bearer_records_to_that_slot(
@@ -29387,8 +29395,9 @@ class TestSessionAffinityOnMessages:
         refused = {"its slot is not kept": 1}
         for make, slot, why in (
                 (lambda: (pp._affinity_kept.pop(ident),
-                          pp._affinity_why.update({ident: "at its bar"})),
-                 "1", "at its bar"),
+                          pp._affinity_why.update(
+                              {ident: "at its keep bar, 90%"})),
+                 "1", "at its keep bar, 90%"),
                 (lambda: pp._affinity_rest.update(
                     {ident: time.monotonic() + 99}), "1", "resting"),
                 (lambda: pp._affinity_kept.update(
