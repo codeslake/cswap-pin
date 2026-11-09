@@ -62,10 +62,14 @@ class _FakeUpstream:
                  reject_missing_auth: bool = False,
                  reject_headers: bytes = b"", reject_body: bytes = b"",
                  reject_two_credentials: bool = False,
-                 replies: "list[bytes] | None" = None):
+                 replies: "list[bytes] | None" = None,
+                 by_bearer: "dict[str, int] | None" = None):
         # replies: one whole response per request, in order (then `reply`, or
         # the 200): a conversation whose every turn is answered differently.
         self.replies = list(replies or [])
+        # by_bearer: the bodiless status each named bearer is answered, the
+        # 200 for any other: one fleet whose accounts answer differently.
+        self._by_bearer = dict(by_bearer or {})
         # reject_two_credentials: also answer `reject_status` to a request whose
         # `x-api-key` is not the bearer it carries ("more than one credential").
         # reject_bearer: answer `reject_status` to exactly this credential
@@ -150,6 +154,14 @@ class _FakeUpstream:
                     continue
                 key = next((l.split(":", 1)[1].strip() for l in lines[1:]
                             if l.lower().startswith("x-api-key:")), None)
+                named = self._by_bearer.get(
+                    (self.seen_auth or "").removeprefix("Bearer "))
+                if named:
+                    tls.sendall(
+                        f"HTTP/1.1 {named} Named\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n".encode("latin1"))
+                    tls.close()
+                    continue
                 if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
                         or (self.seen_auth is None
                             and self._reject_missing_auth)
@@ -31035,3 +31047,322 @@ class TestConnectorsFollowPin:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
+    """T3415. A Remote Control session is owned by whichever account made it,
+    and that is neither the pinned account nor, after a slot alternation, the
+    bearer the client arrives with. The take-back resent as the arriving bearer
+    (4e8fcd3) and took that bearer for the owner: true only while the owner was
+    the active slot. Measured on a work mac 2026-11-09: a lid-wake `POST
+    .../bridge` went pinned 404, arriving (slot 7) 401, and the pin relayed the
+    401, which Claude Code reads as a credentials verdict and never retries.
+
+    The owner is remembered when it is MEASURED (the pinned attempt refused, the
+    arriving bearer answered 2xx), in `session-owners.json` by account identity.
+    A double refusal then gets one more attempt with the owner's STORED token
+    (no refresh, no consume); an owner whose token is expired but refreshable
+    gets a local 503 on `POST .../bridge` and `.../unarchive`, which Claude Code
+    retries until cswap's poller has refreshed it."""
+
+    SID = "cse_01OwnedByASlotThatIsNeitherPinnedNorActive"
+    BRIDGE = f"/v1/code/sessions/{SID}/bridge"
+    UNARCHIVE = f"/v1/sessions/{SID}/unarchive"
+    BY_ID = f"/v1/code/sessions/{SID}"
+    OWNER = ("c@example.com", "org-c")
+    FAR = 4102444800000
+    # the pinned account's bearer is refused, the arriving ones are another
+    # account's, and the owner's own is the one the server accepts
+    FLEET = {"PIN-TOKEN": 404, "B-token": 401, "D-token": 401}
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            self, request, tmp_path_factory,
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
+
+    def _store(self, monkeypatch, owner_expires=FAR, owner_refresh="rt-c",
+               quarantined=()):
+        """cswap's account store: four slots, the owner's (3) the one a case
+        varies. Every credential read is recorded in `.reads`, and anything
+        that could refresh, consume or write a slot in `.touched`."""
+        import cswap_pin.proxy as pp
+
+        real_require, store = pp.require, types.SimpleNamespace(
+            reads=[], touched=[])
+        slots = {
+            "1": ("a@example.com", "org-a", "A-stored", self.FAR, "rt-a"),
+            "3": (*self.OWNER, "C-token", owner_expires, owner_refresh),
+            "5": ("b@example.com", "org-b", "B-token", self.FAR, "rt-b"),
+            "7": ("d@example.com", "org-d", "D-token", self.FAR, "rt-d"),
+        }
+
+        def creds(num, email):
+            store.reads.append(num)
+            _, _, tok, exp, rt = slots[num]
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": tok, "expiresAt": exp,
+                **({"refreshToken": rt} if rt else {})}})
+
+        def touched(name):
+            return lambda *a, **k: store.touched.append(name)
+
+        switcher = types.SimpleNamespace(
+            _get_sequence_data=lambda: {"accounts": {
+                n: {"email": e, "organizationUuid": o}
+                for n, (e, o, *_r) in slots.items()}},
+            read_account_credentials=creds,
+            _engine_quarantined=lambda num, fp: num in quarantined,
+            consume_backup_grant=touched("consume_backup_grant"),
+            write_account_credentials=touched("write_account_credentials"),
+            _write_account_credentials=touched("_write_account_credentials"))
+        monkeypatch.setattr(pp, "require", lambda name: (
+            types.SimpleNamespace(ClaudeAccountSwitcher=lambda: switcher)
+            if name == "switcher" else real_require(name)))
+        monkeypatch.setattr(pp.oauth, "try_refresh_oauth_credentials",
+                            touched("try_refresh_oauth_credentials"))
+        return store
+
+    @staticmethod
+    def _provider(pinned=("1", "a@example.com")):
+        def provider():
+            return "PIN-TOKEN"
+        provider.current_target = lambda: pinned
+        return provider
+
+    def _fleet(self, certdir, monkeypatch, **store_kw):
+        """(proxy, upstream, lifecycle lines, store spy), started."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        store = self._store(monkeypatch, **store_kw)
+        upstream = _FakeUpstream(certdir, by_bearer=self.FLEET)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=self._provider(),
+                         upstream=("127.0.0.1", upstream.port))
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        proxy.start()
+        return proxy, upstream, lines, store
+
+    @staticmethod
+    def _memo(certdir, sid):
+        """The memo of ``sid``, once written: it is written AFTER the answer
+        has reached the client, so a case that has just read the answer waits."""
+        import cswap_pin.proxy as pp
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if pp._owner_memo(certdir, sid):
+                break
+            time.sleep(0.02)
+        return pp._owner_memo(certdir, sid)
+
+    @staticmethod
+    def _saw(lines, text):
+        """Whether a lifecycle line holding ``text`` was written, waited for for
+        the same reason as `_memo`."""
+        deadline = time.time() + 5
+        while time.time() < deadline and not any(text in ln for ln in lines):
+            time.sleep(0.02)
+        return any(text in ln for ln in lines)
+
+    def _ask(self, proxy, certdir, path, bearer, method="POST", hdrs=None):
+        return _request_through_proxy(
+            proxy.port, certdir / "ca.pem", path, bearer=bearer,
+            method=method, headers_out=hdrs)
+
+    def case_a_fall_back_2xx_remembers_the_owner_and_a_later_double_refusal_reaches_it(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            # the owner (slot 3) is the active slot: pinned 404, it answers 200
+            assert self._ask(proxy, certdir, self.BRIDGE, "C-token") == 200
+            assert self._memo(certdir, self.SID) == self.OWNER
+            assert self._saw(lines, "owner remembered, slot 3"), lines
+            # the alternation: the arriving bearer is slot 7's and is refused
+            upstream.auths_seen.clear()
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 200
+            assert upstream.auths_seen == [
+                "Bearer PIN-TOKEN", "Bearer D-token", "Bearer C-token"]
+            assert self._saw(lines, "owner's slot 3 answered 200"), lines
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_new_daemon_reads_the_memo_a_predecessor_wrote(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.UNARCHIVE, "D-token") == 200
+            assert upstream.auths_seen[-1] == "Bearer C-token"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_with_an_expired_refreshable_token_holds_a_503_on_the_two_posts(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        proxy, upstream, lines, store = self._fleet(
+            certdir, monkeypatch, owner_expires=1)
+        try:
+            for path in (self.BRIDGE, self.UNARCHIVE):
+                hdrs = {}
+                assert self._ask(proxy, certdir, path, "D-token",
+                                 hdrs=hdrs) == 503, path
+                assert hdrs.get("retry-after"), hdrs
+            assert "Bearer C-token" not in upstream.auths_seen
+            assert any("held 503, owner's slot 3 token expired" in ln
+                       for ln in lines), lines
+            # every other route relays the real answer: the arriving 401
+            upstream.auths_seen.clear()
+            assert self._ask(proxy, certdir, self.BY_ID, "D-token",
+                             method="GET") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_cswap_cannot_refresh_gets_the_real_answer(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, self.OWNER)
+        for kw in ({"owner_refresh": ""}, {"quarantined": ("3",)}):
+            proxy, upstream, lines, store = self._fleet(
+                certdir, monkeypatch, owner_expires=1, **kw)
+            try:
+                assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401, kw
+                assert upstream.auths_seen == [
+                    "Bearer PIN-TOKEN", "Bearer D-token"], (kw, upstream.auths_seen)
+            finally:
+                proxy.stop()
+                upstream.stop()
+
+    def case_with_no_memo_nothing_changes(self, certdir, monkeypatch):
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+            assert store.reads == [], "a store read with no owner to find"
+            assert [ln for ln in lines if ln.startswith("swap refused")] == [
+                f"swap refused (404) on POST {self.BRIDGE}: fell-back"], lines
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_an_owner_that_is_the_pinned_account_is_not_a_third_attempt(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        pp._owner_remember(certdir, self.SID, ("a@example.com", "org-a"))
+        proxy, upstream, lines, store = self._fleet(certdir, monkeypatch)
+        try:
+            assert self._ask(proxy, certdir, self.BRIDGE, "D-token") == 401
+            assert upstream.auths_seen == ["Bearer PIN-TOKEN", "Bearer D-token"]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_memo_is_bounded_and_two_writers_keep_each_others_entries(
+            self, certdir, monkeypatch):
+        import threading
+        import cswap_pin.proxy as pp
+
+        old = {"cse_old": [*self.OWNER, time.time() - pp._OWNERS_KEEP_S - 5]}
+        (certdir / pp._OWNERS_FILE).write_text(json.dumps(
+            {"v": 1, "rows": old}))
+        threads, rounds = 6, 20
+        gate = threading.Barrier(threads)
+
+        def write(t):
+            for r in range(rounds):
+                gate.wait()
+                pp._owner_remember(certdir, f"cse_race{t}x{r}", self.OWNER)
+
+        ts = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]
+        assert "cse_old" not in got, "a row past its retention was kept"
+        assert len(got) == threads * rounds, (
+            f"a concurrent writer dropped an entry: {len(got)}")
+        monkeypatch.setattr(pp, "_OWNERS_MAX", 10)
+        pp._owner_remember(certdir, "cse_newest", self.OWNER)
+        got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]
+        assert len(got) == 10 and "cse_newest" in got, sorted(got)
+
+    def case_the_absolute_form_path_remembers_reaches_and_holds_the_same_way(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        store = self._store(monkeypatch)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+
+        def answer(req):
+            bearer = re.search(rb"Authorization: Bearer (\S+)", req).group(1)
+            code = self.FLEET.get(bearer.decode(), 200)
+            return (f"HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n").encode()
+
+        def ask(proxy, bearer, path=self.BRIDGE):
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    f"POST https://api.anthropic.com{path} HTTP/1.1\r\n"
+                    f"Host: api.anthropic.com\r\nAuthorization: Bearer {bearer}"
+                    "\r\nContent-Length: 0\r\n\r\n".encode())
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                return got
+            finally:
+                c.close()
+
+        def start():
+            chain = _RecordingChain(answer)
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=self._provider(),
+                             rediscover_chain=True)
+            proxy.start()
+            return proxy, chain
+
+        def bearers(chain):
+            return [re.search(rb"Bearer (\S+)", r).group(1).decode()
+                    for r in chain.seen]
+
+        proxy, chain = start()
+        try:
+            assert ask(proxy, "C-token").startswith(b"HTTP/1.1 200")
+            assert self._memo(certdir, self.SID) == self.OWNER, (
+                lines, bearers(chain), store.reads)
+            chain.seen.clear()
+            assert ask(proxy, "D-token").startswith(b"HTTP/1.1 200")
+            assert bearers(chain) == ["PIN-TOKEN", "D-token", "C-token"], (
+                bearers(chain))
+            assert store.touched == [], store.touched
+        finally:
+            proxy.stop()
+            chain.stop()
+        # the owner's token has expired and cswap can refresh it
+        self._store(monkeypatch, owner_expires=1)
+        proxy, chain = start()
+        try:
+            got = ask(proxy, "D-token")
+            assert got.startswith(b"HTTP/1.1 503") and b"Retry-After" in got, got
+            assert bearers(chain) == ["PIN-TOKEN", "D-token"], bearers(chain)
+        finally:
+            proxy.stop()
+            chain.stop()
