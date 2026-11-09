@@ -3532,7 +3532,8 @@ _affinity_kept: dict[tuple, tuple] = {}
 _affinity_dropped: dict[tuple, tuple[float, float]] = {}
 # (slot, email) -> why the last snapshot did not keep it (None: it did)
 _affinity_why: dict[tuple, "str | None"] = {}
-_AFFINITY_DROPPED_WHY = "dropped at its bar, no newer reading since"
+_AFFINITY_DROPPED_WHY = ("dropped at its keep bar, {:g}%, no newer reading "
+                         "since")
 # cswap hooks the snapshot reads that this host lacks, already said once
 _affinity_hooks_warned: set = set()
 # reason -> (monotonic time of its last lifecycle line, declines folded into
@@ -3690,6 +3691,12 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     (`account_policies`), lowered to its `weekly_cap` when it has one, else the
     one cswap's engine switches at for ``strategy`` and ``threshold``
     (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
+    The engine spends its primary to 99% used (cswap's PRIMARY_WALL_PCT, 1
+    point of headroom), and that wall is not mirrored: the switch record
+    (`last_engine_switch`) names the primary only until the next switch (a
+    partner's warm turn included), so the pin cannot judge the primary against
+    its wall and keeps the strategy's bar. The decline line names the keep
+    bar's number so it is not read as the engine's departure (T3406).
     A stored 7d window with no 5h one (an account whose 5h limit is gone) is a
     whole reading: the week is its only wall. A slot not kept is recorded with
     the reason, for `_affinity_pick` to say.
@@ -3782,7 +3789,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                     if not {"5h", "7d"} <= windows else
                     "its stored token has no expiry"
                     if not isinstance(data.get("expiresAt"), (int, float))
-                    else "at its bar"
+                    else f"at its keep bar, {bar:g}%"
                     if oauth.account_headroom(usage, ("all",)) <= 100.0 - bar
                     else None)
                 if why[ident] is None:
@@ -3806,7 +3813,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                                      and started > d[1]):
                         _affinity_kept[i] = v
                     else:
-                        why[i] = _AFFINITY_DROPPED_WHY
+                        why[i] = _AFFINITY_DROPPED_WHY.format(v[2])
                 _affinity_why.clear()
                 _affinity_why.update(why)
                 _affinity_snap["at"] = started
@@ -3939,7 +3946,7 @@ def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
                 _affinity_kept[ident] = (*stored[:4], used)
             return None
         del _affinity_kept[ident]
-        _affinity_why[ident] = _AFFINITY_DROPPED_WHY
+        _affinity_why[ident] = _AFFINITY_DROPPED_WHY.format(stored[2])
         _bounded_put(_affinity_dropped, ident, (time.time(), time.monotonic()))
         return ident
 
