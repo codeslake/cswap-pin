@@ -5647,7 +5647,7 @@ def _stored_slots():
             data = oauth.extract_oauth_data(creds)
             q = bool(data) and bool(quarantined(
                 str(num), oauth.credential_fingerprint(creds)))
-        except Exception:  # noqa: BLE001 — one unreadable slot ends no search
+        except Exception:  # noqa: BLE001: one unreadable slot ends no search
             continue
         if data:
             yield (str(num), (info["email"], info.get("organizationUuid") or ""),
@@ -5663,7 +5663,7 @@ def _relayed_2xx(local) -> bool:
 def _pinned_slot(provider) -> "str | None":
     try:
         return provider.current_target()[0]
-    except Exception:  # noqa: BLE001 — a bare callable, or a cleared pin
+    except Exception:  # noqa: BLE001: a bare callable, or a cleared pin
         return None
 
 
@@ -25042,7 +25042,7 @@ class PinProxy:
         try:
             slot, data, quarantined = next(
                 (s, d, q) for s, i, d, q in _stored_slots() if i == ident)
-        except Exception:  # noqa: BLE001 — no such slot, or a store that will not read
+        except Exception:  # noqa: BLE001: no such slot, or a store that will not read
             return None
         token, expires = data.get("accessToken") or "", data.get("expiresAt")
         if slot == _pinned_slot(self._pin_token_provider) or token == arrived:
@@ -25060,7 +25060,10 @@ class PinProxy:
         """The pinned attempt was refused (``refused``) and the arriving bearer
         answered 2xx: the account storing that token owns the session, which is
         remembered. Nothing for a bearer in no slot (an unmanaged login) or the
-        pinned account's, or a row younger than `_OWNERS_FRESH_S`."""
+        pinned account's, or a row younger than `_OWNERS_FRESH_S`.
+
+        shortcut: a bearer in no slot is scanned for on every such 2xx (no row
+        throttles it); a negative memo if it shows."""
         sid = _owner_session(clean_path)
         if (not sid or not _relayed_2xx(self._local)
                 or _owner_fresh(self._certdir, sid)):
@@ -25068,7 +25071,7 @@ class PinProxy:
         try:
             slot, ident = next((s, i) for s, i, d, _q in _stored_slots()
                                if d.get("accessToken") == arrived)
-        except Exception:  # noqa: BLE001 — nothing is learned, and nothing lost
+        except Exception:  # noqa: BLE001: nothing is learned, and nothing lost
             return
         if slot != _pinned_slot(self._pin_token_provider) and _owner_remember(
                 self._certdir, sid, ident):
