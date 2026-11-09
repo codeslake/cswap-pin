@@ -5554,6 +5554,119 @@ def is_artifact_route(path: str) -> bool:
     return path.startswith(("/api/frame/", "/api/oauth/files/"))
 
 
+# A SESSION'S OWNER, MEASURED (T3415). The server fixes a Remote Control
+# session's owner at its create and there is no transfer, so a per-session
+# route answers 2xx for that account alone. The take-back resends as the bearer
+# the client arrived with and took THAT for the owner, true only while the owner
+# is the active slot: after a slot alternation a lid-wake `POST .../bridge` went
+# pinned 404, arriving 401, and the relayed 401 reads in Claude Code as a
+# credentials verdict it never retries (4e8fcd3: 401/403/404 are terminal). So
+# the owner is remembered the moment it is MEASURED (the pinned attempt
+# refused, the arriving bearer answered 2xx), by account identity (email, org),
+# never a slot number: slots move. Nothing is stamped into a pointer (e085b2d,
+# df6ba6b, 3f5b4fc tore sessions off with a GUESSED owner): the memo only picks
+# the bearer of one more attempt.
+_OWNERS_FILE = "session-owners.json"
+_OWNERS_KEEP_S = 30 * 86400.0  # a row past this goes at the next write
+_OWNERS_MAX = 512  # the newest rows stay
+_OWNERS_FRESH_S = 300.0  # a row this young is not rewritten, nor its bearer scanned for
+_SESSION_ROUTE = re.compile(r"^/v1/(?:code/)?sessions/([^/?]+)(?:[/?]|$)")
+# the two posts Claude Code answers a 5xx with a retry loop, and a 401 with its end
+_OWNER_HOLD = re.compile(r"^/v1/(?:code/)?sessions/[^/]+/(?:bridge|unarchive)$")
+
+
+class _OwnerPlan(NamedTuple):
+    kind: str  # "send": one more attempt on `token`; "hold": a local 503
+    token: str
+    slot: str
+    ident: tuple
+    sid: str
+
+
+def _owner_session(clean_path: str) -> "str | None":
+    """The `<id>` of a per-session route a swap can be refused on, else None.
+    The `/worker` subtree and presence are never swapped, so never refused."""
+    if _WORKER_SUBTREE.search(clean_path) or _PRESENCE.search(clean_path):
+        return None
+    m = _SESSION_ROUTE.match(clean_path)
+    return m.group(1) if m else None
+
+
+def _owner_load(certdir) -> dict:
+    """session -> [email, org, wall time it was measured]; `{}` for no file or
+    one that does not read."""
+    try:
+        rows = json.loads((Path(certdir) / _OWNERS_FILE).read_text())["rows"]
+        return {s: r for s, r in rows.items() if isinstance(r, list)
+                and len(r) == 3 and isinstance(r[2], (int, float))}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def _owner_memo(certdir, sid: str) -> "tuple | None":
+    """The (email, org) measured to own session ``sid``, if still on record."""
+    row = _owner_load(certdir).get(sid)
+    return tuple(row[:2]) if row and time.time() - row[2] < _OWNERS_KEEP_S else None
+
+
+def _owner_fresh(certdir, sid: str) -> bool:
+    row = _owner_load(certdir).get(sid)
+    return bool(row) and time.time() - row[2] < _OWNERS_FRESH_S
+
+
+def _owner_remember(certdir, sid: str, ident: tuple) -> bool:
+    """Record that ``ident`` answered 2xx for ``sid``. READ-MERGE-WRITE under a
+    file lock, because two pins write during a handover and a lost update drops
+    the other's row; the rows past `_OWNERS_KEEP_S` go and the newest
+    `_OWNERS_MAX` stay. Never raises: a memo is not worth a request."""
+    try:
+        with _spawn_lock(certdir, ".session-owners.lock", timeout=2.0):
+            now = time.time()
+            rows = {s: r for s, r in _owner_load(certdir).items()
+                    if now - r[2] < _OWNERS_KEEP_S}
+            rows[sid] = [*ident, now]
+            rows = dict(sorted(rows.items(), key=lambda kv: kv[1][2])[-_OWNERS_MAX:])
+            return write_carry_file(certdir, _OWNERS_FILE, {"v": 1, "rows": rows})
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stored_slots():
+    """(slot, (email, org), stored oauth data, quarantined) for each slot whose
+    credential reads, one at a time so a caller that finds its slot stops
+    reading. NO refresh, NO consume, NO write: `_affinity_rebuild`'s own read
+    (`read_account_credentials`, `extract_oauth_data`). Runs on the request
+    thread of a refused per-session route, which is rare and inside Claude
+    Code's 10 s `/bridge` timeout; the hot path's `_affinity_rebuild` keeps its
+    own thread for a store read that can hang."""
+    sw = require("switcher").ClaudeAccountSwitcher()
+    quarantined = getattr(sw, "_engine_quarantined", lambda *_: False)
+    for num, info in (sw._get_sequence_data() or {}).get("accounts", {}).items():
+        try:
+            creds = sw.read_account_credentials(num, info["email"])
+            data = oauth.extract_oauth_data(creds)
+            q = bool(data) and bool(quarantined(
+                str(num), oauth.credential_fingerprint(creds)))
+        except Exception:  # noqa: BLE001 — one unreadable slot ends no search
+            continue
+        if data:
+            yield (str(num), (info["email"], info.get("organizationUuid") or ""),
+                   data, q)
+
+
+def _relayed_2xx(local) -> bool:
+    """The status line `_forward`/`_plain_relay_request` last relayed on this
+    thread (`local.relayed`) is a 2xx."""
+    return (getattr(local, "relayed", None) or b"").startswith(b"HTTP/1.1 2")
+
+
+def _pinned_slot(provider) -> "str | None":
+    try:
+        return provider.current_target()[0]
+    except Exception:  # noqa: BLE001 — a bare callable, or a cleared pin
+        return None
+
+
 @dataclass(frozen=True)
 class CertBundle:
     """Paths to the generated MITM material.
@@ -24143,6 +24256,12 @@ class PinProxy:
 
         artifact = connector or is_artifact_route(rel)
 
+        def _arrived() -> str:
+            """The bearer the client arrived with."""
+            return _bearer(next(
+                (h.split(":", 1)[1].strip() for h in unswapped
+                 if h.split(":", 1)[0].strip().lower() == "authorization"), ""))
+
         def _swap_attempts():
             """Swapped once, refetched once on a refusal, then unswapped --
             the same take-back order `_forward` uses, via the SAME shared
@@ -24168,9 +24287,25 @@ class PinProxy:
                             if h.split(":", 1)[0].strip().lower() == "authorization"
                             else h for h in headers]
                 yield pin_hdrs, True
-            yield (pin_hdrs if artifact else unswapped), False
+            if artifact:
+                yield pin_hdrs, False
+                return
+            # THE SESSION'S REMEMBERED OWNER (T3415), as `_owner_plan` has it:
+            # the resend as it arrived is flagged only when the refusal has a
+            # next step, which runs only because that refusal was consumed
+            # (a generator is resumed only to retry).
+            plan = self._owner_plan(method, rel.split("?", 1)[0], _arrived())
+            owner.append(plan)
+            yield unswapped, plan is not None
+            if plan is not None and plan.kind == "send":
+                owner.append([
+                    f"Authorization: Bearer {plan.token}"
+                    if h.split(":", 1)[0].strip().lower() == "authorization"
+                    else h for h in unswapped])
+                yield owner[-1], False
 
-        pending_refusal = None
+        owner: list = []  # [`_owner_plan`'s, the owner attempt's headers]
+        pending_refusal = last_refused = None
         try:
             # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
             # already does. An environment registered before the pin knew
@@ -24205,8 +24340,15 @@ class PinProxy:
                     # a fresh swap exists at all is `_swap_attempts`' own
                     # lazy decision, not known until the generator has
                     # already advanced to it, which is only now.
-                    kind = ("with a fresh swap" if retry
-                            else "as the pin" if artifact else "as it arrived")
+                    on_owner = len(owner) > 1 and hdrs is owner[1]
+                    # `retry` is also the flag of the resend as it arrived
+                    # when the owner has a next step (`_swap_attempts`)
+                    fresh = retry and hdrs is not unswapped
+                    kind = ("with a fresh swap" if fresh
+                            else "as the pin" if artifact
+                            else "on the session's owner's stored token"
+                            if on_owner else "as it arrived")
+                    last_refused = pending_refusal
                     self._tunnel_trace(
                         f"{method} {rel} swap refused ({pending_refusal}) — "
                         f"retrying {kind} (absolute-form)")
@@ -24216,11 +24358,13 @@ class PinProxy:
                     # `claude remote-control` bridge client) wrote nothing
                     # daemon.log's own readers -- rc_six_gate.py row 13
                     # among them -- could see.
-                    self._note_swap_refused(
-                        pending_refusal, method, rel.split("?", 1)[0],
-                        "retried-fresh" if retry else
-                        "relayed as the pin" if artifact else "fell-back")
+                    if not on_owner:  # its own line is written once it is answered
+                        self._note_swap_refused(
+                            pending_refusal, method, rel.split("?", 1)[0],
+                            "retried-fresh" if fresh else
+                            "relayed as the pin" if artifact else "fell-back")
                     pending_refusal = None
+                self._local.relayed = None
                 try:
                     up, head = dial(hdrs)
                 except NoChainHopError:
@@ -24293,19 +24437,36 @@ class PinProxy:
                         reject_on_auth_error=retry,
                         drop_request_id=retry and _is_profile_route(rel),
                         method=method,
-                        on_status=lambda st: _release_bridge_hold(),
+                        on_status=lambda st: (
+                            _release_bridge_hold(),
+                            setattr(self._local, "relayed", st)),
                         note_hop=host == UPSTREAM_HOST and secure,
                     )
                     if isinstance(result, _AuthRejected):
                         pending_refusal = result.code
                         continue
                     _release_bridge_hold()
+                    if hdrs is unswapped:
+                        self._owner_learn(method, rel.split("?", 1)[0],
+                                          _arrived(), last_refused)
+                    elif len(owner) > 1 and hdrs is owner[1]:
+                        self._owner_answered(
+                            owner[0], last_refused, method,
+                            rel.split("?", 1)[0])
                     return bool(result) and not client_wants_close
                 finally:
                     try:
                         up.close()
                     except OSError:
                         pass
+            if pending_refusal is not None:
+                # A REFUSAL NOTHING FOLLOWS: only the resend as it arrived,
+                # flagged for the owner's plan, ends here, and a plan with no
+                # next step is "hold" (see `_owner_plan`).
+                self._owner_held(owner[0], pending_refusal, method,
+                                 rel.split("?", 1)[0])
+                self._owner_503(conn, close=True)
+                return False
         finally:
             # THE EXCHANGE HAS SETTLED ONE WAY OR ANOTHER by the time this
             # runs — sent and handed to `_pump`, relayed, refused with a
@@ -24813,8 +24974,8 @@ class PinProxy:
                     elif as_403:
                         keep = self._artifact_403(tls, close=False)
                     else:
-                        keep = self._forward(
-                            method, path,
+                        keep = self._resend_as_arrived(
+                            method, path, keep.code,
                             pin_headers if artifact else original_headers,
                             body, tls)
         except NoChainHopError:
@@ -24857,6 +25018,121 @@ class PinProxy:
             return refetch(refused_auth)
         except Exception:
             return None
+
+    def _owner_plan(self, method: str, clean_path: str,
+                    arrived: str) -> "_OwnerPlan | None":
+        """What a remembered owner asks of the resend as the bearer the client
+        ARRIVED with, decided BEFORE it is sent: a refusal the resend is flagged
+        for is consumed by `_relay_response`, so deciding after would cost one
+        more request to relay the answer. None (no memo, the owner is the
+        pinned account or the arriving bearer, or nothing to do for it) sends
+        and relays it as ever. "send": its refusal is followed by one attempt on
+        the owner's STORED token. "hold": that token is expired and cswap can
+        refresh it (a refresh token stored, the slot not quarantined), so on
+        `POST .../bridge` and `.../unarchive` its refusal is a local 503, which
+        Claude Code retries (a 5xx is transient to it, a relayed 401 its end)
+        until cswap's poller has refreshed the slot. Never raises.
+
+        shortcut: a refresh can rotate the owner's token between this read and
+        the attempt: one more refusal, relayed; `_affinity_reread` if it shows."""
+        sid = _owner_session(clean_path)
+        ident = _owner_memo(self._certdir, sid) if sid else None
+        if ident is None:
+            return None
+        try:
+            slot, data, quarantined = next(
+                (s, d, q) for s, i, d, q in _stored_slots() if i == ident)
+        except Exception:  # noqa: BLE001 — no such slot, or a store that will not read
+            return None
+        token, expires = data.get("accessToken") or "", data.get("expiresAt")
+        if slot == _pinned_slot(self._pin_token_provider) or token == arrived:
+            return None
+        if token and (not isinstance(expires, (int, float))
+                      or _affinity_token_live(expires)):
+            return _OwnerPlan("send", token, slot, ident, sid)
+        if (method == "POST" and _OWNER_HOLD.match(clean_path.rstrip("/"))
+                and data.get("refreshToken") and not quarantined):
+            return _OwnerPlan("hold", "", slot, ident, sid)
+        return None
+
+    def _owner_learn(self, method: str, clean_path: str, arrived: str,
+                     refused: int) -> None:
+        """The pinned attempt was refused (``refused``) and the arriving bearer
+        answered 2xx: the account storing that token owns the session, which is
+        remembered. Nothing for a bearer in no slot (an unmanaged login) or the
+        pinned account's, or a row younger than `_OWNERS_FRESH_S`."""
+        sid = _owner_session(clean_path)
+        if (not sid or not _relayed_2xx(self._local)
+                or _owner_fresh(self._certdir, sid)):
+            return
+        try:
+            slot, ident = next((s, i) for s, i, d, _q in _stored_slots()
+                               if d.get("accessToken") == arrived)
+        except Exception:  # noqa: BLE001 — nothing is learned, and nothing lost
+            return
+        if slot != _pinned_slot(self._pin_token_provider) and _owner_remember(
+                self._certdir, sid, ident):
+            self._note_swap_refused(refused, method, clean_path,
+                                    f"owner remembered, slot {slot}")
+
+    def _owner_answered(self, plan: "_OwnerPlan", refused: int, method: str,
+                        clean_path: str) -> None:
+        """The attempt on the owner's stored token was answered and relayed as
+        it came; a 2xx refreshes the memo."""
+        st = getattr(self._local, "relayed", None) or b"HTTP/1.1 ???"
+        self._note_swap_refused(
+            refused, method, clean_path,
+            f"owner's slot {plan.slot} answered {st[9:12].decode('latin1')}")
+        if _relayed_2xx(self._local) and not _owner_fresh(self._certdir, plan.sid):
+            _owner_remember(self._certdir, plan.sid, plan.ident)
+
+    def _owner_held(self, plan: "_OwnerPlan", refused: int, method: str,
+                    clean_path: str) -> None:
+        self._note_swap_refused(
+            refused, method, clean_path,
+            f"held 503, owner's slot {plan.slot} token expired")
+
+    def _resend_as_arrived(self, method: str, path: str, refused: int,
+                           headers, body, tls):
+        """The take-back's last resend (4e8fcd3), ``headers`` carrying the
+        bearer the client arrived with, and what the session's owner adds to it
+        (T3415): see `_owner_plan`."""
+        clean = path.split("?", 1)[0]
+        arrived = _bearer(next((v for k, v in headers
+                                if k.lower() == "authorization"), ""))
+        plan = self._owner_plan(method, clean, arrived)
+        self._local.relayed = None
+        keep = self._forward(method, path, headers, body, tls,
+                             swapped=plan is not None)
+        if not isinstance(keep, _AuthRejected):
+            self._owner_learn(method, clean, arrived, refused)
+            return keep
+        self._drop_upstream()
+        if plan.kind == "hold":
+            self._owner_held(plan, keep.code, method, clean)
+            return self._owner_503(tls, close=False)
+        refused = keep.code
+        self._local.relayed = None
+        keep = self._forward(method, path, _swap_credential(headers, plan.token),
+                             body, tls)
+        self._owner_answered(plan, refused, method, clean)
+        return keep
+
+    @staticmethod
+    def _owner_503(sock, close: bool) -> bool:
+        """A local, retryable 503 for an owner cswap is about to refresh. Claude
+        Code ignores `Retry-After` and re-mints on its own backoff (30 s
+        doubling to 300 s); it is there for a client that does not. True when
+        the connection lives on."""
+        close = close or this_process_is_draining()  # see `_relay_response`
+        try:
+            sock.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n"
+                b"Content-Length: 0\r\nConnection: "
+                + (b"close" if close else b"keep-alive") + b"\r\n\r\n")
+        except OSError:
+            return False
+        return not close
 
     @staticmethod
     def _artifact_403(sock, close: bool) -> bool:
@@ -25162,6 +25438,7 @@ class PinProxy:
                     # request for the same cse must not wait a byte longer
                     # than that.
                     _release_bridge_hold(),
+                    setattr(self._local, "relayed", st),
                     self._note_attachment(path, st),
                     self._note_rename(method, path, st),
                     self._note_bridge_superseded(method, path, st),
