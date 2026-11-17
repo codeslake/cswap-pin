@@ -12902,9 +12902,13 @@ class TestDrainReportsWhatItCut:
         # prose. The invariant is that the pinned block REUSES the sweep's
         # fetch instead of making its own; that is one line, and reverting it
         # is what brings the double fetch back.
-        assert "token = _tok if _tok_fetched else self._pin_token_provider()" in body, (
+        # (T3510: the fetch is `_pin_token_or_memo`'s now, which calls the
+        # provider once itself, so the reuse is the `(_tok, None)` arm.)
+        assert re.search(
+            r"\(_tok, None\) if _tok_fetched\s+else "
+            r"self\._pin_token_or_memo\(path\)", body), (
             "the pinned block fetches its own token again instead of reusing "
-            "the sweep's — a pinned route that also sweeps pays twice")
+            "the sweep's: a pinned route that also sweeps pays twice")
         assert "_tok_fetched" in body, (
             "no sentinel, so a falsy test would re-fetch whenever the "
             "provider legitimately answers None")
