@@ -12902,9 +12902,13 @@ class TestDrainReportsWhatItCut:
         # prose. The invariant is that the pinned block REUSES the sweep's
         # fetch instead of making its own; that is one line, and reverting it
         # is what brings the double fetch back.
-        assert "token = _tok if _tok_fetched else self._pin_token_provider()" in body, (
+        # (T3510: the fetch is `_pin_token_or_memo`'s now, which calls the
+        # provider once itself, so the reuse is the `(_tok, None)` arm.)
+        assert re.search(
+            r"\(_tok, None\) if _tok_fetched\s+else "
+            r"self\._pin_token_or_memo\(path\)", body), (
             "the pinned block fetches its own token again instead of reusing "
-            "the sweep's — a pinned route that also sweeps pays twice")
+            "the sweep's: a pinned route that also sweeps pays twice")
         assert "_tok_fetched" in body, (
             "no sentinel, so a falsy test would re-fetch whenever the "
             "provider legitimately answers None")
@@ -19402,15 +19406,18 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
         return pp.make_pin_token_provider(_Sw(), "2", "pin@example.com")
 
     def _ask(self, certdir, provider, path=None, lines=None,
-             reject=("pin-token",), reject_status=403, ua=None):
+             reject=("pin-token",), reject_status=403, ua=None,
+             out=None, reply=None, extra_headers=None):
         """One GET of `path` (the policy route by default) with the session's
         own bearer through a real daemon; `(status, bearers the upstream
-        saw)`. `lines` collects the lifecycle log; `ua` is the User-Agent."""
+        saw)`. `lines` collects the lifecycle log; `ua` is the User-Agent;
+        `out` is filled with the reply's `headers` and `body` and the request
+        `heads` the upstream saw; `reply` is the upstream's whole 200."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir, reject_bearer=set(reject),
-                                 reject_status=reject_status)
+                                 reject_status=reject_status, reply=reply)
         proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
                          upstream=("127.0.0.1", upstream.port))
         real_log = pp._log_lifecycle
@@ -19418,9 +19425,14 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
             pp._log_lifecycle = lines.append
         proxy.start()
         try:
+            hdrs, body = {}, []
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", path or self.POLICY,
-                bearer="session-bearer", method="GET", body=None, ua=ua)
+                bearer="session-bearer", method="GET", body=None, ua=ua,
+                headers_out=hdrs, body_out=body, extra_headers=extra_headers)
+            if out is not None:
+                out.update(headers=hdrs, body=body[0],
+                           heads=list(upstream.heads_seen))
             return status, list(upstream.auths_seen)
         finally:
             proxy.stop()
@@ -19511,11 +19523,14 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
                     "fell-back") in lines, (name, lines)
 
     def _ask_absolute(self, certdir, provider, path=None, lines=None,
-                      reject=("pin-token",), ua=None, reject_status=403):
+                      reject=("pin-token",), ua=None, reject_status=403,
+                      out=None, ok=b"HTTP/1.1 200 OK\r\nContent-Length: 0"
+                      b"\r\n\r\n", accept=None):
         """The absolute-form twin of `_ask` (`claude remote-control`'s own
         form): one GET of `path` with the session's own bearer through a real
-        daemon and a recording hop that refuses every bearer in `reject`;
-        `(the reply's first bytes, the requests the hop saw)`."""
+        daemon and a recording hop that refuses every bearer in `reject` and
+        answers `ok` to the rest; `(the reply's first bytes, the requests the
+        hop saw)`. `out` gets the whole reply's `head` and `body`."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
@@ -19523,7 +19538,7 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
             lambda req: (f"HTTP/1.1 {reject_status} X\r\nContent-Length: 0"
                          "\r\n\r\n".encode()
                          if any(f"Bearer {b}".encode() in req for b in reject)
-                         else b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+                         else ok))
         real_log = pp._log_lifecycle
         if lines is not None:
             pp._log_lifecycle = lines.append
@@ -19539,16 +19554,33 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
                     f"GET https://api.anthropic.com{path or self.POLICY} "
                     "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                     + (f"User-Agent: {ua}\r\n" if ua else "")
+                    + (f"Accept-Encoding: {accept}\r\n" if accept else "")
                     + "Authorization: Bearer session-bearer\r\n\r\n"
                 ).encode("latin1"))
-                got = c.recv(256)
+                # the whole reply (head, then Content-Length bytes), not the
+                # first segment: a profile answer is more than 256 bytes
+                got = c.recv(65536)
+                head, _, rest = got.partition(b"\r\n\r\n")
+                want = next((int(ln.split(b":")[1]) for ln in head.split(b"\r\n")
+                             if ln.lower().startswith(b"content-length:")), 0)
+                while b"\r\n\r\n" in got and len(rest) < want:
+                    more = c.recv(65536)
+                    if not more:
+                        break
+                    got += more
+                    rest += more
             finally:
                 c.close()
+            if out is not None:
+                out.update(head=head, body=rest)
             return got, list(chain.seen)
         finally:
             if proxy:
                 proxy.stop()
             chain.stop()
+            # the hop it hinted is dead now: a later MITM ask on this certdir
+            # would dial it and be refused for that reason
+            (certdir / "upstream.json").unlink(missing_ok=True)
             pp._log_lifecycle = real_log
 
     def case_an_absolute_form_failed_or_deferred_mint_answers_503(
@@ -19858,6 +19890,258 @@ class TestTheProfileQuestionIsNeverAnsweredAsAnotherAccount:
             f"GET {self.PROFILE} refused (503): profile",
             f"GET {self.h.POLICY} refused (503): policy",
             "POST /v1/environments/bridge refused (503): blind"], lines
+
+    # T3510: CC 2.1.326 FIXES THE STORED LOGIN IDS FROM THE FIRST PROFILE
+    # ANSWER of a /login (10 s), else from the token exchange's own account;
+    # its one retry writes only `oauthAccount`. A first answer that is a 503
+    # or a timeout therefore records the REAL account and raises the owner
+    # ask, so a pin that holds a usable slot but has no bearer in hand in time
+    # (a slow mint, a busy-slot deferral) answers the last profile the pinned
+    # account itself gave, remembered beside `pin-identity.json`.
+    PIN_UUID = "uuid-pin"
+
+    def _doc(self, uuid=None, email="pin@example.com"):
+        return json.dumps({
+            "account": {"uuid": uuid or self.PIN_UUID, "email": email,
+                        "full_name": "Pin", "display_name": "Pin",
+                        "created_at": "2025-01-01T00:00:00Z"},
+            "organization": {"uuid": "org-pin", "organization_type": "claude_max",
+                             "billing_type": "stripe_subscription",
+                             "rate_limit_tier": "default_claude_max_5x"}},
+            sort_keys=True).encode()
+
+    def _reply(self, raw):
+        return (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"request-id: req_upstream\r\nContent-Length: %d\r\n\r\n"
+                % len(raw) + raw)
+
+    def _seed(self, certdir, uuid=None, remember=True):
+        """The pin's identity memo, and (`remember`) the profile body it
+        answered, which `remember_pin_profile` accepts only for that uuid."""
+        import cswap_pin.proxy as pp
+
+        pp.remember_pin_identity(certdir, {
+            "accountUuid": uuid or self.PIN_UUID,
+            "emailAddress": "pin@example.com"})
+        raw = self._doc(uuid)
+        if remember:
+            assert pp.remember_pin_profile(certdir, raw)
+        return raw
+
+    def _asks(self, certdir, provider, **kw):
+        """The same question both ways in: `{form: (status, body, the reply's
+        header names, bearers the upstream saw)}` for the MITM and the
+        absolute form."""
+        out, got = {}, {}
+        status, seen = self.h._ask(
+            certdir, provider(), self.PROFILE, ua=self.CC, out=out, **kw)
+        got["mitm"] = (status, out["body"], set(out["headers"]), seen)
+        out = {}
+        reply, seen = self.h._ask_absolute(
+            certdir, provider(), self.PROFILE, ua=self.CC, out=out, **kw)
+        names = {ln.split(":")[0].strip().lower()
+                 for ln in out["head"].decode("latin1").split("\r\n")[1:]}
+        got["absolute"] = (
+            int(reply[9:12]), out["body"], names,
+            [re.search(r"Bearer [^\s]+", r.decode("latin1")).group(0)
+             for r in seen])
+        return got
+
+    def case_a_deferred_mint_answers_the_remembered_profile(
+            self, certdir, monkeypatch):
+        """THE DEFERRAL ARM: `pin_is_noop()` reads True and the slot is held,
+        so the answer is the pinned account's own last profile, 200, with no
+        `request-id` (d8e6587) and nothing sent upstream. Logged once each."""
+        raw = self._seed(certdir)
+        lines = []
+        got = self._asks(
+            certdir, lambda: self.h._provider(
+                certdir, monkeypatch, lambda n: "expired", busy=True),
+            lines=lines)
+        for form, (status, body, names, seen) in got.items():
+            assert status == 200 and body == raw and seen == [], (
+                form, status, body[:60], seen)
+            assert "request-id" not in names, (form, names)
+        assert len([ln for ln in lines if "remembered" in ln
+                    and self.PROFILE in ln]) == 2, lines
+
+    def case_a_slow_mint_answers_the_remembered_profile_in_time(
+            self, certdir, monkeypatch):
+        """THE SLOW-MINT ARM: a store read that outlasts the deadline (CC's own
+        first fetch gives up at 10 s, the 45 s lock bound is longer) gets the
+        remembered answer AT the deadline, and the mint goes on unharmed."""
+        import cswap_pin.proxy as pp
+
+        raw = self._seed(certdir)
+        monkeypatch.setattr(pp, "_PROFILE_MINT_WAIT_S", 0.3)
+        release = threading.Event()
+
+        def slow(n):
+            release.wait(30)
+            return "pin-token"
+
+        try:
+            t0 = time.monotonic()
+            got = self._asks(certdir, lambda: self.h._provider(
+                certdir, monkeypatch, slow))
+            took = time.monotonic() - t0
+        finally:
+            release.set()
+            for t in threading.enumerate():
+                if t.name == "pin-profile-mint":
+                    t.join(5)
+        for form, (status, body, _h, seen) in got.items():
+            assert status == 200 and body == raw and seen == [], (
+                form, status, body[:60], seen)
+        assert took < 20, took
+
+    def case_an_earlier_stall_on_the_connection_does_not_refuse_the_memo(
+            self, certdir, monkeypatch):
+        """`mint_stalled()` is per THREAD and the provider runs on its own
+        thread while a body is remembered, so the request thread's flag is
+        whatever an earlier request on the connection left. A stale True must
+        not turn the remembered answer into the stalled-store 503."""
+        import cswap_pin.proxy as pp
+
+        raw = self._seed(certdir)
+        monkeypatch.setattr(pp, "_PROFILE_MINT_WAIT_S", 0.3)
+        release = threading.Event()
+
+        def provider():
+            release.wait(30)
+
+        provider.mint_stalled = lambda: True
+        provider.pin_stands_down = lambda: False
+        provider.pin_is_noop = lambda: False
+        try:
+            got = self._asks(certdir, lambda: provider)
+        finally:
+            release.set()
+            for t in threading.enumerate():
+                if t.name == "pin-profile-mint":
+                    t.join(5)
+        for form, (status, body, _h, seen) in got.items():
+            assert status == 200 and body == raw and seen == [], (
+                form, status, body[:60], seen)
+
+    def case_a_remembered_profile_is_kept_to_the_transient_arms(
+            self, certdir, monkeypatch):
+        """THE GUARDS, each with a servable memo in place or they pass for the
+        wrong reason. No token (a credential that cannot be read): 503. A
+        pinned token refused after the refetch: 503. A cleared pin and the
+        live login: relayed on the session's bearer, the upstream's answer and
+        not the memo. cswap's own oracle: unswapped, even on a deferral."""
+        import cswap_pin.proxy as pp
+
+        raw = self._seed(certdir)
+        live = ["Bearer session-bearer"]
+
+        def cleared():
+            # `cswap pin --clear`: the record goes, and the memo with its body
+            # (a memo left standing reads as a LOST record, bb9e275)
+            pp.save_pin(certdir, None, None)
+            pp.remember_pin_identity(certdir, None)
+            return self.h._provider(certdir, monkeypatch, pinned=False)
+
+        for name, mk, kw, status, seen in (
+                ("no token", lambda: self.h._provider(certdir, monkeypatch),
+                 {}, 503, []),
+                ("cleared", cleared, {}, 200, live),
+                ("live login", lambda: self.h._provider(
+                    certdir, monkeypatch, active="2"), {}, 200, live),
+                ("refused", lambda: self.h._provider(
+                    certdir, monkeypatch, lambda n: "pin-token"),
+                 {"reject_status": 401}, 503, ["Bearer pin-token"])):
+            self._seed(certdir)  # a row before it may have cleared it
+            lines = []
+            for form, got in self._asks(
+                    certdir, mk, lines=lines, **kw).items():
+                assert got[0] == status and got[3] == seen \
+                    and got[1] != raw, (name, form, got[0], got[3], lines)
+        out = {}
+        status, seen = self.h._ask(
+            certdir, self.h._provider(
+                certdir, monkeypatch, lambda n: "expired", busy=True),
+            self.PROFILE, ua="claude-swap/1.0", out=out)
+        assert status == 200 and seen == live and out["body"] != raw, (
+            status, seen)
+
+    def case_a_remembered_profile_of_another_identity_is_never_served(
+            self, certdir, monkeypatch):
+        """Bound to the account it was answered for: a body written for the
+        pin is not served once the pin names another account, and a body for
+        another account than the pin's is not remembered at all."""
+        import cswap_pin.proxy as pp
+
+        self._seed(certdir)
+        pp.remember_pin_identity(certdir, {
+            "accountUuid": "uuid-other", "emailAddress": "other@example.com"})
+        assert pp.remembered_pin_profile(certdir) is None
+        for form, got in self._asks(certdir, lambda: self.h._provider(
+                certdir, monkeypatch, lambda n: "expired", busy=True)).items():
+            assert got[0] == 503 and got[3] == [], (form, got[0], got[3])
+        (certdir / "pin-profile.json").unlink(missing_ok=True)
+        assert pp.remember_pin_profile(certdir, self._doc()) is False
+        assert not (certdir / "pin-profile.json").exists()
+        assert pp.remember_pin_profile(certdir, b"not json") is False
+
+    def case_a_clear_drops_the_remembered_profile(self, certdir):
+        """`remember_pin_identity(certdir, None)` is the clear (and the stale
+        memo's unlink): the body goes with the record, and re-pinning the same
+        account afterwards does not bring it back."""
+        import cswap_pin.proxy as pp
+
+        self._seed(certdir)
+        assert pp.remembered_pin_profile(certdir) == self._doc()
+        pp.remember_pin_identity(certdir, None)
+        assert pp.remembered_pin_profile(certdir) is None
+        assert not (certdir / "pin-profile.json").exists()
+        self._seed(certdir, remember=False)
+        assert pp.remembered_pin_profile(certdir) is None
+
+    def case_a_swapped_profile_answer_is_remembered(self, certdir, monkeypatch):
+        """THE SEED: a 200 the pin's own bearer got is kept whole, asked for
+        plain (a gzip body could not be re-served), on both paths. THE
+        CONTROLS: an unswapped answer (live login), cswap's oracle, a 401 and
+        an answer naming another account are not kept."""
+        import cswap_pin.proxy as pp
+
+        raw = self._doc()
+        for form in ("mitm", "absolute"):
+            self._seed(certdir, remember=False)
+            (certdir / "pin-profile.json").unlink(missing_ok=True)
+            out = {}
+            prov = self.h._provider(certdir, monkeypatch, lambda n: "pin-token")
+            if form == "mitm":
+                self.h._ask(certdir, prov, self.PROFILE, ua=self.CC, out=out,
+                            reject=(), reply=self._reply(raw),
+                            extra_headers={"Accept-Encoding": "gzip"})
+                heads = [h.lower() for h in out["heads"]]
+            else:
+                _r, seen = self.h._ask_absolute(
+                    certdir, prov, self.PROFILE, ua=self.CC, reject=(),
+                    ok=self._reply(raw), accept="gzip")
+                heads = [r.decode("latin1").lower() for r in seen]
+            assert pp.remembered_pin_profile(certdir) == raw, form
+            assert all("accept-encoding: identity" in h
+                       and "gzip" not in h for h in heads), (form, heads)
+        for name, kw, ask in (
+                ("live login", {"active": "2"}, {"ua": self.CC}),
+                ("oracle", {}, {"ua": "claude-swap/1.0"})):
+            (certdir / "pin-profile.json").unlink(missing_ok=True)
+            self.h._ask(certdir, self.h._provider(
+                certdir, monkeypatch, lambda n: "pin-token", **kw),
+                self.PROFILE, reject=(), reply=self._reply(raw), **ask)
+            assert pp.remembered_pin_profile(certdir) is None, name
+        for name, reply, reject in (
+                ("refused", None, ("pin-token",)),
+                ("another account", self._reply(self._doc("uuid-other")), ())):
+            (certdir / "pin-profile.json").unlink(missing_ok=True)
+            self.h._ask(certdir, self.h._provider(
+                certdir, monkeypatch, lambda n: "pin-token"),
+                self.PROFILE, ua=self.CC, reject=reject, reply=reply,
+                reject_status=401)
+            assert pp.remembered_pin_profile(certdir) is None, name
 
 
 class TestEverySmallCaseHolder:
