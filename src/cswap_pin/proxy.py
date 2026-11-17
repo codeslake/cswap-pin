@@ -5353,6 +5353,28 @@ _POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
                    "could be minted; no other account answers it")
 _POLICY_REFUSED = ("the pinned token was refused ({code}) on the org-policy "
                    "question; no other account answers it")
+_PROFILE_NO_MINT = ("the account-profile question needs the pinned token and "
+                    "none could be minted; no other account answers it")
+_PROFILE_REFUSED = ("the pinned token was refused ({code}) on the "
+                    "account-profile question; no other account answers it")
+
+
+def _never_as_another_account(path: str):
+    """`(no-mint wording, refused wording)` of a route that is answered 503
+    rather than on the session's own bearer, else None.
+
+    The org-policy route (a denial is permanent) and, since CC 2.1.326, the
+    profile route: its answer names the live account, which CC writes to
+    `oauthAccount` and, when the answer is stamped, to the stored
+    `claudeAiOauth` ids that `jH()` prefers, so a changed owner turns Remote
+    Control off. A failed startup refetch writes nothing; a failed one at
+    /login falls back to the token exchange's ids (`tokenAccount`, the real
+    account), which only cswap can clear (T3508)."""
+    if _is_policy_route(path):
+        return _POLICY_NO_MINT, _POLICY_REFUSED
+    if _is_profile_route(path):
+        return _PROFILE_NO_MINT, _PROFILE_REFUSED
+    return None
 
 
 def is_pinned_route(path: str, ua: str = "") -> bool:
@@ -10436,8 +10458,8 @@ def _pin_is_noop(provider) -> bool:
 def _pin_stands_down(provider) -> bool:
     """Whether the pin is cleared or IS the live login (`pin_stands_down`),
     False for a provider without the hook: a bare test callable is a pin that
-    simply failed to mint, which is the safe reading for the org-policy
-    question."""
+    simply failed to mint, which is the safe reading for the org-policy and
+    profile questions."""
     try:
         return bool(getattr(provider, "pin_stands_down", None)
                     and provider.pin_stands_down())
@@ -23638,15 +23660,16 @@ class PinProxy:
         stalled-store wording, which is the only cause this used to answer
         for.
 
-        THE ORG-POLICY ROUTE HAS ITS OWN COOLDOWN SLOT: its 503 repeats for as
-        long as the pin cannot mint, and sharing the budget would let that
-        burst swallow the next blind-mint line above.
+        THE ORG-POLICY AND PROFILE ROUTES EACH HAVE THEIR OWN COOLDOWN SLOT:
+        their 503s repeat for as long as the pin cannot mint, and sharing the
+        budget would let that burst swallow the next blind-mint line above.
         """
         # A DEPARTING DAEMON'S ANSWER ENDS ITS SOCKET, as `_relay_response`'s
         # does: the MITM loop would otherwise serve the next request on it.
         close = close or this_process_is_draining()
         now = time.monotonic()
         slot = ("_policy_refused_at" if _is_policy_route(path)
+                else "_profile_refused_at" if _is_profile_route(path)
                 else "_stall_refused_at")
         last = getattr(self, slot, None)
         if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
@@ -24112,13 +24135,14 @@ class PinProxy:
                 ) and self._pin_token_provider.mint_stalled():
                     self._refuse_stalled_mint(conn, method, rel, close=True)
                     return False
-                # THE MITM PATH'S ORG-POLICY RULE, FOR THE SAME REASON (see
-                # the note above its own call): a failed or deferred mint
-                # answers 503, never the session's bearer.
-                if token is None and _is_policy_route(rel) \
+                # THE MITM PATH'S ORG-POLICY AND PROFILE RULE, FOR THE SAME
+                # REASON (see the note above its own call): a failed or
+                # deferred mint answers 503, never the session's bearer.
+                no_fallback = _never_as_another_account(rel)
+                if token is None and no_fallback \
                         and not _pin_stands_down(self._pin_token_provider):
                     self._refuse_stalled_mint(
-                        conn, method, rel, _POLICY_NO_MINT, close=True)
+                        conn, method, rel, no_fallback[0], close=True)
                     return False
                 token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
@@ -24317,14 +24341,15 @@ class PinProxy:
                 if hdrs is None:
                     break
                 if pending_refusal is not None and not retry \
-                        and _is_policy_route(rel):
-                    # THE ORG-POLICY QUESTION NEVER FALLS BACK (the MITM
-                    # take-back's rule): the last attempt would be the
-                    # session's own bearer, so the pin's refusal is a local
-                    # 503 instead, and the refusal's own line is the one log.
+                        and (wording := _never_as_another_account(rel)):
+                    # THE ORG-POLICY AND PROFILE QUESTIONS NEVER FALL BACK
+                    # (the MITM take-back's rule): the last attempt would be
+                    # the session's own bearer, so the pin's refusal is a
+                    # local 503 instead, and the refusal's own line is the
+                    # one log.
                     self._refuse_stalled_mint(
                         conn, method, rel,
-                        _POLICY_REFUSED.format(code=pending_refusal),
+                        wording[1].format(code=pending_refusal),
                         close=True)
                     return False
                 if pending_refusal == 401 and artifact and not retry:
@@ -24657,10 +24682,16 @@ class PinProxy:
             # ponytail: a cache-less cold start then refuses only a NEW
             # /remote-control ("Couldn't verify"), never a live bridge;
             # accepted, since the fall-open's cost is cutting live sessions.
-            if token is None and _is_policy_route(path) \
+            # THE PROFILE QUESTION TOO (CC 2.1.326, see
+            # `_never_as_another_account`): its answer as the live account
+            # moves the session owner. A failed startup refetch writes nothing;
+            # a failed one at /login falls back to the token exchange's ids,
+            # which only cswap can clear (T3508).
+            no_fallback = _never_as_another_account(path)
+            if token is None and no_fallback \
                     and not _pin_stands_down(self._pin_token_provider):
                 return self._refuse_stalled_mint(
-                    tls, method, path, _POLICY_NO_MINT)
+                    tls, method, path, no_fallback[0])
             token = self._wait_for_pin_token(method, path, token)
             if token:
                 # NESTED, NOT A SINGLE `and` (T1193). A token that resolved
@@ -24957,20 +24988,21 @@ class PinProxy:
                     # active account is never right. It logs under its own path.
                     artifact = connector or is_artifact_route(clean_path)
                     as_403 = artifact and keep.code == 401
-                    # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
-                    # rule as the failed mint above, so the pin's refusal is
-                    # a local 503, not a resend on the session's bearer. ONE
-                    # LOG LINE: the refusal's own, which carries the code.
-                    policy = _is_policy_route(clean_path)
-                    if not policy:
+                    # THE ORG-POLICY AND PROFILE QUESTIONS NEVER FALL BACK
+                    # EITHER: the same rule as the failed mint above, so the
+                    # pin's refusal is a local 503, not a resend on the
+                    # session's bearer. ONE LOG LINE: the refusal's own, which
+                    # carries the code.
+                    no_fallback = _never_as_another_account(clean_path)
+                    if not no_fallback:
                         self._note_swap_refused(
                             keep.code, method, clean_path,
                             "relayed as the pin as 403" if as_403 else
                             "relayed as the pin" if artifact else "fell-back")
-                    if policy:
+                    if no_fallback:
                         keep = self._refuse_stalled_mint(
                             tls, method, path,
-                            _POLICY_REFUSED.format(code=keep.code))
+                            no_fallback[1].format(code=keep.code))
                     elif as_403:
                         keep = self._artifact_403(tls, close=False)
                     else:
