@@ -738,6 +738,9 @@ class TestPinProxyServer:
                     ua=ua, method="GET", body="", headers_out=got)
                 assert status == 200, (path, ua, refuse)
                 assert ("request-id" in got) is kept, (path, ua, refuse, got)
+                if refuse:  # the take-back ran: the refused swap, then as arrived
+                    assert upstream.auths_seen == [
+                        "Bearer PIN-TOKEN", "Bearer disk-token"], upstream.auths_seen
             finally:
                 proxy.stop()
                 upstream.stop()
@@ -19657,9 +19660,10 @@ class TestTheProfileQuestionIsNeverAnsweredAsAnotherAccount:
     `/api/oauth/profile` that leaves on CC's own bearer names the LIVE account:
     CC writes `oauthAccount` from it, stamped or not, and a stamped one (a
     `request-id`) also fills the stored ids. So a pin that cannot swap this
-    route answers a local 503, which CC reads as a failed fetch and writes
-    nothing for, and a swap the upstream refuses is never resent on the
-    session's bearer. A cleared pin, or one that IS the live login, keeps
+    route answers a local 503, which CC reads as a failed fetch: a startup
+    refetch then writes nothing, while a /login falls back to the token
+    exchange's ids, which only cswap can clear (T3508). A swap the upstream
+    refuses is never resent on the session's bearer. A cleared pin, or one that IS the live login, keeps
     relaying: the live bearer's answer is then the pinned identity.
 
     The policy route's rule (`TestThePolicyQuestion...`), on the profile

@@ -5367,7 +5367,9 @@ def _never_as_another_account(path: str):
     profile route: its answer names the live account, which CC writes to
     `oauthAccount` and, when the answer is stamped, to the stored
     `claudeAiOauth` ids that `jH()` prefers, so a changed owner turns Remote
-    Control off. A failed fetch writes nothing."""
+    Control off. A failed startup refetch writes nothing; a failed one at
+    /login falls back to the token exchange's ids (`tokenAccount`, the real
+    account), which only cswap can clear (T3508)."""
     if _is_policy_route(path):
         return _POLICY_NO_MINT, _POLICY_REFUSED
     if _is_profile_route(path):
@@ -24682,7 +24684,9 @@ class PinProxy:
             # accepted, since the fall-open's cost is cutting live sessions.
             # THE PROFILE QUESTION TOO (CC 2.1.326, see
             # `_never_as_another_account`): its answer as the live account
-            # moves the session owner, and a failed fetch writes nothing.
+            # moves the session owner. A failed startup refetch writes nothing;
+            # a failed one at /login falls back to the token exchange's ids,
+            # which only cswap can clear (T3508).
             no_fallback = _never_as_another_account(path)
             if token is None and no_fallback \
                     and not _pin_stands_down(self._pin_token_provider):
