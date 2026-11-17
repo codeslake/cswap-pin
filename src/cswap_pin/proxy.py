@@ -24818,7 +24818,9 @@ class PinProxy:
             # nothing serving it. Fail THIS request fast instead of joining
             # them; the fail-open path below is for a credential that was
             # actually asked and answered no.
-            if token is None and not connector and getattr(
+            # NOT WITH A MEMO (T3510): the provider ran on its own thread, and
+            # this flag is per thread, so it would be an earlier request's.
+            if token is None and not connector and not memo and getattr(
                     self._pin_token_provider, "mint_stalled", None
             ) and self._pin_token_provider.mint_stalled():
                 return self._refuse_stalled_mint(tls, method, path)

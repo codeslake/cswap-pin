@@ -19995,6 +19995,35 @@ class TestTheProfileQuestionIsNeverAnsweredAsAnotherAccount:
                 form, status, body[:60], seen)
         assert took < 20, took
 
+    def case_an_earlier_stall_on_the_connection_does_not_refuse_the_memo(
+            self, certdir, monkeypatch):
+        """`mint_stalled()` is per THREAD and the provider runs on its own
+        thread while a body is remembered, so the request thread's flag is
+        whatever an earlier request on the connection left. A stale True must
+        not turn the remembered answer into the stalled-store 503."""
+        import cswap_pin.proxy as pp
+
+        raw = self._seed(certdir)
+        monkeypatch.setattr(pp, "_PROFILE_MINT_WAIT_S", 0.3)
+        release = threading.Event()
+
+        def provider():
+            release.wait(30)
+
+        provider.mint_stalled = lambda: True
+        provider.pin_stands_down = lambda: False
+        provider.pin_is_noop = lambda: False
+        try:
+            got = self._asks(certdir, lambda: provider)
+        finally:
+            release.set()
+            for t in threading.enumerate():
+                if t.name == "pin-profile-mint":
+                    t.join(5)
+        for form, (status, body, _h, seen) in got.items():
+            assert status == 200 and body == raw and seen == [], (
+                form, status, body[:60], seen)
+
     def case_a_remembered_profile_is_kept_to_the_transient_arms(
             self, certdir, monkeypatch):
         """THE GUARDS, each with a servable memo in place or they pass for the
