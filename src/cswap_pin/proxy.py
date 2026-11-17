@@ -4771,6 +4771,31 @@ def _reply_tee(headers, body, path: str) -> "_ReplyTee | None":
     return _ReplyTee(entry, session, body) if awaited else None
 
 
+class _ProfileTee:
+    """`_relay_response`'s tee (`start`, `feed`, `end`, as `_ReplyTee`'s) for a
+    SWAPPED profile answer: a 200 body is kept, whole, as the pinned account's
+    remembered profile (`remember_pin_profile`, T3510). It reads a plain body
+    because the request that arms it asks for identity."""
+
+    _MAX = 65536
+
+    def __init__(self, certdir):
+        self._certdir, self._code, self._buf = certdir, None, bytearray()
+
+    def start(self, code: int) -> None:
+        self._code = code
+
+    def feed(self, data: bytes) -> None:
+        if len(self._buf) <= self._MAX:
+            self._buf += data
+
+    def end(self) -> None:
+        code, buf, self._code = self._code, bytes(self._buf), None
+        if code == 200 and 0 < len(buf) <= self._MAX:
+            with contextlib.suppress(Exception):  # a statistic, not the relay
+                remember_pin_profile(self._certdir, buf)
+
+
 def _affinity_capture(certdir, headers, body: bytes, path: str,
                       inject=None) -> bool:
     """Keep ``body`` as its session's last main-thread body when armed and it
@@ -5369,7 +5394,9 @@ def _never_as_another_account(path: str):
     `claudeAiOauth` ids that `jH()` prefers, so a changed owner turns Remote
     Control off. A failed startup refetch writes nothing; a failed one at
     /login falls back to the token exchange's ids (`tokenAccount`, the real
-    account), which only cswap can clear (T3508)."""
+    account), so a mint that is only SLOW or DEFERRED answers the remembered
+    profile instead (`_pin_token_or_memo`, T3510) and a token that cannot be
+    had at all is left to cswap (T3508)."""
     if _is_policy_route(path):
         return _POLICY_NO_MINT, _POLICY_REFUSED
     if _is_profile_route(path):
@@ -8572,6 +8599,9 @@ def remember_pin_identity(certdir, identity: dict | None, *,
     """
     p = Path(certdir) / _PIN_IDENTITY_NAME
     if not identity:
+        # THE PROFILE BODY GOES WITH THE RECORD it was answered for (T3510).
+        with contextlib.suppress(OSError):
+            (Path(certdir) / _PIN_PROFILE_NAME).unlink(missing_ok=True)
         # `missing_ok=True` already absorbs "was never there" -- anything
         # still raising here is a REFUSED unlink (permission denied, a
         # read-only mount), and `_current_target` now reads this file's
@@ -8612,6 +8642,54 @@ def remembered_pin_identity(certdir) -> dict | None:
     except (OSError, ValueError, TypeError):
         return None
     return d if isinstance(d, dict) and d.get("accountUuid") else None
+
+
+#: The last `/api/oauth/profile` body the pin's own bearer was answered, kept
+#: whole beside `pin-identity.json` (never inside it: that dict is spliced
+#: into `oauthAccount` and its mere presence reads as "not cleared", bb9e275).
+_PIN_PROFILE_NAME = "pin-profile.json"
+
+#: How long a pinned profile question waits for its bearer when a body is
+#: remembered. Claude Code's FIRST profile fetch of a /login gives up at 10 s
+#: and a failed first answer is what turns its stored ids into the real
+#: account's; the mint's own bound (`_MINT_LOCK_BOUND_S`) is longer.
+_PROFILE_MINT_WAIT_S = 8.0
+
+
+def _profile_body_uuid(raw: bytes) -> "str | None":
+    """The account uuid a profile body names, or None when it is not one."""
+    try:
+        ident = profile_identity_from(json.loads(raw))
+    except (ValueError, TypeError):
+        return None
+    return ident["accountUuid"] if ident else None
+
+
+def remember_pin_profile(certdir, raw: bytes) -> bool:
+    """Keep ``raw``, a profile answer the pin's bearer got, for the pinned
+    account only: a body that names another account than
+    `remembered_pin_identity` (or any when there is none) is not kept."""
+    ident = remembered_pin_identity(certdir)
+    if not ident or _profile_body_uuid(raw) != ident["accountUuid"]:
+        return False
+    try:
+        (Path(certdir) / _PIN_PROFILE_NAME).write_bytes(raw)
+    except OSError:
+        return False  # a pin that cannot cache its profile still pins
+    return True
+
+
+def remembered_pin_profile(certdir) -> "bytes | None":
+    """What :func:`remember_pin_profile` kept, only while it still names the
+    pinned account. Read from disk each time: a clear runs in another
+    process."""
+    try:
+        raw = (Path(certdir) / _PIN_PROFILE_NAME).read_bytes()
+    except (OSError, TypeError):
+        return None
+    ident = remembered_pin_identity(certdir)
+    return raw if ident and _profile_body_uuid(raw) == ident["accountUuid"] \
+        else None
 
 
 def _restore_record_from_wiring(
@@ -23691,6 +23769,62 @@ class PinProxy:
             pass
         return not close
 
+    def _pin_token_or_memo(self, path: str):
+        """`(token, memo)`: what the pin's token provider answers a pinned
+        `path`, and, for the profile question only, the pinned account's own
+        remembered profile (`remembered_pin_profile`) to answer in place of a
+        503 when the token is not coming in time (T3510).
+
+        CC 2.1.326 fixes a /login's stored ids from its FIRST profile answer
+        (10 s) and from the token exchange's account when that fails, and its
+        one retry writes only `oauthAccount`, so a 503 or a timeout there
+        raises the owner ask that turns Remote Control off. `memo` is set when
+        a body is remembered for the pinned account AND the provider has not
+        answered within `_PROFILE_MINT_WAIT_S` (a slow mint, or a stall: it
+        runs on in its own thread and warms the cache for the next request) or
+        answered None as a DEFERRAL (`pin_is_noop` while `pin_stands_down` is
+        False: a usable slot with a token owed). The caller still refuses a
+        stood-down pin, and an answer of None for any other cause (no
+        credential, a refused refresh) stays a 503. Without a remembered body
+        the provider is called here, exactly as before."""
+        memo = (remembered_pin_profile(getattr(self, "_certdir", None))
+                if _is_profile_route(path) else None)
+        provider = self._pin_token_provider
+        if memo is None:
+            return provider(), None
+        box: list = []
+        worker = threading.Thread(
+            target=lambda: box.append(provider()), name="pin-profile-mint",
+            daemon=True)
+        worker.start()
+        worker.join(_PROFILE_MINT_WAIT_S)
+        if not box:
+            return None, memo
+        token = box[0]
+        return token, memo if token is None and _pin_is_noop(provider) else None
+
+    def _serve_remembered_profile(self, tls, method: str, path: str,
+                                   raw: bytes, close: bool = False) -> bool:
+        """Answer a pinned profile question 200 from `raw`, the pinned
+        account's own last answer (`_pin_token_or_memo`). NO `request-id`, as
+        every swapped profile answer (d8e6587). Keeps the connection like
+        `_refuse_stalled_mint`; True when it lives on."""
+        close = close or this_process_is_draining()
+        _log_lifecycle(
+            f"{method} {path} answered 200 from the remembered profile of the "
+            f"pinned account: no pinned token in hand within "
+            f"{_PROFILE_MINT_WAIT_S:.0f}s or its refresh was deferred, and a "
+            "failed first profile fetch at a /login would record the live "
+            "account as the session owner")
+        try:
+            tls.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\nConnection: %s\r\n\r\n" % (
+                    len(raw), b"close" if close else b"keep-alive") + raw)
+        except OSError:
+            pass
+        return not close
+
     def _warn_unpinnable(self) -> None:
         """Say once, on stderr, that the pin is not being applied.
 
@@ -24121,7 +24255,7 @@ class PinProxy:
             connector = is_connector_route(rel) and connectors_follow_pin(
                 self._certdir)
             if connector or is_pinned_route(rel, ua):
-                token = self._pin_token_provider()
+                token, memo = self._pin_token_or_memo(rel)
                 # THE SAME PRE-CHECK THE MITM PATH MAKES (see its own note
                 # above `_wait_for_pin_token`'s call there). Without it, a
                 # stalled credential store pays this thread's own
@@ -24141,8 +24275,12 @@ class PinProxy:
                 no_fallback = _never_as_another_account(rel)
                 if token is None and no_fallback \
                         and not _pin_stands_down(self._pin_token_provider):
-                    self._refuse_stalled_mint(
-                        conn, method, rel, no_fallback[0], close=True)
+                    if memo:
+                        self._serve_remembered_profile(
+                            conn, method, rel, memo, close=True)
+                    else:
+                        self._refuse_stalled_mint(
+                            conn, method, rel, no_fallback[0], close=True)
                     return False
                 token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
@@ -24164,6 +24302,12 @@ class PinProxy:
                               else h)
                         for h in headers
                     ]
+                    if _is_profile_route(rel):
+                        # PLAIN, for the remembered profile's tee below
+                        # (`_forward` asks the same).
+                        headers = [h for h in headers if h.split(":", 1)[0]
+                                   .strip().lower() != "accept-encoding"
+                                   ] + ["Accept-Encoding: identity"]
                 # TRACED LIKE THE MITM PATH. Untraced, a feature travelling
                 # here leaves the same evidence as one that never ran.
                 self._tunnel_trace(
@@ -24457,16 +24601,21 @@ class PinProxy:
                     # NO `path=`/`certdir=`/`auth=` (T1041 finding 5): none of
                     # what they enable is owed here — the standalone RC
                     # client's absolute-form routes gate on none of them.
+                    ptee = (_ProfileTee(self._certdir)
+                            if retry and _is_profile_route(rel) else None)
                     result = _relay_response(
                         up, conn, getattr(self._local, "cid", 0),
                         reject_on_auth_error=retry,
                         drop_request_id=retry and _is_profile_route(rel),
+                        tee=ptee,
                         method=method,
                         on_status=lambda st: (
                             _release_bridge_hold(),
                             setattr(self._local, "relayed", st)),
                         note_hop=host == UPSTREAM_HOST and secure,
                     )
+                    if ptee is not None:
+                        ptee.end()
                     if isinstance(result, _AuthRejected):
                         pending_refusal = result.code
                         continue
@@ -24659,7 +24808,8 @@ class PinProxy:
         swapped = False
         original_headers = list(headers)
         if pinned:
-            token = _tok if _tok_fetched else self._pin_token_provider()
+            token, memo = ((_tok, None) if _tok_fetched
+                           else self._pin_token_or_memo(path))
             # A STALL, NOT A FAIL-OPEN CASE. `provider()` above just gave up
             # on `refresh_lock` after `_MINT_LOCK_BOUND_S` rather than queue
             # behind a credential store that may never answer (measured: a
@@ -24685,11 +24835,15 @@ class PinProxy:
             # THE PROFILE QUESTION TOO (CC 2.1.326, see
             # `_never_as_another_account`): its answer as the live account
             # moves the session owner. A failed startup refetch writes nothing;
-            # a failed one at /login falls back to the token exchange's ids,
-            # which only cswap can clear (T3508).
+            # a failed one at /login falls back to the token exchange's ids:
+            # a slow or deferred mint answers `memo` (T3510), a token that
+            # cannot be had at all is left to cswap (T3508).
             no_fallback = _never_as_another_account(path)
             if token is None and no_fallback \
                     and not _pin_stands_down(self._pin_token_provider):
+                if memo:
+                    return self._serve_remembered_profile(
+                        tls, method, path, memo)
                 return self._refuse_stalled_mint(
                     tls, method, path, no_fallback[0])
             token = self._wait_for_pin_token(method, path, token)
@@ -25308,7 +25462,9 @@ class PinProxy:
                 and (_TRACE is not None
                      or trace_target(getattr(self, "_certdir", None)))
                 else "")
-            tee = _reply_tee(headers, body, path)
+            tee = (_ProfileTee(getattr(self, "_certdir", None))
+                   if swapped and _is_profile_route(path)
+                   else _reply_tee(headers, body, path))
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
             # _read_body decoded a chunked body, and the transfer-coding
