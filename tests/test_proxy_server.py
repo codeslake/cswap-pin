@@ -19407,12 +19407,13 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
 
     def _ask(self, certdir, provider, path=None, lines=None,
              reject=("pin-token",), reject_status=403, ua=None,
-             out=None, reply=None, extra_headers=None):
+             out=None, reply=None, extra_headers=None, trace=None):
         """One GET of `path` (the policy route by default) with the session's
         own bearer through a real daemon; `(status, bearers the upstream
         saw)`. `lines` collects the lifecycle log; `ua` is the User-Agent;
         `out` is filled with the reply's `headers` and `body` and the request
-        `heads` the upstream saw; `reply` is the upstream's whole 200."""
+        `heads` the upstream saw; `reply` is the upstream's whole 200;
+        `trace` is a file the request trace is armed to and ticked open."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
@@ -19423,8 +19424,13 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
         real_log = pp._log_lifecycle
         if lines is not None:
             pp._log_lifecycle = lines.append
+        if trace is not None:
+            (certdir / pp._TRACE_SWITCH_FILE).write_text(str(trace))
+            pp._TRACE_CACHE.clear()
         proxy.start()
         try:
+            if trace is not None:
+                proxy._trace_tick()  # the only thing that opens the handle
             hdrs, body = {}, []
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", path or self.POLICY,
@@ -20142,6 +20148,119 @@ class TestTheProfileQuestionIsNeverAnsweredAsAnotherAccount:
                 self.PROFILE, ua=self.CC, reject=reject, reply=reply,
                 reject_status=401)
             assert pp.remembered_pin_profile(certdir) is None, name
+
+
+class TestTheSettingsFetchAsksAsThePinnedAccount:
+    """CC POLLS `/api/claude_code/settings` HOURLY and writes the answer to
+    the shared `remote-settings.json`. On the live login's bearer, an
+    Enterprise org's settings (`disableBypassPermissionsMode`, `defaultMode`)
+    reached sessions whose work travels as the pin. So it is asked as the pin,
+    and, like the policy question, never answered as another account: a pin
+    that cannot mint, or whose token is refused (401/403), answers a local 503
+    rather than the live login's answer. A 404 on the pin's token is the
+    server's "no settings" (CC then rewrites the file to `{}`), so it is
+    relayed, never taken back. A cleared pin, or one that IS the live login,
+    keeps relaying.
+
+    The policy route's rule (`TestThePolicyQuestion...`), on the settings
+    route, with that class's helpers."""
+
+    SETTINGS = "/api/claude_code/settings"
+    h = TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount()
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_minted_token_swaps_and_the_trace_says_so(
+            self, certdir, monkeypatch):
+        """The session's (other org's) bearer never goes upstream."""
+        trace = certdir / "armed-trace.log"
+        status, seen = self.h._ask(
+            certdir,
+            self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
+            self.SETTINGS, reject=(), trace=trace)
+        assert status == 200 and seen == ["Bearer pin-token"], (status, seen)
+        assert f"GET {self.SETTINGS} pinned=True swapped=True" in \
+            trace.read_text()
+
+    def case_a_failed_mint_answers_503_and_the_neighbours_fall_open(
+            self, certdir, monkeypatch):
+        """Bare, with a query, with a trailing slash. THE CONTROLS, same
+        daemon state: the path boundary and a sibling still relay."""
+        for path in (self.SETTINGS, self.SETTINGS + "?x=1",
+                     self.SETTINGS + "/"):
+            lines = []
+            status, seen = self.h._ask(
+                certdir, self.h._provider(certdir, monkeypatch), path, lines)
+            assert status == 503 and seen == [], (path, status, seen)
+            assert any(f"GET {path} refused (503)" in ln
+                       and "managed-settings" in ln for ln in lines), lines
+        for path in (self.SETTINGS + "XYZ", "/api/claude_code/other"):
+            status, seen = self.h._ask(
+                certdir, self.h._provider(certdir, monkeypatch), path)
+            assert status == 200 and seen == ["Bearer session-bearer"], (
+                path, status, seen)
+
+    def case_a_refused_pin_token_answers_503_but_a_404_is_relayed(
+            self, certdir, monkeypatch):
+        """401/403 on the pin's token must not be resent as the live login.
+        A 404 is the pinned account's own "no settings": relayed, once."""
+        for code, want in ((403, 503), (401, 503), (404, 404)):
+            status, seen = self.h._ask(
+                certdir,
+                self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
+                self.SETTINGS, reject_status=code)
+            assert (status, seen) == (want, ["Bearer pin-token"]), (
+                code, status, seen)
+
+    def case_a_cleared_pin_and_the_live_login_still_relay(
+            self, certdir, monkeypatch):
+        for name, kw in (("cleared", {"pinned": False}),
+                         ("live login", {"active": "2"})):
+            status, seen = self.h._ask(
+                certdir, self.h._provider(certdir, monkeypatch, **kw),
+                self.SETTINGS)
+            assert status == 200 and seen == ["Bearer session-bearer"], (
+                name, status, seen)
+
+    def case_an_absolute_form_never_relays_the_session_bearer(
+            self, certdir, monkeypatch):
+        """`claude remote-control`'s path: a failed mint and a refused token
+        are 503 with no session bearer upstream; a 404 is relayed."""
+        got, seen = self.h._ask_absolute(
+            certdir, self.h._provider(certdir, monkeypatch), self.SETTINGS)
+        assert got.startswith(b"HTTP/1.1 503") and seen == [], (got[:40], seen)
+        for code, want in ((403, b"HTTP/1.1 503"), (404, b"HTTP/1.1 404")):
+            got, seen = self.h._ask_absolute(
+                certdir,
+                self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
+                self.SETTINGS, reject_status=code)
+            assert got.startswith(want) and len(seen) == 1 \
+                and b"Bearer pin-token" in seen[0], (code, got[:40], seen)
+
+    def case_a_settings_503_does_not_silence_a_following_blind_mint_line(
+            self, certdir):
+        """Its own cooldown slot, as the policy and profile routes have."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        class Tls:
+            def sendall(self, _b):
+                pass
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            proxy._refuse_stalled_mint(Tls(), "GET", self.SETTINGS, "settings")
+            proxy._refuse_stalled_mint(
+                Tls(), "POST", "/v1/environments/bridge", "blind")
+        finally:
+            pp._log_lifecycle = real_log
+        assert lines == [
+            f"GET {self.SETTINGS} refused (503): settings",
+            "POST /v1/environments/bridge refused (503): blind"], lines
 
 
 class TestEverySmallCaseHolder:

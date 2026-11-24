@@ -7507,11 +7507,24 @@ class TestIsPinnedRoute:
              "the policy that governs a pinned session is the PIN's; asking "
              "under the active account caches another org's denial for the "
              "life of the process"),
+            # CC's managed-settings fetch, polled hourly: asked on the live
+            # login's bearer it wrote an Enterprise org's settings
+            # (disableBypassPermissionsMode, defaultMode) to the shared
+            # remote-settings.json of sessions whose work travels as the pin.
+            # Exact match, with the query form, like the policy route.
+            ("/api/claude_code/settings", True,
+             "the managed settings a pinned session reads are the PIN's org's, "
+             "not the live login's"),
+            ("/api/claude_code/settings?x=1", True,
+             "the query form is the same read"),
+            ("/api/claude_code/settingsXYZ", False,
+             "the path boundary: only the settings route itself"),
             # The neighbour that must not be swept in by a prefix. Nothing
             # else under /api/claude_code/ is known to be ownership-decided,
             # so the rule is an exact match, same as /api/oauth/validate.
             ("/api/claude_code/other", False,
-             "only the policy question is pinned, not the whole subtree"),
+             "only the policy and settings questions are pinned, not the "
+             "whole subtree"),
             # THE IMAGE A PERSON ATTACHES ON claude.ai, and the third symptom
             # of the same cause as the two rows above.
             #
