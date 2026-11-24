@@ -25416,6 +25416,18 @@ class PinProxy:
         _log_lifecycle(
             f"swap refused ({code}) on {method} {clean_path}: {outcome}{more}")
 
+    def _serves_identity(self, swapped: bool, affinity) -> bool:
+        """Whether the account serving this request is the pin's identity, the
+        one Claude Code files a reply under (`_relay_response`'s
+        ``serves_identity``): the pinned swap, a kept slot that IS the pinned
+        one, else the host's own bearer (plain or followed), which is the
+        active account's, so only while the pin is the live login or cleared.
+        A provider that cannot say (no `current_target`) is a no."""
+        if affinity:
+            pinned = _pinned_slot(self._pin_token_provider)
+            return pinned is not None and str(affinity[0]) == str(pinned)
+        return swapped or _pin_stands_down(self._pin_token_provider)
+
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False,
                  bridge_hold: "tuple[str, threading.Event] | None" = None,
@@ -25617,6 +25629,7 @@ class PinProxy:
                 reject_on_auth_error=swapped,
                 drop_request_id=swapped and _is_profile_route(path),
                 affinity=affinity, follow=follow, ua=_ua,
+                serves_identity=lambda: self._serves_identity(swapped, affinity),
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
@@ -28681,9 +28694,17 @@ def _relay_response(
     follow: bool = False,
     tee: "_ReplyTee | None" = None,
     ua: str = "",
+    serves_identity=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``serves_identity`` answers, when called, whether the account that served
+    the reply is the identity the client files it under (the pin's). Claude Code
+    latches ``anthropic-ratelimit-unified-overage-in-use: true`` under that
+    identity, and with no Fable consent stored the latch ("credits required")
+    only /login clears, so a ``true`` from any other account is not relayed.
+    Called only for a reply carrying that header as ``true``.
 
     ``tee`` is handed the status and every body byte relayed (decoded, if the
     body is chunked), for `_SseReply`: it learns nothing of a response that was
@@ -29024,9 +29045,10 @@ def _relay_response(
             # false` would stop the retry the relay depends on. Stripped
             # either way.
             continue
-        # the client would latch a swapped account's credit billing as its own
-        if (reject_on_auth_error or affinity or follow) and (
-                kl == b"anthropic-ratelimit-unified-overage-in-use"):
+        # Only `true` latches, so only it asks who served. No `serves_identity`
+        # means the serving account cannot be told: dropped.
+        if (kl == b"anthropic-ratelimit-unified-overage-in-use" and vl == b"true"
+                and not (serves_identity is not None and serves_identity())):
             continue
         if kl in _HOP_BY_HOP_BYTES or (drop_request_id and kl == b"request-id"):
             continue
@@ -29110,6 +29132,7 @@ def _relay_response(
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
                 on_hop_trouble=on_hop_trouble, affinity=affinity,
                 drop_request_id=drop_request_id, follow=follow, tee=tee, ua=ua,
+                serves_identity=serves_identity,
             )
         return _relay_response(
             up, client, cid,
@@ -29118,6 +29141,7 @@ def _relay_response(
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             on_hop_trouble=on_hop_trouble, affinity=affinity,
             drop_request_id=drop_request_id, follow=follow, tee=tee, ua=ua,
+            serves_identity=serves_identity,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send

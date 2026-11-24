@@ -31985,50 +31985,97 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             chain.stop()
 
 
-class TestASwappedReplyDoesNotLatchItsCreditBilling:
+class TestAReplyAnotherAccountServedDoesNotLatchItsCreditBilling:
     """T3564. Claude Code files `anthropic-ratelimit-unified-overage-in-use:
     true` under the identity it holds (the pin's account), and with no Fable
     consent stored it latches "credits required" for the whole process, which
-    only /login clears. When another account served the request (a swapped,
-    kept or followed credential) the header is that account's billing, so it
-    is not relayed. The rest of the head, `status` included, still is."""
+    only /login clears. So the header is relayed only when the account that
+    served the reply IS that identity: the pinned swap, a kept slot that is the
+    pin's, or the host's own bearer while the pin is the live login. Any other
+    serving account, or one the pin cannot tell, loses the header. The rest of
+    the head, `status` included, still is relayed."""
 
     REPLY = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
              b"anthropic-ratelimit-unified-status: allowed\r\n"
              b"anthropic-ratelimit-unified-overage-in-use: true\r\n\r\nhi")
+    OVERAGE = "anthropic-ratelimit-unified-overage-in-use"
+    STATUS = "anthropic-ratelimit-unified-status"
 
-    @classmethod
-    def _head(cls, **relay_kwargs) -> bytes:
-        from cswap_pin.proxy import _relay_response
+    @pytest.fixture(autouse=True)
+    def _quiet(self, monkeypatch):
+        from cswap_pin import proxy as pp
 
-        up_a, up_b = socket.socketpair()
-        cl_a, cl_b = socket.socketpair()
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda *a, **k: None)
+
+    @staticmethod
+    def _provider(pinned="1", live_login=False):
+        """The pin's provider: it pins slot ``pinned``, which is the live login
+        (the host's own bearer is the identity's) or is not."""
+        def provider():
+            return "PIN-TOKEN"
+        provider.current_target = lambda: (pinned, "a@example.com")
+        provider.pin_stands_down = lambda: live_login
+        return provider
+
+    def _ask(self, certdir, provider, bearer, path="/v1/messages", **kw):
+        """One request through a real MITM: (reply headers, bearers the
+        upstream saw)."""
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, reply=self.REPLY)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        got: dict = {}
         try:
-            up_b.sendall(cls.REPLY)
-            up_b.shutdown(socket.SHUT_WR)
-            _relay_response(up_a, cl_a, 0, method="POST", path="/v1/messages",
-                            **relay_kwargs)
-            cl_a.shutdown(socket.SHUT_WR)
-            got = b""
-            while chunk := cl_b.recv(4096):
-                got += chunk
-            return got.partition(b"\r\n\r\n")[0].lower()
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", path, bearer=bearer,
+                headers_out=got, **kw)
         finally:
-            for s_ in (up_a, up_b, cl_a, cl_b):
-                try: s_.close()
-                except OSError: pass
+            proxy.stop()
+            upstream.stop()
+        assert status == 200, status
+        return got, upstream.auths_seen
 
-    @pytest.mark.parametrize("serving", [
-        {"reject_on_auth_error": True},
-        {"affinity": ("2", "kept@example.com")},
-        {"follow": True},
-    ], ids=["swapped", "kept", "followed"])
-    def test_a_swapped_reply_loses_overage_in_use_only(self, serving):
-        head = self._head(**serving)
-        assert b"anthropic-ratelimit-unified-overage-in-use" not in head, head
-        assert b"anthropic-ratelimit-unified-status: allowed" in head, head
+    def test_a_plain_reply_on_another_active_slot_loses_it(self, certdir):
+        got, auths = self._ask(certdir, self._provider(), "HOST-TOKEN")
+        assert auths == ["Bearer HOST-TOKEN"], auths  # the active slot's own
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
 
-    def test_the_clients_own_reply_keeps_both(self):
-        head = self._head()
-        assert b"anthropic-ratelimit-unified-overage-in-use: true" in head, head
-        assert b"anthropic-ratelimit-unified-status: allowed" in head, head
+    def test_a_plain_reply_while_the_active_slot_is_the_identity_keeps_it(
+            self, certdir):
+        got, auths = self._ask(
+            certdir, self._provider(live_login=True), "HOST-TOKEN")
+        assert auths == ["Bearer HOST-TOKEN"], auths
+        assert got[self.OVERAGE] == "true", got
+        assert got[self.STATUS] == "allowed", got
+
+    def test_a_pinned_swap_to_the_identity_keeps_it(self, certdir):
+        got, auths = self._ask(
+            certdir, self._provider(live_login=False), "HOST-TOKEN",
+            path="/api/oauth/validate")
+        assert auths == ["Bearer PIN-TOKEN"], auths  # served as the identity
+        assert got[self.OVERAGE] == "true", got
+        assert got[self.STATUS] == "allowed", got
+
+    @pytest.mark.parametrize("pinned, kept", [("2", False), ("1", True)],
+                             ids=["other-slot", "identity-slot"])
+    def test_a_kept_reply_keeps_it_only_on_the_identity_slot(
+            self, monkeypatch, certdir, pinned, kept):
+        """The session is kept on slot 1 (`tok-A`) while slot 2 is live."""
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        _A._seed("S", "tok-A")
+        got, auths = self._ask(
+            certdir, self._provider(pinned=pinned), "tok-B", body=_A.BODY,
+            extra_headers={"x-claude-code-session-id": "S"})
+        assert auths == ["Bearer tok-A"], auths
+        assert (got.get(self.OVERAGE) == "true") is kept, got
+        assert got[self.STATUS] == "allowed", got
+
+    def test_a_serving_account_the_pin_cannot_tell_loses_it(self, certdir):
+        """A bare callable has no identity to compare the serving account to."""
+        got, _ = self._ask(certdir, lambda: "PIN-TOKEN", "HOST-TOKEN")
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
