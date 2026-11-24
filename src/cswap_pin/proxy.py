@@ -5373,6 +5373,11 @@ def _is_profile_route(path: str) -> bool:
     return path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile"
 
 
+def _is_settings_route(path: str) -> bool:
+    """CC's managed-settings fetch, bare or with a query."""
+    return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/settings"
+
+
 # WHY a policy 503 says it, on the MITM and the absolute-form path alike.
 _POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
                    "could be minted; no other account answers it")
@@ -5382,6 +5387,10 @@ _PROFILE_NO_MINT = ("the account-profile question needs the pinned token and "
                     "none could be minted; no other account answers it")
 _PROFILE_REFUSED = ("the pinned token was refused ({code}) on the "
                     "account-profile question; no other account answers it")
+_SETTINGS_NO_MINT = ("the managed-settings fetch needs the pinned token and "
+                     "none could be minted; no other account answers it")
+_SETTINGS_REFUSED = ("the pinned token was refused ({code}) on the "
+                     "managed-settings fetch; no other account answers it")
 
 
 def _never_as_another_account(path: str):
@@ -5396,11 +5405,17 @@ def _never_as_another_account(path: str):
     /login falls back to the token exchange's ids (`tokenAccount`, the real
     account), so a mint that is only SLOW or DEFERRED answers the remembered
     profile instead (`_pin_token_or_memo`, T3510) and a token that cannot be
-    had at all is left to cswap (T3508)."""
+    had at all is left to cswap (T3508).
+
+    And the managed-settings route: the live login's answer is its org's
+    settings (`disableBypassPermissionsMode`, `defaultMode`), which CC writes
+    to the shared `remote-settings.json` of sessions that run as the pin."""
     if _is_policy_route(path):
         return _POLICY_NO_MINT, _POLICY_REFUSED
     if _is_profile_route(path):
         return _PROFILE_NO_MINT, _PROFILE_REFUSED
+    if _is_settings_route(path):
+        return _SETTINGS_NO_MINT, _SETTINGS_REFUSED
     return None
 
 
@@ -5514,9 +5529,17 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     # pin too. Asking under the active account applies one org's restrictions
     # to another org's session, which is the exact thing the pin exists to
     # prevent. EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same
-    # reason validate is: nothing else known under that subtree is decided by
-    # ownership, and a prefix would swap routes nobody has looked at.
-    if _is_policy_route(path):
+    # reason validate is: nothing else known under that subtree (bar the
+    # settings route below) is decided by ownership, and a prefix would swap
+    # routes nobody has looked at.
+    #
+    # ``/api/claude_code/settings`` (CC 2.1.330, hourly) on the live login's
+    # bearer wrote an Enterprise org's managed settings to
+    # ``remote-settings.json`` (disableBypassPermissionsMode, defaultMode), so
+    # every live session dropped out of bypassPermissions though its work
+    # travels as the pin. CC rewrites that file from its next successful
+    # answer, so the swap alone replaces a stale copy.
+    if _is_policy_route(path) or _is_settings_route(path):
         return True
     # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with the
     # OAuth bearer and renders any non-200 as "could not be downloaded". The
@@ -23738,7 +23761,8 @@ class PinProxy:
         stalled-store wording, which is the only cause this used to answer
         for.
 
-        THE ORG-POLICY AND PROFILE ROUTES EACH HAVE THEIR OWN COOLDOWN SLOT:
+        THE ORG-POLICY, PROFILE AND SETTINGS ROUTES EACH HAVE THEIR OWN
+        COOLDOWN SLOT:
         their 503s repeat for as long as the pin cannot mint, and sharing the
         budget would let that burst swallow the next blind-mint line above.
         """
@@ -23748,6 +23772,7 @@ class PinProxy:
         now = time.monotonic()
         slot = ("_policy_refused_at" if _is_policy_route(path)
                 else "_profile_refused_at" if _is_profile_route(path)
+                else "_settings_refused_at" if _is_settings_route(path)
                 else "_stall_refused_at")
         last = getattr(self, slot, None)
         if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
@@ -24600,7 +24625,9 @@ class PinProxy:
                     #
                     # NO `path=`/`certdir=`/`auth=` (T1041 finding 5): none of
                     # what they enable is owed here — the standalone RC
-                    # client's absolute-form routes gate on none of them.
+                    # client's absolute-form routes gate on none of them. The
+                    # ONE `path=` is the settings fetch's, whose 404 the relay
+                    # must not take back (see the status check there).
                     ptee = (_ProfileTee(self._certdir)
                             if retry and _is_profile_route(rel) else None)
                     result = _relay_response(
@@ -24609,6 +24636,7 @@ class PinProxy:
                         drop_request_id=retry and _is_profile_route(rel),
                         tee=ptee,
                         method=method,
+                        path=rel if _is_settings_route(rel) else None,
                         on_status=lambda st: (
                             _release_bridge_hold(),
                             setattr(self._local, "relayed", st)),
@@ -28754,6 +28782,9 @@ def _relay_response(
     # permanent; anything else is the origin's own answer and belongs to it.
     # A KEPT session's 404 is not a refusal of the account (see
     # `_affinity_relay_404`): it is relayed, and its 429 is taken back instead.
+    # THE SETTINGS FETCH'S 404 IS RELAYED TOO: on the pin's token it is that
+    # account's "no settings" (CC then writes `{}`), and taken back it would
+    # be answered by the live login's org.
     # A FOLLOWED request's is relayed too (T2670 measured a 404 is no account's
     # refusal), and its 403 is taken back only once it is known not to be the
     # access-grant refusal: the active account's grant 403 is what the 401
@@ -28790,7 +28821,8 @@ def _relay_response(
     if (reject_on_auth_error or affinity or following) and not _walled_401 and any(
         status_line.startswith(b"HTTP/1.1 " + c)
         for c in ((b"401", b"403", b"429") if kept
-                  else (b"401", b"403") if following
+                  else (b"401", b"403")
+                  if following or _is_settings_route(path or "")
                   else (b"401", b"403", b"404"))
     ):
         if _TRACE is not None:
