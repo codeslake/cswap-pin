@@ -29024,6 +29024,10 @@ def _relay_response(
             # false` would stop the retry the relay depends on. Stripped
             # either way.
             continue
+        # the client would latch a swapped account's credit billing as its own
+        if (reject_on_auth_error or affinity or follow) and (
+                kl == b"anthropic-ratelimit-unified-overage-in-use"):
+            continue
         if kl in _HOP_BY_HOP_BYTES or (drop_request_id and kl == b"request-id"):
             continue
         out.append(line)

@@ -31983,3 +31983,52 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
         finally:
             proxy.stop()
             chain.stop()
+
+
+class TestASwappedReplyDoesNotLatchItsCreditBilling:
+    """T3564. Claude Code files `anthropic-ratelimit-unified-overage-in-use:
+    true` under the identity it holds (the pin's account), and with no Fable
+    consent stored it latches "credits required" for the whole process, which
+    only /login clears. When another account served the request (a swapped,
+    kept or followed credential) the header is that account's billing, so it
+    is not relayed. The rest of the head, `status` included, still is."""
+
+    REPLY = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+             b"anthropic-ratelimit-unified-status: allowed\r\n"
+             b"anthropic-ratelimit-unified-overage-in-use: true\r\n\r\nhi")
+
+    @classmethod
+    def _head(cls, **relay_kwargs) -> bytes:
+        from cswap_pin.proxy import _relay_response
+
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        try:
+            up_b.sendall(cls.REPLY)
+            up_b.shutdown(socket.SHUT_WR)
+            _relay_response(up_a, cl_a, 0, method="POST", path="/v1/messages",
+                            **relay_kwargs)
+            cl_a.shutdown(socket.SHUT_WR)
+            got = b""
+            while chunk := cl_b.recv(4096):
+                got += chunk
+            return got.partition(b"\r\n\r\n")[0].lower()
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
+    @pytest.mark.parametrize("serving", [
+        {"reject_on_auth_error": True},
+        {"affinity": ("2", "kept@example.com")},
+        {"follow": True},
+    ], ids=["swapped", "kept", "followed"])
+    def test_a_swapped_reply_loses_overage_in_use_only(self, serving):
+        head = self._head(**serving)
+        assert b"anthropic-ratelimit-unified-overage-in-use" not in head, head
+        assert b"anthropic-ratelimit-unified-status: allowed" in head, head
+
+    def test_the_clients_own_reply_keeps_both(self):
+        head = self._head()
+        assert b"anthropic-ratelimit-unified-overage-in-use: true" in head, head
+        assert b"anthropic-ratelimit-unified-status: allowed" in head, head
