@@ -29024,6 +29024,11 @@ def _relay_response(
             # false` would stop the retry the relay depends on. Stripped
             # either way.
             continue
+        # Claude Code latches a `true` per process ("credits required", cleared
+        # only by /login) while the pin moves that process between accounts, so
+        # a latch set under any serving account outlives the next switch.
+        if kl == b"anthropic-ratelimit-unified-overage-in-use" and vl == b"true":
+            continue
         if kl in _HOP_BY_HOP_BYTES or (drop_request_id and kl == b"request-id"):
             continue
         out.append(line)

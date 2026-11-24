@@ -31983,3 +31983,139 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
         finally:
             proxy.stop()
             chain.stop()
+
+
+class TestAClientIsNeverToldItsCreditBillingIsInUse:
+    """T3564. Claude Code files `anthropic-ratelimit-unified-overage-in-use:
+    true` under the identity it holds and, with no Fable consent stored,
+    latches "credits required" for the whole process: only /login clears it.
+    The pin's job is to move that process between accounts, so a latch set
+    while ANY account served (the identity included) outlives the next switch.
+    The pin relays a `true` to no client, whoever served the reply; upstream
+    still bills the request itself. `false` and the rest of the head, `status`
+    included, are relayed as before."""
+
+    REPLY = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+             b"anthropic-ratelimit-unified-status: allowed\r\n"
+             b"anthropic-ratelimit-unified-overage-in-use: true\r\n\r\nhi")
+    OVERAGE = "anthropic-ratelimit-unified-overage-in-use"
+    STATUS = "anthropic-ratelimit-unified-status"
+
+    @pytest.fixture(autouse=True)
+    def _quiet(self, monkeypatch):
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_log_lifecycle", lambda *a, **k: None)
+
+    @pytest.fixture
+    def certdir(self, tmp_path):
+        # the follow switch (`settings.json`) sits beside `pin-proxy/`
+        return _make_certdir(_mkdir(tmp_path / "pin-proxy"))
+
+    @staticmethod
+    def _provider(pinned="1", live_login=False):
+        """The pin's provider: it pins slot ``pinned``, which is the live login
+        (the host's own bearer is the identity's) or is not."""
+        def provider():
+            return "PIN-TOKEN"
+        provider.current_target = lambda: (pinned, "a@example.com")
+        provider.pin_stands_down = lambda: live_login
+        return provider
+
+    def _ask(self, certdir, provider, bearer, path="/v1/messages",
+             reply=REPLY, **kw):
+        """One request through a real MITM: (reply headers, bearers the
+        upstream saw)."""
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, reply=reply)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        got: dict = {}
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", path, bearer=bearer,
+                headers_out=got, **kw)
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert status == 200, status
+        return got, upstream.auths_seen
+
+    @pytest.mark.parametrize("live_login", [False, True],
+                             ids=["other-active-slot", "identity-active-slot"])
+    def test_a_plain_reply_loses_it(self, certdir, live_login):
+        got, auths = self._ask(
+            certdir, self._provider(live_login=live_login), "HOST-TOKEN")
+        assert auths == ["Bearer HOST-TOKEN"], auths  # the active slot's own
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
+
+    def test_a_pinned_swap_loses_it(self, certdir):
+        got, auths = self._ask(certdir, self._provider(), "HOST-TOKEN",
+                               path="/api/oauth/validate")
+        assert auths == ["Bearer PIN-TOKEN"], auths  # served as the identity
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
+
+    @pytest.mark.parametrize("pinned", ["2", "1"],
+                             ids=["other-slot", "identity-slot"])
+    def test_a_kept_reply_loses_it(self, monkeypatch, certdir, pinned):
+        """The session is kept on slot 1 (`tok-A`) while slot 2 is live."""
+        _A = TestSessionAffinityOnMessages
+        _A._wire(monkeypatch, certdir)
+        _A._seed("S", "tok-A")
+        got, auths = self._ask(
+            certdir, self._provider(pinned=pinned), "tok-B", body=_A.BODY,
+            extra_headers={"x-claude-code-session-id": "S"})
+        assert auths == ["Bearer tok-A"], auths
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
+
+    def test_a_followed_reply_loses_it(self, monkeypatch, certdir):
+        TestInferenceFollows._arm(monkeypatch, certdir)
+        got, auths = self._ask(certdir, self._provider(), "HOST-TOKEN",
+                               ua=_DESKTOP_UA)
+        assert auths == ["Bearer ACTIVE"], auths  # the follow's bearer
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "allowed", got
+
+    def test_an_absolute_form_reply_loses_it(self, certdir):
+        """`_plain_relay` runs the same relay: its head is cleaned too."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(lambda req: self.REPLY)
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=self._provider(),
+                             rediscover_chain=True)
+            proxy.start()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(b"GET https://api.anthropic.com/v1/messages HTTP/1.1\r\n"
+                          b"Host: api.anthropic.com\r\n"
+                          b"Authorization: Bearer HOST-TOKEN\r\n\r\n")
+                got = b""
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+        head = got.decode().lower()
+        assert head.startswith("http/1.1 200"), got
+        assert self.OVERAGE not in head, got
+        assert f"{self.STATUS}: allowed" in head, got
+
+    def test_a_false_value_is_relayed(self, certdir):
+        got, _ = self._ask(certdir, self._provider(), "HOST-TOKEN",
+                           reply=self.REPLY.replace(b": true", b": false"))
+        assert got[self.OVERAGE] == "false", got
+        assert got[self.STATUS] == "allowed", got
