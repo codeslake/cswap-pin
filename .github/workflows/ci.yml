@@ -90,6 +90,8 @@ jobs:
           # a NAMED failure. Restore parallelism when the thread hygiene is
           # fixed, not before -- a green that depends on which worker got which
           # test is not a green.
+          # `-m "not needs_host_seam"` keeps the `release_only` tests: they are
+          # only deselected by a developer's quick command, never here.
           WORKERS=0
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \

@@ -4540,6 +4540,10 @@ class TestAHeldDaemonThatStoppedAccepting:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     class _Proc:
         """A `Popen` double: `wait(timeout)` blocks until `terminate()`, and
         raises `TimeoutExpired` when it runs out, as the real one does."""
@@ -4697,6 +4701,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         finally:
             holder.stop()
 
+    @release_only_case
     def case_a_slow_health_answer_is_not_silence(self, tmp_path, monkeypatch):
         """T1935: on a loaded host (wmac, 2026-10-06: one `/health` reply took
         1007 ms against 1.0 s) a daemon that still accepts and serves answered
@@ -4714,6 +4719,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         finally:
             holder.stop()
 
+    @release_only_case
     def case_the_last_long_ask_spares_a_daemon_the_probes_missed(
             self, tmp_path, monkeypatch):
         """Every ordinary probe times out before the 1.5 s answer, so the
@@ -4926,6 +4932,7 @@ class TestAHeldDaemonThatStoppedAccepting:
             predecessor.exit()
             holder.stop()
 
+    @release_only_case
     def case_a_parked_holder_repairs_a_published_successor_that_stopped_accepting(
             self, tmp_path, monkeypatch):
         """T3107: the supervisor is parked on a predecessor that drains by
@@ -4968,6 +4975,7 @@ class TestAHeldDaemonThatStoppedAccepting:
             predecessor.exit()
             holder.stop()
 
+    @release_only_case
     def case_a_parked_successor_that_exited_clean_is_repaired_only_while_the_pin_is_wanted(
             self, tmp_path, monkeypatch):
         """T3107: a clean exit is a decision, not a failure. The parked arm

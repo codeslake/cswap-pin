@@ -28,7 +28,7 @@ import pytest
 
 from cswap_pin.proxy import ensure_ca
 
-from conftest import PIN_STAMP, run_cases, short_root
+from conftest import PIN_STAMP, release_only_case, run_cases, short_root
 
 
 @pytest.fixture(autouse=True)
@@ -31695,6 +31695,12 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             self, request, tmp_path_factory,
             extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(
+            self, request, tmp_path_factory, release_only=True,
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
+
     def _store(self, monkeypatch, owner_expires=FAR, owner_refresh="rt-c",
                quarantined=()):
         """cswap's account store: four slots, the owner's (3) the one a case
@@ -31886,6 +31892,7 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             proxy.stop()
             upstream.stop()
 
+    @release_only_case
     def case_the_memo_is_bounded_and_two_writers_keep_each_others_entries(
             self, certdir, monkeypatch):
         import threading
