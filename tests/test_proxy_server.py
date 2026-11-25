@@ -28,7 +28,7 @@ import pytest
 
 from cswap_pin.proxy import ensure_ca
 
-from conftest import PIN_STAMP, release_only_case, run_cases, short_root
+from conftest import PIN_STAMP, run_cases, short_root
 
 
 @pytest.fixture(autouse=True)
@@ -15200,10 +15200,9 @@ class TestDrainReportsWhatItCut:
             assert len(ended) == 1, (
                 f"`on_close` ran {len(ended)} times for one pair: {ended!r}")
         finally:
-            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair but
-            # leaves its sockets' selector keys, and a later test whose new
-            # socket reuses a closed fd number then has `add` swallow the
-            # KeyError and close its pair, so the tunnel never opens.
+            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair, and
+            # (since T3572) its selector keys, but only `release_pairs` runs the
+            # pair's `on_close` and closes the sockets.
             _PUMP.release_pairs()
             _PUMP.reset_for_tests()
             for s_ in (feed, a, b, sink, feed2, c, d, sink2):
@@ -31695,12 +31694,6 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             self, request, tmp_path_factory,
             extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
 
-    @pytest.mark.release_only
-    def test_all_release_only(self, request, tmp_path_factory):
-        run_cases(
-            self, request, tmp_path_factory, release_only=True,
-            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))})
-
     def _store(self, monkeypatch, owner_expires=FAR, owner_refresh="rt-c",
                quarantined=()):
         """cswap's account store: four slots, the owner's (3) the one a case
@@ -31892,7 +31885,6 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             proxy.stop()
             upstream.stop()
 
-    @release_only_case
     def case_the_memo_is_bounded_and_two_writers_keep_each_others_entries(
             self, certdir, monkeypatch):
         import threading
@@ -31910,6 +31902,12 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
                 pp._owner_remember(certdir, f"cse_race{t}x{r}", self.OWNER)
 
         ts = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
+        # `_spawn_lock` retries on a fixed `time.sleep(0.1)`, which was 9.7 s of
+        # this case's cost. The writers poll at 5 ms instead (T3572): the same
+        # 120 contended writes, through the same lock, with more races.
+        real_sleep = time.sleep
+        monkeypatch.setattr(time, "sleep", lambda s: real_sleep(
+            0.005 if threading.current_thread() in ts else s))
         for t in ts: t.start()
         for t in ts: t.join()
         got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]

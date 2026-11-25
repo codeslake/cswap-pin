@@ -365,7 +365,7 @@ def test_every_case_has_a_driver():
                 cases.append(line.strip())
 
     assert not dead, (
-        f"{len(dead)} class(es) have `case_*` methods that never run — no "
+        f"{len(dead)} class(es) have `case_*` methods that never run: no "
         f"`test_all` driver, or `@release_only_case` cases and no "
         f"`test_all_release_only`:\n"
         + "\n".join(f"  {f}::{c} ({n})" for f, c, n in dead)
