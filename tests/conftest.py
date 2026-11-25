@@ -874,12 +874,29 @@ except PackageNotFoundError:
 
 PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 
+
+def release_only_case(case):
+    """Mark a `case_*` whose cost is a real process or a fixed product wait.
+
+    The class's `test_all` skips it and its `test_all_release_only`, which
+    carries `pytest.mark.release_only`, runs it: the declared quick command
+    deselects that marker, ci.yml and publish.yml still run it.
+    """
+    case.release_only = True
+    return case
+
+
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
-# overhead is not the cost — but 332 collected items is more surface than the
-# behaviour warrants, and each one re-pays the autouse fixtures. `run_cases`
-# runs every `case_*` method of a class inside ONE pytest test, giving each its
-# own tmp_path and its own monkeypatch so a case cannot leak into the next.
+# overhead is not the cost, but one collected item per case is more surface
+# than the behaviour warrants, and each one re-pays the autouse fixtures.
+# `run_cases` runs the `case_*` methods of a class inside ONE pytest test,
+# giving each its own tmp_path and its own monkeypatch so a case cannot leak
+# into the next. A case marked `@release_only_case` (a real process or a fixed
+# product wait) is left to the class's SECOND driver, `test_all_release_only`
+# with `pytest.mark.release_only`, which the declared quick command deselects
+# and ci.yml and publish.yml run: each case runs once, under exactly one
+# driver. test_meta's `test_every_case_has_a_driver` holds both drivers.
 #
 # WHAT THIS MUST NOT LOSE, and does not:
 #  - INDEPENDENCE. Each case gets a fresh MonkeyPatch (undone in a finally) and
@@ -897,14 +914,11 @@ PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 #    and a failure among them still gets raised. Only when every case in the
 #    run skipped does this itself skip, naming each one; a mix of skips and a
 #    clean pass surfaces the skips as a warning rather than going quiet.
-def run_cases(instance, request, tmp_path_factory, extra=None):
-    """Run every `case_*` method of `instance`, isolated, reporting all failures.
+def run_cases(instance, request, tmp_path_factory, extra=None, release_only=False):
+    """Run the `case_*` methods of `instance`, isolated, reporting all failures.
 
-    `instance` may be a LIST of holders — several small classes sharing one
-    pytest test. They are run separately (own instance, own helpers) rather
-    than merged by inheritance, because three of this suite's classes define a
-    `_ca` / `_cfg` / `_ours` helper with DIFFERENT meanings and a shared MRO
-    would have handed every case just one of them.
+    Those marked `@release_only_case` only when `release_only` is set, the rest
+    only when it is not.
 
     A case takes the fixtures it names in its signature, resolved from `extra`
     plus the per-case `tmp_path` / `monkeypatch` this builds. Anything else it
@@ -914,16 +928,16 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
 
     from _pytest.monkeypatch import MonkeyPatch
 
-    holders = instance if isinstance(instance, (list, tuple)) else [instance]
-    work = []
-    for holder in holders:
-        cls = type(holder)
-        for n in sorted(dir(cls)):
-            if n.startswith("case_") and callable(getattr(holder, n)):
-                work.append((holder, f"{cls.__name__}::{n}", getattr(holder, n)))
-    module_factories = getattr(
-        sys.modules[type(holders[0]).__module__], "case_fixtures", {}
-    )
+    cls = type(instance)
+    work = [
+        (instance, f"{cls.__name__}::{n}", getattr(instance, n))
+        for n in sorted(dir(cls))
+        if n.startswith("case_") and callable(getattr(instance, n))
+        and getattr(getattr(instance, n), "release_only", False) == release_only
+    ]
+    if not work:
+        pytest.fail(f"{cls.__name__}: no case selected (release_only={release_only})")
+    module_factories = getattr(sys.modules[cls.__module__], "case_fixtures", {})
     failures = []
     skipped = []
 

@@ -117,11 +117,12 @@ jobs:
           # So the release gate does not run workers at all. `-n 0` distributes
           # nothing and deselects nothing, so coverage is unchanged, and a test
           # that really does take a worker down becomes a named failure instead
-          # of a silent one. It costs about twenty seconds.
+          # of a silent one. It costs minutes now, not twenty seconds.
           #
-          # ci.yml keeps `-n 4` on Linux deliberately: a flake there is red,
-          # visible, and one click from a re-run. Here it is a version that
-          # looks released and is not.
+          # ci.yml runs one process too (its WORKERS=0 note). BOTH select only
+          # `not needs_host_seam`: the `release_only` tests (real holder, daemon
+          # and standby processes) that a developer's quick command deselects
+          # run here and on every CI run, so do not add `and not release_only`.
           WORKERS=0
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \

@@ -9902,6 +9902,37 @@ def test_a_proxy_accept_loop_serving_before_run_cases_is_stopped_and_not_blamed(
         srv._srv.close()
 
 
+def test_a_pump_reset_forgets_the_selector_keys_of_sockets_a_case_closed():
+    """T3572: `reset_for_tests` cleared the maps and left the selector's keys,
+    so a socket a case closed itself (never through `release_pairs`) kept its
+    fd number registered, and the next pair to land on it had `add` swallow the
+    KeyError and close that pair: `release_pairs` read 0 where it held a
+    tunnel. Which case failed depended on what ran before it (the suite lost a
+    fixed order when the duplicate aggregators went), so the reset is where it
+    is fixed. The key is filed by hand: through `add`, the loop thread may
+    clean the pair up before the reset and hide the leftover."""
+    import selectors
+
+    import cswap_pin.proxy as pp
+
+    a, b = socket.socketpair()
+    with pp._PUMP._lock:
+        pp._PUMP._sel.register(a, selectors.EVENT_READ)
+    stale = a.fileno()
+    a.close()
+    b.close()
+    pp._PUMP.reset_for_tests()
+    c, d = socket.socketpair()      # the lowest free fds are the stale ones
+    try:
+        assert stale in (c.fileno(), d.fileno()), "the fd number was not reused"
+        pp._PUMP.add(c, d, lambda: None, kind="bridge")
+        assert pp._PUMP.release_pairs("bridge") == 1, (
+            "the pair was closed at `add`: a stale selector key held its fd")
+    finally:
+        c.close()
+        d.close()
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
@@ -15169,10 +15200,9 @@ class TestDrainReportsWhatItCut:
             assert len(ended) == 1, (
                 f"`on_close` ran {len(ended)} times for one pair: {ended!r}")
         finally:
-            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair but
-            # leaves its sockets' selector keys, and a later test whose new
-            # socket reuses a closed fd number then has `add` swallow the
-            # KeyError and close its pair, so the tunnel never opens.
+            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair, and
+            # (since T3572) its selector keys, but only `release_pairs` runs the
+            # pair's `on_close` and closes the sockets.
             _PUMP.release_pairs()
             _PUMP.reset_for_tests()
             for s_ in (feed, a, b, sink, feed2, c, d, sink2):
@@ -20261,39 +20291,6 @@ class TestTheSettingsFetchAsksAsThePinnedAccount:
         assert lines == [
             f"GET {self.SETTINGS} refused (503): settings",
             "POST /v1/environments/bridge refused (503): blind"], lines
-
-
-class TestEverySmallCaseHolder:
-    """Every small case-holder in this file, as ONE pytest test.
-
-    Each holder is run SEPARATELY (its own instance, its own helpers)
-    rather than merged by inheritance: three of these classes define a
-    `_ca` / `_cfg` / `_ours` helper with different meanings, and a
-    shared MRO would have handed every case just one of them.
-    A failure still names the class its case came from.
-    """
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(
-            [
-                TestStreamingRelay(),
-                TestChunkedRequestBodiesReachUpstream(),
-                TestTheChainsCredentialIsSent(),
-                TestLoopbackChainTrust(),
-                TestLongPollSurvives(),
-                TestAbsoluteFormPassthrough(),
-                TestHealthEndpoint(),
-                TestKeepAlive(),
-                TestWebSocketUpgrade(),
-                TestBlindTunnelIsTraced(),
-                TestBlindTunnelFallsBackWhenChainRefuses(),
-                TestOptimisticConnectIsDetected(),
-                TestTheTrustFileActuallyVerifies(),
-                TestTheKillGateIdentifiesItsTarget(),
-                ],
-            request,
-            tmp_path_factory,
-        )
 
 
 class TestAHandoverMidDrainDropsTheClock:
@@ -31905,6 +31902,12 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
                 pp._owner_remember(certdir, f"cse_race{t}x{r}", self.OWNER)
 
         ts = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
+        # `_spawn_lock` retries on a fixed `time.sleep(0.1)`, which was 9.7 s of
+        # this case's cost. The writers poll at 5 ms instead (T3572): the same
+        # 120 contended writes, through the same lock, with more races.
+        real_sleep = time.sleep
+        monkeypatch.setattr(time, "sleep", lambda s: real_sleep(
+            0.005 if threading.current_thread() in ts else s))
         for t in ts: t.start()
         for t in ts: t.join()
         got = json.loads((certdir / pp._OWNERS_FILE).read_text())["rows"]

@@ -37,7 +37,7 @@ from cswap_pin.proxy import (
 # stubs the module attribute for every test.
 from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
-from conftest import PIN_STAMP, run_cases, short_root
+from conftest import PIN_STAMP, release_only_case, run_cases, short_root
 
 # A pid no process can hold, for a record the code under test probes with a
 # real `os.kill(pid, 0)`. A bare 999999 is below this box's pid_max (4194304)
@@ -4540,6 +4540,10 @@ class TestAHeldDaemonThatStoppedAccepting:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     class _Proc:
         """A `Popen` double: `wait(timeout)` blocks until `terminate()`, and
         raises `TimeoutExpired` when it runs out, as the real one does."""
@@ -4697,6 +4701,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         finally:
             holder.stop()
 
+    @release_only_case
     def case_a_slow_health_answer_is_not_silence(self, tmp_path, monkeypatch):
         """T1935: on a loaded host (wmac, 2026-10-06: one `/health` reply took
         1007 ms against 1.0 s) a daemon that still accepts and serves answered
@@ -4714,6 +4719,7 @@ class TestAHeldDaemonThatStoppedAccepting:
         finally:
             holder.stop()
 
+    @release_only_case
     def case_the_last_long_ask_spares_a_daemon_the_probes_missed(
             self, tmp_path, monkeypatch):
         """Every ordinary probe times out before the 1.5 s answer, so the
@@ -4926,6 +4932,7 @@ class TestAHeldDaemonThatStoppedAccepting:
             predecessor.exit()
             holder.stop()
 
+    @release_only_case
     def case_a_parked_holder_repairs_a_published_successor_that_stopped_accepting(
             self, tmp_path, monkeypatch):
         """T3107: the supervisor is parked on a predecessor that drains by
@@ -4968,6 +4975,7 @@ class TestAHeldDaemonThatStoppedAccepting:
             predecessor.exit()
             holder.stop()
 
+    @release_only_case
     def case_a_parked_successor_that_exited_clean_is_repaired_only_while_the_pin_is_wanted(
             self, tmp_path, monkeypatch):
         """T3107: a clean exit is a decision, not a failure. The parked arm
@@ -13176,6 +13184,76 @@ class TestDaemonPortStability:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
+    @staticmethod
+    def _hammer(port, stop, refused, served, connect=socket.create_connection,
+                stall_s=0.5):
+        """A REQUEST, not a connect. A bare `create_connection().close()`
+        cannot see the failure that matters here.
+
+        While a departing daemon drains, the port stays BOUND (the
+        holder's socket queues arrivals), so a connect always succeeds
+        and `refused` is structurally 0 no matter how long nobody is
+        behind it. Measured on host-a during a 30s held-exit drain:
+        refused=0, and 30 requests died on a 3s timeout with no reply.
+        A refused-only hammer calls that window healthy.
+
+        So this sends a CONNECT and requires an answer. Something that
+        accepts and never replies counts as a failure, which is what it
+        is to a session.
+        """
+        while not stop.is_set():
+            began = time.monotonic()
+            try:
+                s = connect(("127.0.0.1", port), timeout=2)
+            except OSError as exc:
+                refused.append(repr(exc))
+                time.sleep(0.002)
+                continue
+            # A CONNECT THAT HUNG AND THEN LANDED IS A HOLE TOO. One thread: a
+            # connect the kernel does not answer holds it, and when it lands
+            # on the successor it is neither refused nor reset, so it was
+            # never counted. KNOWN: T1294 measured a macOS CI connect that
+            # timed out instead of being refused, and a temporary emulation
+            # of a 1s stall read this control as 0. NOT MEASURED: that macOS
+            # did it in PR #194's run (see the warning `_handover` raises when
+            # it counts one). `stall_s` assumes a connect to a listening
+            # loopback socket answers far inside it: on Linux at load 9 to
+            # 11 the longest connect in 5 runs was 1.5ms (control arm) and
+            # 0.3ms (hand-down arm), and 0.5s is over 300 times that.
+            took = time.monotonic() - began
+            if took > stall_s:
+                refused.append(f"connect stalled {took:.2f}s")
+            try:
+                # AS LONG AS THE SPAWN WAIT, NOT SHORTER. The holder
+                # queues a request that arrives while the successor
+                # boots, and a boot is 2.3s on a core shared four ways
+                # (measured), so a 2s wait read that queued request as
+                # dropped: 10 of 12 runs failed with exactly one
+                # "no reply (timeout)". A real hang is tens of seconds
+                # (the 30s held-exit drain in the docstring), so this
+                # still sees it.
+                s.settimeout(5)
+                s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                          b"Host: api.anthropic.com:443\r\n\r\n")
+                if s.recv(64):
+                    served.append(1)
+                else:
+                    refused.append("no reply (EOF)")
+            except socket.timeout:
+                refused.append("no reply (timeout)")
+            except OSError as exc:
+                refused.append(repr(exc))
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            time.sleep(0.002)
+
     @staticmethod
     def _probe_no_refusal_window(addr, other_pid_seen, deadline_s=5,
                                  connect_timeout_s=3):
@@ -13225,6 +13303,24 @@ class TestDaemonPortStability:
         finally:
             probe.close()
 
+    def case_the_hammer_counts_a_connect_that_stalled_and_then_landed(self):
+        """The one outcome the hammer used to miss: a connect that hangs past
+        the window and then succeeds. A fake `connect` stands in for it."""
+        a, b = socket.socketpair()
+        b.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+        stop, refused, served = threading.Event(), [], []
+
+        def stalled(addr, timeout):
+            time.sleep(0.1)
+            stop.set()      # one iteration is enough
+            return a
+
+        self._hammer(0, stop, refused, served, connect=stalled, stall_s=0.05)
+        b.close()
+        assert served == [1] and len(refused) == 1, (served, refused)
+        assert refused[0].startswith("connect stalled"), refused
+
+    @release_only_case
     def case_a_real_spawned_successor_drops_no_connection(
         self, tmp_path, monkeypatch
     ):
@@ -13249,6 +13345,7 @@ class TestDaemonPortStability:
         import socket
         import threading
         import time
+        import warnings
 
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PinProxy, ensure_ca
@@ -13288,56 +13385,9 @@ class TestDaemonPortStability:
             refused, served = [], []
             stop = threading.Event()
 
-            def hammer():
-                """A REQUEST, not a connect. A bare `create_connection().close()`
-                cannot see the failure that matters here.
-
-                While a departing daemon drains, the port stays BOUND — the
-                holder's socket queues arrivals — so a connect always succeeds
-                and `refused` is structurally 0 no matter how long nobody is
-                behind it. Measured on host-a during a 30s held-exit drain:
-                refused=0, and 30 requests died on a 3s timeout with no reply.
-                A refused-only hammer calls that window healthy.
-
-                So this sends a CONNECT and requires an answer. Something that
-                accepts and never replies counts as a failure, which is what it
-                is to a session.
-                """
-                while not stop.is_set():
-                    try:
-                        s = socket.create_connection(("127.0.0.1", port), timeout=2)
-                    except OSError as exc:
-                        refused.append(repr(exc))
-                        time.sleep(0.002)
-                        continue
-                    try:
-                        # AS LONG AS THE SPAWN WAIT, NOT SHORTER. The holder
-                        # queues a request that arrives while the successor
-                        # boots, and a boot is 2.3s on a core shared four ways
-                        # (measured), so a 2s wait read that queued request as
-                        # dropped: 10 of 12 runs failed with exactly one
-                        # "no reply (timeout)". A real hang is tens of seconds
-                        # (the 30s held-exit drain in the docstring), so this
-                        # still sees it.
-                        s.settimeout(5)
-                        s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
-                                  b"Host: api.anthropic.com:443\r\n\r\n")
-                        if s.recv(64):
-                            served.append(1)
-                        else:
-                            refused.append("no reply (EOF)")
-                    except socket.timeout:
-                        refused.append("no reply (timeout)")
-                    except OSError as exc:
-                        refused.append(repr(exc))
-                    finally:
-                        try:
-                            s.close()
-                        except OSError:
-                            pass
-                    time.sleep(0.002)
-
-            h = threading.Thread(target=hammer, daemon=True)
+            h = threading.Thread(
+                target=self._hammer, args=(port, stop, refused, served),
+                daemon=True)
             h.start()
             time.sleep(0.3)
             base = len(refused)
@@ -13390,6 +13440,11 @@ class TestDaemonPortStability:
                 f"the successor came up on {spawned}, not {port} — this run "
                 f"measures a port change, not a handover"
             )
+            stalls = [r for r in refused[base:] if r.startswith("connect stalled")]
+            if stalls:
+                warnings.warn(
+                    f"the {'hand-down' if hand_down else 'control'} arm counted "
+                    f"{len(stalls)} stalled connect(s): {stalls[:3]}")
             return len(refused) - base, len(served)
 
         # REAP BOTH ARMS, WHATEVER HAPPENS. This case starts REAL detached
@@ -13400,12 +13455,13 @@ class TestDaemonPortStability:
         from conftest import _reap_pin_processes
 
         try:
-            control_refused, _ = _handover(hand_down=False)
+            control_refused, control_served = _handover(hand_down=False)
             assert control_refused > 0, (
                 "THE CONTROL DID NOT FAIL. Handing the port NUMBER over leaves "
                 "a hole the successor's start-up cannot avoid, so a run with "
                 "zero refusals here means the hammer is not measuring the "
-                "window — and the pass below would prove nothing"
+                "window, and the pass below would prove nothing "
+                f"(it was answered {control_served} times)"
             )
 
             refused, served = _handover(hand_down=True)
@@ -15523,6 +15579,7 @@ print("OK", port)
             proxy.stop()
             squatter.close()
 
+    @release_only_case
     def case_recycling_a_held_daemon_keeps_the_port_and_one_holder(
         self, tmp_path
     ):
@@ -16574,6 +16631,7 @@ print("OK", port)
         """(a2), T3107: the tick after a miss finds the sidecar the holder
         wrote when it spawned the successor, and asks nothing: not the signal
         (the holder would decline it), not the announcement."""
+        import signal
         import subprocess
         import sys
 
@@ -16618,7 +16676,10 @@ print("OK", port)
                 pass
             seen = (list(signalled), list(exited), list(released))
         finally:
-            booting.kill()
+            # The REAL kill: `booting.kill()` goes through the `os.kill` this
+            # case patched, which swallowed it and left `wait()` on the 60 s
+            # child (60.02 s, measured).
+            real_kill(booting.pid, signal.SIGKILL)
             booting.wait()
         assert seen == ([], [], []), (
             f"a tick beside a booting successor acted: signalled, exited, "
@@ -29956,70 +30017,6 @@ class TestTheStallPredicateOnACappedArm:
             "comment at the wait loop, it describes the opposite")
 
 
-class TestEverySmallCaseHolder:
-    """Every small case-holder in this file, as ONE pytest test.
-
-    Each holder is run SEPARATELY (its own instance, its own helpers)
-    rather than merged by inheritance: three of these classes define a
-    `_ca` / `_cfg` / `_ours` helper with different meanings, and a
-    shared MRO would have handed every case just one of them.
-    A failure still names the class its case came from.
-    """
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(
-            [
-                TestLiveRemoteControlSessions(),
-                TestTheStallPredicateOnACappedArm(),
-                TestTheSweepWillNotCloseARunningWorker(),
-                TestRepinIsLive(),
-                TestIsPinnedRoute(),
-                TestParseUpstreamProxy(),
-                TestResolvePinToken(),
-                TestDaemonState(),
-                TestEnsureProxyLifecycle(),
-                TestKillDaemon(),
-                TestDaemonSignalTeardown(),
-                TestOrphanSweep(),
-                TestWorkerJwtRoutesAreNotSwapped(),
-                TestUltrareviewIsPinned(),
-                TestPinTokenRefreshIsSerialized(),
-                TestAmbientProxyPrefersTheLauncherProxy(),
-                TestNarrowingIsDeliberatelyUnguarded(),
-                TestAHolderDoesNotOutliveItsLauncher(),
-                TestTheGateDisarmsWhenThePinIsCleared(),
-                TestArmingReportsWhoItCutsOff(),
-                TestABlindDaemonIsNotReusedForever(),
-                TestSharedBundleGuardMatchesNode(),
-                TestTheKillBudgetOutlastsTheDrain(),
-                TestTheOracleWorksOnRUNTIMESWEDoNotDevelopOn(),
-                TestTheOracleTestsRunWhereTheyClaimTo(),
-                TestTheOracleIsAVetoNeverAnApproval(),
-                TestTheSalvageArmLogsWhatItDid(),
-                TestTheOwnershipGuardCannotBeFakedByName(),
-                TestTheMissingLeafArmStaysUnknown(),
-                TestTheProbeAsksAboutTHISBundle(),
-                TestTheArmorCheckIsNotAcceptingEmptiness(),
-                TestAnEmptyArmorIsNotIntactArmor(),
-                TestSalvageRefusesTheSameArmorThePredicateDoes(),
-                TestTheBlankLineRuleIsAnchoredAndMeansWhitespace(),
-                TestATruncatedBundleIsRefusedNotAccepted(),
-                TestTheLastLineRuleAppliesToCertificatesToo(),
-                TestTheEmptyCAGuardIsOnBothSidesOfTheSeam(),
-                TestTheEmptyCAGuardCoversTheOTHERMergeToo(),
-                TestTheUnMergeBranchReadsTheFileItReturns(),
-                TestTheFilterKeepsBlocksAfterTheTearToo(),
-                TestLoadCertSurvivesAnAmbientErrorFilter(),
-                TestCarriesUsesTheSameGuardAsEverySite(),
-                TestLoadCertDoesNotRaceItself(),
-                TestAReleaseFailureDoesNotLookLikeSuccess(),
-                TestASalvageWriteFailureNeverCostsOurOwnCA(),
-                ],
-            request,
-            tmp_path_factory,
-        )
-
-
 class TestAHolderDoesNotOutliveItsLauncher:
     """A holder whose launcher is SIGKILLed must not become an immortal orphan.
 
@@ -35671,6 +35668,10 @@ else:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     @staticmethod
     def _until(what, fn, timeout):
         deadline = time.monotonic() + timeout
@@ -35899,6 +35900,7 @@ else:
         finally:
             proxy.stop(drain=0)
 
+    @release_only_case
     def case_a_denied_lineage_is_moved_into_the_callers_without_a_cut(
             self, tmp_path, monkeypatch):
         """THE WHOLE PROPERTY, with real processes: the caller's ensure starts
@@ -36093,6 +36095,7 @@ else:
             new = set(p.name for p in t.certdir.iterdir()) - set(before)
             assert not new, f"ensure left new files behind: {new}"
 
+    @release_only_case
     def case_a_successor_that_never_publishes_cuts_nothing(
             self, tmp_path, monkeypatch):
         """FAILURE ARM. The relocation (`_take_the_socket_over`, which the
@@ -36234,6 +36237,7 @@ else:
             lsn.close()
             shutil.rmtree(certdir, ignore_errors=True)
 
+    @release_only_case
     def case_a_holder_born_of_a_caller_that_died_refuses_instead_of_stranding(
             self, tmp_path, monkeypatch):
         """A caller killed between its Popen and the new holder's adoption
@@ -36461,6 +36465,7 @@ else:
         pp.relocate_main(tmp_path, "2", "a@b.c")
         assert moved == [], "the helper moved a daemon of other code"
 
+    @release_only_case
     def case_ensure_returns_at_once_while_the_move_is_in_progress(
             self, tmp_path, monkeypatch):
         """NO LAUNCH BLOCKS ON A RELOCATION. The old daemon looks for the
@@ -36947,6 +36952,7 @@ else:
             f"(T3107): released={released} exited={exited}")
         assert signalled == [os.getppid()], "the control did not ask"
 
+    @release_only_case
     def case_a_killed_draining_daemon_is_not_replaced_by_its_old_holder(
             self, tmp_path, monkeypatch):
         """WITH REAL PROCESSES. After the move the old daemon drains (a held
@@ -37006,6 +37012,7 @@ else:
                 f"the old lineage's standby is still armed: {standbys}")
             held.close()
 
+    @release_only_case
     def case_a_launch_during_the_helpers_spawn_wait_is_not_held(
             self, tmp_path, monkeypatch):
         """THE REAL `_spawn_daemon`, with only the successor's holder withheld
@@ -37107,6 +37114,7 @@ else:
         finally:
             serving.close()
 
+    @release_only_case
     def case_a_daemon_in_another_pid_namespace_is_pulled_when_the_caller_opts_in(
             self, tmp_path, monkeypatch):
         """T2939, with real processes: the pin holder runs in one pid
@@ -37862,6 +37870,10 @@ else:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     class _Origin:
         """A plain-HTTP origin whose reply is mid-body until ``release``."""
 
@@ -38042,6 +38054,7 @@ else:
         assert int(st["port"]) == t.port, "the port moved"
         self._one_daemon_is_left(t, int(st["pid"]))
 
+    @release_only_case
     def case_a_successor_that_dies_in_a_short_window_is_respawned(
             self, monkeypatch):
         with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
@@ -38091,6 +38104,7 @@ else:
                 _reap_pin_processes(b / "pin-proxy")
                 shutil.rmtree(b, ignore_errors=True)
 
+    @release_only_case
     def case_a_window_of_several_seconds_takes_several_respawns(
             self, monkeypatch):
         """The window is ~3 s: the successor is born into the missing module
@@ -38102,6 +38116,7 @@ else:
                 f"{died} successor(s) died: the window was not several "
                 f"respawns wide\n" + t.log())
 
+    @release_only_case
     def case_a_window_longer_than_the_wait_keeps_serving_and_takes_the_late_publish(
             self, monkeypatch):
         """T3107, THE LIMIT MOVED. The wait is 3 s here and the window 5 s: no
@@ -38781,6 +38796,7 @@ class TestConnectorRoutes:
         assert pp.connectors_follow_pin(None) is False
 
 
+@pytest.mark.release_only
 class TestAHolderOwnsASuccessorItIsStillBooting:
     """T3107: a successor the holder spawned and that has not published sat in
     no record and no mark, so every other sender cut on old state. The daemons
@@ -39094,6 +39110,7 @@ else:
             assert pp._health_pid(t.port) == serving, log
 
 
+@pytest.mark.release_only
 class TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses:
     """T3107: the supervisor is parked on a predecessor that drains for hours
     (a launch's ask put a successor on the socket, which published and retired
@@ -39241,6 +39258,7 @@ class TestASuccessorInFlightIsNamedByASidecar:
 
     @pytest.fixture
     def kid(self):
+        import signal
         import subprocess
         import sys
 
@@ -39251,10 +39269,15 @@ class TestASuccessorInFlightIsNamedByASidecar:
                 [sys.executable, "-c", "import time; time.sleep(60)"]))
             return procs[-1]
 
+        # The kill is the REAL one, captured before the test body: a test that
+        # patches `os.kill` leaves it patched until the autouse monkeypatch
+        # undoes it, AFTER this teardown, so `proc.kill()` went through the
+        # stub and `proc.wait()` sat out the 60 s child (55.55 s, measured).
+        real_kill = os.kill
         yield make
         for proc in procs:
             if proc.poll() is None:
-                proc.kill()
+                real_kill(proc.pid, signal.SIGKILL)
             proc.wait()
 
     @staticmethod
