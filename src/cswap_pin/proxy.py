@@ -29378,6 +29378,15 @@ class _PumpLoop:
             self._pending.clear()
             self._draining.clear()
             self._last_move = 0.0
+            # THE SELECTOR'S KEYS TOO: a socket a case closed itself leaves its
+            # key behind, and the next pair to land on that fd number then has
+            # `add` swallow the KeyError and close the pair at once.
+            for key in list(self._sel.get_map().values()):
+                if key.fileobj is not self._wake_r:
+                    try:
+                        self._sel.unregister(key.fileobj)
+                    except (KeyError, ValueError, OSError):
+                        pass
         for o in self._siblings:
             o.reset_for_tests()
 

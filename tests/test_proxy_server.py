@@ -9902,6 +9902,37 @@ def test_a_proxy_accept_loop_serving_before_run_cases_is_stopped_and_not_blamed(
         srv._srv.close()
 
 
+def test_a_pump_reset_forgets_the_selector_keys_of_sockets_a_case_closed():
+    """T3572: `reset_for_tests` cleared the maps and left the selector's keys,
+    so a socket a case closed itself (never through `release_pairs`) kept its
+    fd number registered, and the next pair to land on it had `add` swallow the
+    KeyError and close that pair: `release_pairs` read 0 where it held a
+    tunnel. Which case failed depended on what ran before it (the suite lost a
+    fixed order when the duplicate aggregators went), so the reset is where it
+    is fixed. The key is filed by hand: through `add`, the loop thread may
+    clean the pair up before the reset and hide the leftover."""
+    import selectors
+
+    import cswap_pin.proxy as pp
+
+    a, b = socket.socketpair()
+    with pp._PUMP._lock:
+        pp._PUMP._sel.register(a, selectors.EVENT_READ)
+    stale = a.fileno()
+    a.close()
+    b.close()
+    pp._PUMP.reset_for_tests()
+    c, d = socket.socketpair()      # the lowest free fds are the stale ones
+    try:
+        assert stale in (c.fileno(), d.fileno()), "the fd number was not reused"
+        pp._PUMP.add(c, d, lambda: None, kind="bridge")
+        assert pp._PUMP.release_pairs("bridge") == 1, (
+            "the pair was closed at `add`: a stale selector key held its fd")
+    finally:
+        c.close()
+        d.close()
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
