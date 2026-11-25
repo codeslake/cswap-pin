@@ -90,4 +90,12 @@ markers = [
     # than skipped inside the test, so the exclusion is a visible `-m`
     # expression in the workflow instead of a silent skip nobody reads.
     "needs_host_seam: requires an unreleased claude_swap seam",
+    # Real holder, daemon and standby processes (or a fixed product wait) that
+    # cannot be made fast. Deselected by the declared quick command
+    # (`-m "not needs_host_seam and not release_only"`); ci.yml and publish.yml
+    # select only `not needs_host_seam`, so every one of these still runs on
+    # CI and on every release. A whole class carries the mark itself; a mixed
+    # class marks its slow cases `@release_only_case` and runs them from a
+    # `test_all_release_only` driver (tests/conftest.py).
+    "release_only: slow real-process test, run by CI and the release gate, not by the quick command",
 ]

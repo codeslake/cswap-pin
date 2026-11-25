@@ -874,6 +874,18 @@ except PackageNotFoundError:
 
 PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 
+
+def release_only_case(case):
+    """Mark a `case_*` whose cost is a real process or a fixed product wait.
+
+    The class's `test_all` skips it and its `test_all_release_only`, which
+    carries `pytest.mark.release_only`, runs it: the declared quick command
+    deselects that marker, ci.yml and publish.yml still run it.
+    """
+    case.release_only = True
+    return case
+
+
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
 # overhead is not the cost — but 332 collected items is more surface than the
@@ -897,8 +909,11 @@ PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 #    and a failure among them still gets raised. Only when every case in the
 #    run skipped does this itself skip, naming each one; a mix of skips and a
 #    clean pass surfaces the skips as a warning rather than going quiet.
-def run_cases(instance, request, tmp_path_factory, extra=None):
-    """Run every `case_*` method of `instance`, isolated, reporting all failures.
+def run_cases(instance, request, tmp_path_factory, extra=None, release_only=False):
+    """Run the `case_*` methods of `instance`, isolated, reporting all failures.
+
+    Those marked `@release_only_case` only when `release_only` is set, the rest
+    only when it is not.
 
     A case takes the fixtures it names in its signature, resolved from `extra`
     plus the per-case `tmp_path` / `monkeypatch` this builds. Anything else it
@@ -913,7 +928,10 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
         (instance, f"{cls.__name__}::{n}", getattr(instance, n))
         for n in sorted(dir(cls))
         if n.startswith("case_") and callable(getattr(instance, n))
+        and getattr(getattr(instance, n), "release_only", False) == release_only
     ]
+    if not work:
+        pytest.fail(f"{cls.__name__}: no case selected (release_only={release_only})")
     module_factories = getattr(sys.modules[cls.__module__], "case_fixtures", {})
     failures = []
     skipped = []

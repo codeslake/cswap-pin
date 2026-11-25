@@ -37,7 +37,7 @@ from cswap_pin.proxy import (
 # stubs the module attribute for every test.
 from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
-from conftest import PIN_STAMP, run_cases, short_root
+from conftest import PIN_STAMP, release_only_case, run_cases, short_root
 
 # A pid no process can hold, for a record the code under test probes with a
 # real `os.kill(pid, 0)`. A bare 999999 is below this box's pid_max (4194304)
@@ -13176,6 +13176,10 @@ class TestDaemonPortStability:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     @staticmethod
     def _probe_no_refusal_window(addr, other_pid_seen, deadline_s=5,
                                  connect_timeout_s=3):
@@ -13225,6 +13229,7 @@ class TestDaemonPortStability:
         finally:
             probe.close()
 
+    @release_only_case
     def case_a_real_spawned_successor_drops_no_connection(
         self, tmp_path, monkeypatch
     ):
@@ -15523,6 +15528,7 @@ print("OK", port)
             proxy.stop()
             squatter.close()
 
+    @release_only_case
     def case_recycling_a_held_daemon_keeps_the_port_and_one_holder(
         self, tmp_path
     ):
@@ -35611,6 +35617,10 @@ else:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     @staticmethod
     def _until(what, fn, timeout):
         deadline = time.monotonic() + timeout
@@ -35839,6 +35849,7 @@ else:
         finally:
             proxy.stop(drain=0)
 
+    @release_only_case
     def case_a_denied_lineage_is_moved_into_the_callers_without_a_cut(
             self, tmp_path, monkeypatch):
         """THE WHOLE PROPERTY, with real processes: the caller's ensure starts
@@ -36033,6 +36044,7 @@ else:
             new = set(p.name for p in t.certdir.iterdir()) - set(before)
             assert not new, f"ensure left new files behind: {new}"
 
+    @release_only_case
     def case_a_successor_that_never_publishes_cuts_nothing(
             self, tmp_path, monkeypatch):
         """FAILURE ARM. The relocation (`_take_the_socket_over`, which the
@@ -36174,6 +36186,7 @@ else:
             lsn.close()
             shutil.rmtree(certdir, ignore_errors=True)
 
+    @release_only_case
     def case_a_holder_born_of_a_caller_that_died_refuses_instead_of_stranding(
             self, tmp_path, monkeypatch):
         """A caller killed between its Popen and the new holder's adoption
@@ -36401,6 +36414,7 @@ else:
         pp.relocate_main(tmp_path, "2", "a@b.c")
         assert moved == [], "the helper moved a daemon of other code"
 
+    @release_only_case
     def case_ensure_returns_at_once_while_the_move_is_in_progress(
             self, tmp_path, monkeypatch):
         """NO LAUNCH BLOCKS ON A RELOCATION. The old daemon looks for the
@@ -36887,6 +36901,7 @@ else:
             f"(T3107): released={released} exited={exited}")
         assert signalled == [os.getppid()], "the control did not ask"
 
+    @release_only_case
     def case_a_killed_draining_daemon_is_not_replaced_by_its_old_holder(
             self, tmp_path, monkeypatch):
         """WITH REAL PROCESSES. After the move the old daemon drains (a held
@@ -36946,6 +36961,7 @@ else:
                 f"the old lineage's standby is still armed: {standbys}")
             held.close()
 
+    @release_only_case
     def case_a_launch_during_the_helpers_spawn_wait_is_not_held(
             self, tmp_path, monkeypatch):
         """THE REAL `_spawn_daemon`, with only the successor's holder withheld
@@ -37047,6 +37063,7 @@ else:
         finally:
             serving.close()
 
+    @release_only_case
     def case_a_daemon_in_another_pid_namespace_is_pulled_when_the_caller_opts_in(
             self, tmp_path, monkeypatch):
         """T2939, with real processes: the pin holder runs in one pid
@@ -37802,6 +37819,10 @@ else:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @pytest.mark.release_only
+    def test_all_release_only(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory, release_only=True)
+
     class _Origin:
         """A plain-HTTP origin whose reply is mid-body until ``release``."""
 
@@ -37982,6 +38003,7 @@ else:
         assert int(st["port"]) == t.port, "the port moved"
         self._one_daemon_is_left(t, int(st["pid"]))
 
+    @release_only_case
     def case_a_successor_that_dies_in_a_short_window_is_respawned(
             self, monkeypatch):
         with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
@@ -38031,6 +38053,7 @@ else:
                 _reap_pin_processes(b / "pin-proxy")
                 shutil.rmtree(b, ignore_errors=True)
 
+    @release_only_case
     def case_a_window_of_several_seconds_takes_several_respawns(
             self, monkeypatch):
         """The window is ~3 s: the successor is born into the missing module
@@ -38042,6 +38065,7 @@ else:
                 f"{died} successor(s) died: the window was not several "
                 f"respawns wide\n" + t.log())
 
+    @release_only_case
     def case_a_window_longer_than_the_wait_keeps_serving_and_takes_the_late_publish(
             self, monkeypatch):
         """T3107, THE LIMIT MOVED. The wait is 3 s here and the window 5 s: no
@@ -38721,6 +38745,7 @@ class TestConnectorRoutes:
         assert pp.connectors_follow_pin(None) is False
 
 
+@pytest.mark.release_only
 class TestAHolderOwnsASuccessorItIsStillBooting:
     """T3107: a successor the holder spawned and that has not published sat in
     no record and no mark, so every other sender cut on old state. The daemons
@@ -39034,6 +39059,7 @@ else:
             assert pp._health_pid(t.port) == serving, log
 
 
+@pytest.mark.release_only
 class TestAParkedHolderReplacesAWedgedSuccessorThroughRealProcesses:
     """T3107: the supervisor is parked on a predecessor that drains for hours
     (a launch's ask put a successor on the socket, which published and retired
