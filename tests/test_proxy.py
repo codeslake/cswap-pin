@@ -13189,6 +13189,70 @@ class TestDaemonPortStability:
         run_cases(self, request, tmp_path_factory, release_only=True)
 
     @staticmethod
+    def _hammer(port, stop, refused, served, connect=socket.create_connection,
+                stall_s=0.5):
+        """A REQUEST, not a connect. A bare `create_connection().close()`
+        cannot see the failure that matters here.
+
+        While a departing daemon drains, the port stays BOUND (the
+        holder's socket queues arrivals), so a connect always succeeds
+        and `refused` is structurally 0 no matter how long nobody is
+        behind it. Measured on host-a during a 30s held-exit drain:
+        refused=0, and 30 requests died on a 3s timeout with no reply.
+        A refused-only hammer calls that window healthy.
+
+        So this sends a CONNECT and requires an answer. Something that
+        accepts and never replies counts as a failure, which is what it
+        is to a session.
+        """
+        while not stop.is_set():
+            began = time.monotonic()
+            try:
+                s = connect(("127.0.0.1", port), timeout=2)
+            except OSError as exc:
+                refused.append(repr(exc))
+                time.sleep(0.002)
+                continue
+            # A CONNECT THAT HUNG AND THEN LANDED IS A HOLE TOO. One thread: a
+            # connect the kernel does not answer (T1294 measured one on macOS
+            # CI that timed out instead of being refused) holds it until the
+            # SYN is resent, about 1s on, past the whole window, and then
+            # lands on the successor: neither refused nor reset, so it was
+            # never counted, and PR #194 read 0 refused beside a successor
+            # that took 0.3s to bind. `stall_s` assumes a connect to a
+            # listening loopback socket answers far inside it (unmeasured on
+            # macOS).
+            took = time.monotonic() - began
+            if took > stall_s:
+                refused.append(f"connect stalled {took:.2f}s")
+            try:
+                # AS LONG AS THE SPAWN WAIT, NOT SHORTER. The holder
+                # queues a request that arrives while the successor
+                # boots, and a boot is 2.3s on a core shared four ways
+                # (measured), so a 2s wait read that queued request as
+                # dropped: 10 of 12 runs failed with exactly one
+                # "no reply (timeout)". A real hang is tens of seconds
+                # (the 30s held-exit drain in the docstring), so this
+                # still sees it.
+                s.settimeout(5)
+                s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                          b"Host: api.anthropic.com:443\r\n\r\n")
+                if s.recv(64):
+                    served.append(1)
+                else:
+                    refused.append("no reply (EOF)")
+            except socket.timeout:
+                refused.append("no reply (timeout)")
+            except OSError as exc:
+                refused.append(repr(exc))
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            time.sleep(0.002)
+
+    @staticmethod
     def _probe_no_refusal_window(addr, other_pid_seen, deadline_s=5,
                                  connect_timeout_s=3):
         """Poll `addr` until `other_pid_seen()` is truthy or `deadline_s`
@@ -13236,6 +13300,23 @@ class TestDaemonPortStability:
             return False
         finally:
             probe.close()
+
+    def case_the_hammer_counts_a_connect_that_stalled_and_then_landed(self):
+        """The one outcome the hammer used to miss: a connect that hangs past
+        the window and then succeeds. A fake `connect` stands in for it."""
+        a, b = socket.socketpair()
+        b.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+        stop, refused, served = threading.Event(), [], []
+
+        def stalled(addr, timeout):
+            time.sleep(0.1)
+            stop.set()      # one iteration is enough
+            return a
+
+        self._hammer(0, stop, refused, served, connect=stalled, stall_s=0.05)
+        b.close()
+        assert served == [1] and len(refused) == 1, (served, refused)
+        assert refused[0].startswith("connect stalled"), refused
 
     @release_only_case
     def case_a_real_spawned_successor_drops_no_connection(
@@ -13301,56 +13382,9 @@ class TestDaemonPortStability:
             refused, served = [], []
             stop = threading.Event()
 
-            def hammer():
-                """A REQUEST, not a connect. A bare `create_connection().close()`
-                cannot see the failure that matters here.
-
-                While a departing daemon drains, the port stays BOUND — the
-                holder's socket queues arrivals — so a connect always succeeds
-                and `refused` is structurally 0 no matter how long nobody is
-                behind it. Measured on host-a during a 30s held-exit drain:
-                refused=0, and 30 requests died on a 3s timeout with no reply.
-                A refused-only hammer calls that window healthy.
-
-                So this sends a CONNECT and requires an answer. Something that
-                accepts and never replies counts as a failure, which is what it
-                is to a session.
-                """
-                while not stop.is_set():
-                    try:
-                        s = socket.create_connection(("127.0.0.1", port), timeout=2)
-                    except OSError as exc:
-                        refused.append(repr(exc))
-                        time.sleep(0.002)
-                        continue
-                    try:
-                        # AS LONG AS THE SPAWN WAIT, NOT SHORTER. The holder
-                        # queues a request that arrives while the successor
-                        # boots, and a boot is 2.3s on a core shared four ways
-                        # (measured), so a 2s wait read that queued request as
-                        # dropped: 10 of 12 runs failed with exactly one
-                        # "no reply (timeout)". A real hang is tens of seconds
-                        # (the 30s held-exit drain in the docstring), so this
-                        # still sees it.
-                        s.settimeout(5)
-                        s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
-                                  b"Host: api.anthropic.com:443\r\n\r\n")
-                        if s.recv(64):
-                            served.append(1)
-                        else:
-                            refused.append("no reply (EOF)")
-                    except socket.timeout:
-                        refused.append("no reply (timeout)")
-                    except OSError as exc:
-                        refused.append(repr(exc))
-                    finally:
-                        try:
-                            s.close()
-                        except OSError:
-                            pass
-                    time.sleep(0.002)
-
-            h = threading.Thread(target=hammer, daemon=True)
+            h = threading.Thread(
+                target=self._hammer, args=(port, stop, refused, served),
+                daemon=True)
             h.start()
             time.sleep(0.3)
             base = len(refused)
@@ -13413,12 +13447,13 @@ class TestDaemonPortStability:
         from conftest import _reap_pin_processes
 
         try:
-            control_refused, _ = _handover(hand_down=False)
+            control_refused, control_served = _handover(hand_down=False)
             assert control_refused > 0, (
                 "THE CONTROL DID NOT FAIL. Handing the port NUMBER over leaves "
                 "a hole the successor's start-up cannot avoid, so a run with "
                 "zero refusals here means the hammer is not measuring the "
-                "window — and the pass below would prove nothing"
+                "window, and the pass below would prove nothing "
+                f"(it was answered {control_served} times)"
             )
 
             refused, served = _handover(hand_down=True)
