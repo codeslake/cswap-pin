@@ -7519,23 +7519,13 @@ class TestIsPinnedRoute:
              "the query form is the same read"),
             ("/api/claude_code/settingsXYZ", False,
              "the path boundary: only the settings route itself"),
-            # CC's GrowthBook remote-eval fetch (2.1.331, every 6 h, the
-            # payload kept in memory until the next one): the server picks a
-            # flag's value by the bearer. One identical body answered
-            # `tengu_saffron_lattice` enabled for slot 10 and disabled for
-            # slots 1, 2, 4 and 9. A PREFIX, because the client key follows
-            # the slash; the authed spelling is the same fetch with a bearer.
-            ("/api/eval/sdk-zAZezfDKGoZuXXKe", True,
-             "the flags a pinned session gates on are the PIN's, not the "
-             "live login's"),
-            ("/api/eval/sdk-zAZezfDKGoZuXXKe?x=1", True,
-             "the query form is the same fetch"),
-            ("/api/eval-authed/sdk-zAZezfDKGoZuXXKe", True,
-             "the authed spelling carries the same bearer"),
-            ("/api/eval", False, "no client key, not the fetch"),
-            ("/api/evaluate", False, "the path boundary: only /api/eval/"),
-            ("/api/eval-authedX/sdk-zAZezfDKGoZuXXKe", False,
-             "the path boundary: only /api/eval-authed/"),
+            # The GrowthBook payload decides the session's Fable policy, and
+            # that policy must follow the active (billed) account, so the eval
+            # fetch keeps the session's own bearer (owner direction, T3565).
+            ("/api/eval/sdk-zAZezfDKGoZuXXKe", False,
+             "the eval fetch is never swapped to the pinned account"),
+            ("/api/eval-authed/sdk-x", False,
+             "the authed spelling keeps the session's own bearer too"),
             # The neighbour that must not be swept in by a prefix. Nothing
             # else under /api/claude_code/ is known to be ownership-decided,
             # so the rule is an exact match, same as /api/oauth/validate.
