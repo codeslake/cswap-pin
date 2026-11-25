@@ -5378,13 +5378,6 @@ def _is_settings_route(path: str) -> bool:
     return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/settings"
 
 
-def _is_eval_route(path: str) -> bool:
-    """CC's GrowthBook remote-eval fetch, `/api/eval/<client key>` or the authed
-    spelling. A PREFIX, because the client key follows the slash; the `?` of a
-    query sits past it, so a plain `startswith` reads the path alone."""
-    return path.startswith(("/api/eval/", "/api/eval-authed/"))
-
-
 # WHY a policy 503 says it, on the MITM and the absolute-form path alike.
 _POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
                    "could be minted; no other account answers it")
@@ -5398,10 +5391,6 @@ _SETTINGS_NO_MINT = ("the managed-settings fetch needs the pinned token and "
                      "none could be minted; no other account answers it")
 _SETTINGS_REFUSED = ("the pinned token was refused ({code}) on the "
                      "managed-settings fetch; no other account answers it")
-_EVAL_NO_MINT = ("the feature-flag evaluation needs the pinned token and "
-                 "none could be minted; no other account answers it")
-_EVAL_REFUSED = ("the pinned token was refused ({code}) on the feature-flag "
-                 "evaluation; no other account answers it")
 
 
 def _never_as_another_account(path: str):
@@ -5420,19 +5409,13 @@ def _never_as_another_account(path: str):
 
     And the managed-settings route: the live login's answer is its org's
     settings (`disableBypassPermissionsMode`, `defaultMode`), which CC writes
-    to the shared `remote-settings.json` of sessions that run as the pin.
-
-    And the GrowthBook eval route: the flags are chosen by the bearer, and CC
-    keeps the answer for hours, so the live login's flags would gate a session
-    that runs as the pin."""
+    to the shared `remote-settings.json` of sessions that run as the pin."""
     if _is_policy_route(path):
         return _POLICY_NO_MINT, _POLICY_REFUSED
     if _is_profile_route(path):
         return _PROFILE_NO_MINT, _PROFILE_REFUSED
     if _is_settings_route(path):
         return _SETTINGS_NO_MINT, _SETTINGS_REFUSED
-    if _is_eval_route(path):
-        return _EVAL_NO_MINT, _EVAL_REFUSED
     return None
 
 
@@ -5556,16 +5539,7 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     # every live session dropped out of bypassPermissions though its work
     # travels as the pin. CC rewrites that file from its next successful
     # answer, so the swap alone replaces a stale copy.
-    #
-    # ``/api/eval/<client key>`` (and ``/api/eval-authed/``), CC's GrowthBook
-    # remote-eval fetch every 6 h, is answered BY THE BEARER: one body gave
-    # ``tengu_saffron_lattice`` enabled for slot 10 and disabled for slots 1, 2,
-    # 4 and 9, and CC holds the payload in memory until its next fetch, so a
-    # session whose fetch fell while slot 10 was live kept gating on slot 10's
-    # flags after leaving it. A PREFIX, because the client key follows the
-    # slash.
-    if (_is_policy_route(path) or _is_settings_route(path)
-            or _is_eval_route(path)):
+    if _is_policy_route(path) or _is_settings_route(path):
         return True
     # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with the
     # OAuth bearer and renders any non-200 as "could not be downloaded". The
@@ -23787,7 +23761,7 @@ class PinProxy:
         stalled-store wording, which is the only cause this used to answer
         for.
 
-        THE ORG-POLICY, PROFILE, SETTINGS AND EVAL ROUTES EACH HAVE THEIR OWN
+        THE ORG-POLICY, PROFILE AND SETTINGS ROUTES EACH HAVE THEIR OWN
         COOLDOWN SLOT:
         their 503s repeat for as long as the pin cannot mint, and sharing the
         budget would let that burst swallow the next blind-mint line above.
@@ -23799,7 +23773,6 @@ class PinProxy:
         slot = ("_policy_refused_at" if _is_policy_route(path)
                 else "_profile_refused_at" if _is_profile_route(path)
                 else "_settings_refused_at" if _is_settings_route(path)
-                else "_eval_refused_at" if _is_eval_route(path)
                 else "_stall_refused_at")
         last = getattr(self, slot, None)
         if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:

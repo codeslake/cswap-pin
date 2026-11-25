@@ -19407,12 +19407,10 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
 
     def _ask(self, certdir, provider, path=None, lines=None,
              reject=("pin-token",), reject_status=403, ua=None,
-             out=None, reply=None, extra_headers=None, trace=None,
-             method="GET", body=None):
+             out=None, reply=None, extra_headers=None, trace=None):
         """One GET of `path` (the policy route by default) with the session's
         own bearer through a real daemon; `(status, bearers the upstream
         saw)`. `lines` collects the lifecycle log; `ua` is the User-Agent;
-        `method` and `body` make it another verb;
         `out` is filled with the reply's `headers` and `body` and the request
         `heads` the upstream saw; `reply` is the upstream's whole 200;
         `trace` is a file the request trace is armed to and ticked open."""
@@ -19433,13 +19431,13 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
         try:
             if trace is not None:
                 proxy._trace_tick()  # the only thing that opens the handle
-            hdrs, got = {}, []
+            hdrs, body = {}, []
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", path or self.POLICY,
-                bearer="session-bearer", method=method, body=body, ua=ua,
-                headers_out=hdrs, body_out=got, extra_headers=extra_headers)
+                bearer="session-bearer", method="GET", body=None, ua=ua,
+                headers_out=hdrs, body_out=body, extra_headers=extra_headers)
             if out is not None:
-                out.update(headers=hdrs, body=got[0],
+                out.update(headers=hdrs, body=body[0],
                            heads=list(upstream.heads_seen))
             return status, list(upstream.auths_seen)
         finally:
@@ -19533,13 +19531,12 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
     def _ask_absolute(self, certdir, provider, path=None, lines=None,
                       reject=("pin-token",), ua=None, reject_status=403,
                       out=None, ok=b"HTTP/1.1 200 OK\r\nContent-Length: 0"
-                      b"\r\n\r\n", accept=None, method="GET"):
+                      b"\r\n\r\n", accept=None):
         """The absolute-form twin of `_ask` (`claude remote-control`'s own
         form): one GET of `path` with the session's own bearer through a real
         daemon and a recording hop that refuses every bearer in `reject` and
         answers `ok` to the rest; `(the reply's first bytes, the requests the
-        hop saw)`. `out` gets the whole reply's `head` and `body`; `method`
-        makes it another verb."""
+        hop saw)`. `out` gets the whole reply's `head` and `body`."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
@@ -19560,7 +19557,7 @@ class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             try:
                 c.sendall((
-                    f"{method} https://api.anthropic.com{path or self.POLICY} "
+                    f"GET https://api.anthropic.com{path or self.POLICY} "
                     "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                     + (f"User-Agent: {ua}\r\n" if ua else "")
                     + (f"Accept-Encoding: {accept}\r\n" if accept else "")
@@ -20263,127 +20260,6 @@ class TestTheSettingsFetchAsksAsThePinnedAccount:
             pp._log_lifecycle = real_log
         assert lines == [
             f"GET {self.SETTINGS} refused (503): settings",
-            "POST /v1/environments/bridge refused (503): blind"], lines
-
-
-class TestTheEvalFetchAsksAsThePinnedAccount:
-    """CC'S GROWTHBOOK REMOTE-EVAL FETCH (`POST /api/eval/<client key>`, 6 h)
-    is answered by the BEARER: one body gave `tengu_saffron_lattice` enabled
-    for slot 10 and disabled for slots 1, 2, 4 and 9, and CC keeps the payload
-    until its next fetch. So it is asked as the pin, and, like the policy and
-    settings questions, never answered as another account: a pin that cannot
-    mint, or whose token is refused, answers a local 503 rather than the live
-    login's flags. A cleared pin, or one that IS the live login, keeps
-    relaying.
-
-    The settings route's rule, on the eval prefixes, with that class's
-    helpers."""
-
-    EVAL = "/api/eval/sdk-zAZezfDKGoZuXXKe"
-    AUTHED = "/api/eval-authed/sdk-zAZezfDKGoZuXXKe"
-    h = TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount()
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def _post(self, certdir, provider, path, **kw):
-        return self.h._ask(certdir, provider, path, method="POST",
-                           body='{"attributes":{}}', **kw)
-
-    def case_a_minted_token_swaps_and_the_trace_says_so(
-            self, certdir, monkeypatch):
-        """The session's own bearer never goes upstream, on either spelling."""
-        for i, path in enumerate((self.EVAL, self.AUTHED)):
-            trace, out = certdir / f"trace{i}.log", {}
-            status, seen = self._post(
-                certdir,
-                self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
-                path, reject=(), trace=trace, out=out)
-            assert status == 200 and seen == ["Bearer pin-token"], (
-                path, status, seen)
-            assert out["heads"][0].startswith(f"POST {path} "), out["heads"]
-            assert f"POST {path} pinned=True swapped=True" in trace.read_text()
-
-    def case_a_failed_mint_answers_503_and_the_neighbours_fall_open(
-            self, certdir, monkeypatch):
-        """Both spellings, with a query. THE CONTROLS, same daemon state: the
-        path boundaries relay on the session's own bearer."""
-        for path in (self.EVAL, self.AUTHED, self.EVAL + "?x=1"):
-            lines = []
-            status, seen = self._post(
-                certdir, self.h._provider(certdir, monkeypatch), path,
-                lines=lines)
-            assert status == 503 and seen == [], (path, status, seen)
-            assert any(f"POST {path} refused (503)" in ln
-                       and "feature-flag" in ln for ln in lines), lines
-        for path in ("/api/eval", "/api/evaluate", "/api/eval-authedX/k"):
-            status, seen = self._post(
-                certdir, self.h._provider(certdir, monkeypatch), path)
-            assert status == 200 and seen == ["Bearer session-bearer"], (
-                path, status, seen)
-
-    def case_a_refused_pin_token_answers_503_without_a_resend(
-            self, certdir, monkeypatch):
-        """401/403 on the pin's token must not be resent as the live login."""
-        for code in (401, 403):
-            lines = []
-            status, seen = self._post(
-                certdir,
-                self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
-                self.EVAL, lines=lines, reject_status=code)
-            assert (status, seen) == (503, ["Bearer pin-token"]), (
-                code, status, seen)
-            assert any(f"refused ({code}) on the feature-flag" in ln
-                       for ln in lines), lines
-
-    def case_a_cleared_pin_and_the_live_login_still_relay(
-            self, certdir, monkeypatch):
-        for name, kw in (("cleared", {"pinned": False}),
-                         ("live login", {"active": "2"})):
-            status, seen = self._post(
-                certdir, self.h._provider(certdir, monkeypatch, **kw),
-                self.EVAL)
-            assert status == 200 and seen == ["Bearer session-bearer"], (
-                name, status, seen)
-
-    def case_an_absolute_form_never_relays_the_session_bearer(
-            self, certdir, monkeypatch):
-        """`claude remote-control`'s path: a failed mint and a refused token
-        are 503 with no session bearer upstream."""
-        got, seen = self.h._ask_absolute(
-            certdir, self.h._provider(certdir, monkeypatch), self.EVAL,
-            method="POST")
-        assert got.startswith(b"HTTP/1.1 503") and seen == [], (got[:40], seen)
-        got, seen = self.h._ask_absolute(
-            certdir,
-            self.h._provider(certdir, monkeypatch, lambda n: "pin-token"),
-            self.EVAL, method="POST")
-        assert got.startswith(b"HTTP/1.1 503") and len(seen) == 1 \
-            and b"Bearer pin-token" in seen[0], (got[:40], seen)
-
-    def case_an_eval_503_does_not_silence_a_following_blind_mint_line(
-            self, certdir):
-        """Its own cooldown slot, as the policy, profile and settings routes
-        have."""
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import PinProxy
-
-        class Tls:
-            def sendall(self, _b):
-                pass
-
-        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
-        lines = []
-        real_log = pp._log_lifecycle
-        pp._log_lifecycle = lines.append
-        try:
-            proxy._refuse_stalled_mint(Tls(), "POST", self.EVAL, "eval")
-            proxy._refuse_stalled_mint(
-                Tls(), "POST", "/v1/environments/bridge", "blind")
-        finally:
-            pp._log_lifecycle = real_log
-        assert lines == [
-            f"POST {self.EVAL} refused (503): eval",
             "POST /v1/environments/bridge refused (503): blind"], lines
 
 
