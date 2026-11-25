@@ -28662,6 +28662,32 @@ def _unified_reset(lines: list[bytes]) -> "float | None":
         return None
 
 
+_LATCH_GUARD_HEADERS = (
+    b"anthropic-ratelimit-unified-status",
+    b"anthropic-ratelimit-unified-overage-status",
+    b"anthropic-ratelimit-unified-representative-claim",
+)
+
+
+def _overage_in_use_cannot_latch(lines: list[bytes]) -> bool:
+    """Whether Claude Code 2.1.331's own guard skips the "credits required"
+    latch for this head: unified status `rejected` AND overage-status
+    `allowed` or `allowed_warning` AND representative-claim anything but
+    `seven_day_overage_included` (absent counts as another). Raw values, case-
+    sensitive, as the client compares them (the relay's lowercased `vl` is
+    not). A repeated guard header fails closed: the client may read the other
+    copy."""
+    seen: dict[bytes, list[bytes]] = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(b":")
+        if (k := k.strip().lower()) in _LATCH_GUARD_HEADERS:
+            seen.setdefault(k, []).append(v.strip())
+    status, overage, claim = (seen.get(k, []) for k in _LATCH_GUARD_HEADERS)
+    return (status == [b"rejected"]
+            and overage in ([b"allowed"], [b"allowed_warning"])
+            and len(claim) < 2 and claim != [b"seven_day_overage_included"])
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -29026,8 +29052,13 @@ def _relay_response(
             continue
         # Claude Code latches a `true` per process ("credits required", cleared
         # only by /login) while the pin moves that process between accounts, so
-        # a latch set under any serving account outlives the next switch.
-        if kl == b"anthropic-ratelimit-unified-overage-in-use" and vl == b"true":
+        # a latch set under any serving account outlives the next switch, and
+        # the `true` is dropped. The exception is a head its own guard skips
+        # (`_overage_in_use_cannot_latch`): nothing latches there, and the
+        # `true` is what keeps its overage billing signals. A wall strip above
+        # takes it first.
+        if (kl == b"anthropic-ratelimit-unified-overage-in-use" and vl == b"true"
+                and not _overage_in_use_cannot_latch(lines)):
             continue
         if kl in _HOP_BY_HOP_BYTES or (drop_request_id and kl == b"request-id"):
             continue
