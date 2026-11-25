@@ -16574,6 +16574,7 @@ print("OK", port)
         """(a2), T3107: the tick after a miss finds the sidecar the holder
         wrote when it spawned the successor, and asks nothing: not the signal
         (the holder would decline it), not the announcement."""
+        import signal
         import subprocess
         import sys
 
@@ -16618,7 +16619,10 @@ print("OK", port)
                 pass
             seen = (list(signalled), list(exited), list(released))
         finally:
-            booting.kill()
+            # The REAL kill: `booting.kill()` goes through the `os.kill` this
+            # case patched, which swallowed it and left `wait()` on the 60 s
+            # child (60.02 s, measured).
+            real_kill(booting.pid, signal.SIGKILL)
             booting.wait()
         assert seen == ([], [], []), (
             f"a tick beside a booting successor acted: signalled, exited, "
@@ -39241,6 +39245,7 @@ class TestASuccessorInFlightIsNamedByASidecar:
 
     @pytest.fixture
     def kid(self):
+        import signal
         import subprocess
         import sys
 
@@ -39251,10 +39256,15 @@ class TestASuccessorInFlightIsNamedByASidecar:
                 [sys.executable, "-c", "import time; time.sleep(60)"]))
             return procs[-1]
 
+        # The kill is the REAL one, captured before the test body: a test that
+        # patches `os.kill` leaves it patched until the autouse monkeypatch
+        # undoes it, AFTER this teardown, so `proc.kill()` went through the
+        # stub and `proc.wait()` sat out the 60 s child (55.55 s, measured).
+        real_kill = os.kill
         yield make
         for proc in procs:
             if proc.poll() is None:
-                proc.kill()
+                real_kill(proc.pid, signal.SIGKILL)
             proc.wait()
 
     @staticmethod
