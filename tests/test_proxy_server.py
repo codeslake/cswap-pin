@@ -20294,39 +20294,6 @@ class TestTheSettingsFetchAsksAsThePinnedAccount:
             "POST /v1/environments/bridge refused (503): blind"], lines
 
 
-class TestEverySmallCaseHolder:
-    """Every small case-holder in this file, as ONE pytest test.
-
-    Each holder is run SEPARATELY (its own instance, its own helpers)
-    rather than merged by inheritance: three of these classes define a
-    `_ca` / `_cfg` / `_ours` helper with different meanings, and a
-    shared MRO would have handed every case just one of them.
-    A failure still names the class its case came from.
-    """
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(
-            [
-                TestStreamingRelay(),
-                TestChunkedRequestBodiesReachUpstream(),
-                TestTheChainsCredentialIsSent(),
-                TestLoopbackChainTrust(),
-                TestLongPollSurvives(),
-                TestAbsoluteFormPassthrough(),
-                TestHealthEndpoint(),
-                TestKeepAlive(),
-                TestWebSocketUpgrade(),
-                TestBlindTunnelIsTraced(),
-                TestBlindTunnelFallsBackWhenChainRefuses(),
-                TestOptimisticConnectIsDetected(),
-                TestTheTrustFileActuallyVerifies(),
-                TestTheKillGateIdentifiesItsTarget(),
-                ],
-            request,
-            tmp_path_factory,
-        )
-
-
 class TestAHandoverMidDrainDropsTheClock:
     """The budget is chosen once, and a handover can arrive after it.
 

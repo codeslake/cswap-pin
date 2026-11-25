@@ -900,12 +900,6 @@ PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 def run_cases(instance, request, tmp_path_factory, extra=None):
     """Run every `case_*` method of `instance`, isolated, reporting all failures.
 
-    `instance` may be a LIST of holders — several small classes sharing one
-    pytest test. They are run separately (own instance, own helpers) rather
-    than merged by inheritance, because three of this suite's classes define a
-    `_ca` / `_cfg` / `_ours` helper with DIFFERENT meanings and a shared MRO
-    would have handed every case just one of them.
-
     A case takes the fixtures it names in its signature, resolved from `extra`
     plus the per-case `tmp_path` / `monkeypatch` this builds. Anything else it
     asks for is fetched from pytest itself via `request.getfixturevalue`.
@@ -914,16 +908,13 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
 
     from _pytest.monkeypatch import MonkeyPatch
 
-    holders = instance if isinstance(instance, (list, tuple)) else [instance]
-    work = []
-    for holder in holders:
-        cls = type(holder)
-        for n in sorted(dir(cls)):
-            if n.startswith("case_") and callable(getattr(holder, n)):
-                work.append((holder, f"{cls.__name__}::{n}", getattr(holder, n)))
-    module_factories = getattr(
-        sys.modules[type(holders[0]).__module__], "case_fixtures", {}
-    )
+    cls = type(instance)
+    work = [
+        (instance, f"{cls.__name__}::{n}", getattr(instance, n))
+        for n in sorted(dir(cls))
+        if n.startswith("case_") and callable(getattr(instance, n))
+    ]
+    module_factories = getattr(sys.modules[cls.__module__], "case_fixtures", {})
     failures = []
     skipped = []
 
