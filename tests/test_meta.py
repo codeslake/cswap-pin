@@ -9,7 +9,9 @@ and four of the six were red by the time anyone looked.
 They live here because this file IS collected. `conftest.py` is still a normal
 module, so what they need comes from it by import.
 """
+import ast
 import os
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -324,6 +326,73 @@ def test_the_publish_gate_accepts_a_commit_with_several_green_runs():
     assert verdict([{"status": "in_progress", "conclusion": None}]) == "pending"
 
 
+def _unwired_release_drivers(source):
+    """Classes in `source` whose `test_all_release_only` does not run the marked cases.
+
+    It must carry `pytest.mark.release_only` (else the quick command runs it
+    too) and call `run_cases(..., release_only=True)` (else it re-runs the
+    quick cases and skips the decorated ones). A name alone proves neither.
+    """
+    tree = ast.parse(source)
+
+    def runs_release_only(fn):
+        return any(
+            isinstance(c, ast.Call)
+            and ast.unparse(c.func) == "run_cases"
+            and any(
+                k.arg == "release_only" and ast.unparse(k.value) == "True"
+                for k in c.keywords
+            )
+            for c in ast.walk(fn)
+        )
+
+    return [
+        cls.name
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef)
+        and fn.name == "test_all_release_only"
+        and not (
+            any(ast.unparse(d) == "pytest.mark.release_only" for d in fn.decorator_list)
+            and runs_release_only(fn)
+        )
+    ]
+
+
+_RELEASE_DRIVER = textwrap.dedent("""\
+    class TestX:
+        @release_only_case
+        def case_slow(self):
+            pass
+
+        @pytest.mark.release_only
+        def test_all_release_only(self, request, tmp_path_factory):
+            run_cases(self, request, tmp_path_factory, release_only=True)
+    """)
+
+
+@pytest.mark.parametrize(
+    "old, new, wired",
+    [
+        ("", "", True),
+        ("    @pytest.mark.release_only\n", "", False),
+        (", release_only=True", "", False),
+        ("release_only=True", "release_only=False", False),
+    ],
+    ids=["wired", "no-marker", "no-keyword", "keyword-false"],
+)
+def test_a_release_driver_must_be_marked_and_run_the_release_only_cases(
+    old, new, wired
+):
+    """T3572 review: a `test_all_release_only` that is not marked is run by the
+    quick command too (paid twice), and one that leaves out
+    `release_only=True` re-runs the quick cases and skips the decorated ones.
+    The name alone satisfied the guard in both."""
+    source = _RELEASE_DRIVER.replace(old, new)
+    assert (not _unwired_release_drivers(source)) is wired, source
+
+
 def test_every_case_has_a_driver():
     """A `case_*` method with no `test_all` NEVER RUNS, and nothing says so.
 
@@ -343,10 +412,15 @@ def test_every_case_has_a_driver():
 
     dead = []
     for path in sorted(pathlib.Path(__file__).parent.glob("test_*.py")):
+        text = path.read_text()
+        dead += [
+            (path.name, c, "release driver unwired")
+            for c in _unwired_release_drivers(text)
+        ]
         cls = None
         has_driver = has_release_driver = marked = False
         cases = []
-        for line in path.read_text().splitlines() + ["class "]:
+        for line in text.splitlines() + ["class "]:
             if line.startswith("class "):
                 if cls and cases and not has_driver:
                     dead.append((path.name, cls, len(cases)))
@@ -367,7 +441,9 @@ def test_every_case_has_a_driver():
     assert not dead, (
         f"{len(dead)} class(es) have `case_*` methods that never run: no "
         f"`test_all` driver, or `@release_only_case` cases and no "
-        f"`test_all_release_only`:\n"
+        f"`test_all_release_only`, or one that is not marked "
+        f"`pytest.mark.release_only` or does not call `run_cases(..., "
+        f"release_only=True)`:\n"
         + "\n".join(f"  {f}::{c} ({n})" for f, c, n in dead)
         + "\n\nAdd to each class:\n"
         "    def test_all(self, request, tmp_path_factory):\n"

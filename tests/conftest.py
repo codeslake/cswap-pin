@@ -888,10 +888,15 @@ def release_only_case(case):
 
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
-# overhead is not the cost — but 332 collected items is more surface than the
-# behaviour warrants, and each one re-pays the autouse fixtures. `run_cases`
-# runs every `case_*` method of a class inside ONE pytest test, giving each its
-# own tmp_path and its own monkeypatch so a case cannot leak into the next.
+# overhead is not the cost, but one collected item per case is more surface
+# than the behaviour warrants, and each one re-pays the autouse fixtures.
+# `run_cases` runs the `case_*` methods of a class inside ONE pytest test,
+# giving each its own tmp_path and its own monkeypatch so a case cannot leak
+# into the next. A case marked `@release_only_case` (a real process or a fixed
+# product wait) is left to the class's SECOND driver, `test_all_release_only`
+# with `pytest.mark.release_only`, which the declared quick command deselects
+# and ci.yml and publish.yml run: each case runs once, under exactly one
+# driver. test_meta's `test_every_case_has_a_driver` holds both drivers.
 #
 # WHAT THIS MUST NOT LOSE, and does not:
 #  - INDEPENDENCE. Each case gets a fresh MonkeyPatch (undone in a finally) and
