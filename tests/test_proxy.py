@@ -38457,7 +38457,7 @@ def test_the_pass_that_follows_the_handover_pass_waits_a_whole_tick_again(monkey
 
 @pytest.mark.parametrize("owner", ["dead", "alive", "unmarked"])
 def test_session_start_reaps_a_short_root_only_when_its_marked_owner_is_dead(
-        tmp_path, owner):
+        tmp_path, monkeypatch, owner):
     """T2725: a pytest killed mid-case never reaches the `finally` that reaps
     the short `/tmp/r*` root a real-holder case made, and nothing swept it.
     The root now carries its creator's pid in a marker; session start reaps
@@ -38474,6 +38474,14 @@ def test_session_start_reaps_a_short_root_only_when_its_marked_owner_is_dead(
     own_root.mkdir(parents=True)
     session = types.SimpleNamespace(config=types.SimpleNamespace(
         _tmp_path_factory=types.SimpleNamespace(getbasetemp=lambda: own_root)))
+    # THE ROOT LIVES WHERE ONLY THIS CASE SWEEPS. The dead arm parks a dead pid
+    # in the stamp on purpose, and every other worker's or run's session start
+    # sweeps the real `/tmp/r*` and reaps exactly that (measured at `-n auto`:
+    # the stand-in SIGTERMed inside 0.3 s). No socket is bound under this root,
+    # so the AF_UNIX limit that puts `short_root` in `/tmp` does not apply.
+    real_dir = conftest._SHORT_ROOT_DIR
+    (tmp_path / "short").mkdir()
+    monkeypatch.setattr(conftest, "_SHORT_ROOT_DIR", str(tmp_path / "short"))
     root = conftest.short_root().resolve()
     # argv `_reap_pin_processes` selects on: the product module, then a path
     # under the root as the LAST token.
@@ -38491,6 +38499,15 @@ def test_session_start_reaps_a_short_root_only_when_its_marked_owner_is_dead(
             marker.unlink()
         time.sleep(0.3)
         assert stand_in.poll() is None, "the stand-in exited on its own"
+
+        # Another worker's (or run's) session start, landing in the window the
+        # stamp is in. `_sweep_dead_short_roots` returns once what it reaped
+        # is gone, so a reaped stand-in is already dead here.
+        with monkeypatch.context() as m:
+            m.setattr(conftest, "_SHORT_ROOT_DIR", real_dir)
+            conftest._sweep_dead_short_roots()
+        assert stand_in.poll() is None and root.exists(), (
+            "a foreign sweep of the real short-root directory reaped this case's root")
 
         conftest.pytest_sessionstart(session)
 
