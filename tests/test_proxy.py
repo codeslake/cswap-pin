@@ -13214,14 +13214,16 @@ class TestDaemonPortStability:
                 time.sleep(0.002)
                 continue
             # A CONNECT THAT HUNG AND THEN LANDED IS A HOLE TOO. One thread: a
-            # connect the kernel does not answer (T1294 measured one on macOS
-            # CI that timed out instead of being refused) holds it until the
-            # SYN is resent, about 1s on, past the whole window, and then
-            # lands on the successor: neither refused nor reset, so it was
-            # never counted, and PR #194 read 0 refused beside a successor
-            # that took 0.3s to bind. `stall_s` assumes a connect to a
-            # listening loopback socket answers far inside it (unmeasured on
-            # macOS).
+            # connect the kernel does not answer holds it, and when it lands
+            # on the successor it is neither refused nor reset, so it was
+            # never counted. KNOWN: T1294 measured a macOS CI connect that
+            # timed out instead of being refused, and a temporary emulation
+            # of a 1s stall read this control as 0. NOT MEASURED: that macOS
+            # did it in PR #194's run (see the warning `_handover` raises when
+            # it counts one). `stall_s` assumes a connect to a listening
+            # loopback socket answers far inside it: on Linux at load 9 to
+            # 11 the longest connect in 5 runs was 1.5ms (control arm) and
+            # 0.3ms (hand-down arm), and 0.5s is over 300 times that.
             took = time.monotonic() - began
             if took > stall_s:
                 refused.append(f"connect stalled {took:.2f}s")
@@ -13343,6 +13345,7 @@ class TestDaemonPortStability:
         import socket
         import threading
         import time
+        import warnings
 
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PinProxy, ensure_ca
@@ -13437,6 +13440,11 @@ class TestDaemonPortStability:
                 f"the successor came up on {spawned}, not {port} — this run "
                 f"measures a port change, not a handover"
             )
+            stalls = [r for r in refused[base:] if r.startswith("connect stalled")]
+            if stalls:
+                warnings.warn(
+                    f"the {'hand-down' if hand_down else 'control'} arm counted "
+                    f"{len(stalls)} stalled connect(s): {stalls[:3]}")
             return len(refused) - base, len(served)
 
         # REAP BOTH ARMS, WHATEVER HAPPENS. This case starts REAL detached
