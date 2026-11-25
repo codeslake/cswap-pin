@@ -31985,15 +31985,19 @@ class TestAThirdAccountsSessionIsReachedWithItsOwnersToken:
             chain.stop()
 
 
-class TestAClientIsNeverToldItsCreditBillingIsInUse:
-    """T3564. Claude Code files `anthropic-ratelimit-unified-overage-in-use:
+class TestAClientIsToldItsCreditBillingOnlyWhereItCannotLatch:
+    """T3564, T3565. Claude Code files `anthropic-ratelimit-unified-overage-in-use:
     true` under the identity it holds and, with no Fable consent stored,
     latches "credits required" for the whole process: only /login clears it.
     The pin's job is to move that process between accounts, so a latch set
     while ANY account served (the identity included) outlives the next switch.
-    The pin relays a `true` to no client, whoever served the reply; upstream
-    still bills the request itself. `false` and the rest of the head, `status`
-    included, are relayed as before."""
+    The pin relays a `true` to no client, whoever served the reply, EXCEPT on
+    a head where the client's own guard skips the latch (status `rejected`,
+    overage-status `allowed` or `allowed_warning`, claim not
+    `seven_day_overage_included`, all raw): there nothing latches, and the
+    client keeps its overage billing signals. A relayed wall loses the whole
+    family first. `false` and the rest of the head, `status` included, are
+    relayed as before."""
 
     REPLY = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
              b"anthropic-ratelimit-unified-status: allowed\r\n"
@@ -32119,3 +32123,79 @@ class TestAClientIsNeverToldItsCreditBillingIsInUse:
                            reply=self.REPLY.replace(b": true", b": false"))
         assert got[self.OVERAGE] == "false", got
         assert got[self.STATUS] == "allowed", got
+
+    @staticmethod
+    def _head(status="rejected", overage="allowed", claim="five_hour",
+              inuse="true"):
+        """The four headers the client's latch guard reads; ``None`` omits
+        one. The defaults are the guard's own skip condition."""
+        heads = {"status": status, "overage-status": overage,
+                 "representative-claim": claim, "overage-in-use": inuse}
+        return b"".join(f"anthropic-ratelimit-unified-{k}: {v}\r\n".encode()
+                        for k, v in heads.items() if v is not None)
+
+    def _reply(self, **kw):
+        return (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                + self._head(**kw) + b"\r\nhi")
+
+    @pytest.mark.parametrize("overage", ["allowed", "allowed_warning"])
+    def test_a_reply_the_client_cannot_latch_on_keeps_it(self, certdir, overage):
+        got, _ = self._ask(certdir, self._provider(), "HOST-TOKEN",
+                           reply=self._reply(overage=overage))
+        assert got[self.OVERAGE] == "true", got
+        assert got[self.STATUS] == "rejected", got
+
+    def test_the_guarded_claim_still_loses_it(self, certdir):
+        got, _ = self._ask(
+            certdir, self._provider(), "HOST-TOKEN",
+            reply=self._reply(claim="seven_day_overage_included"))
+        assert self.OVERAGE not in got, got
+        assert got[self.STATUS] == "rejected", got
+
+    def test_a_relayed_wall_loses_it_with_the_whole_family(self, monkeypatch):
+        """The wall strip runs first: a 429 the pin could not convert loses
+        every `anthropic-ratelimit-` header, a `true` the guard would skip
+        included."""
+        _W = TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount
+        _W._wire(monkeypatch, switched=False)
+        relay = type("W", (_W,), {
+            "UNIFIED_STATUS": b"anthropic-ratelimit-unified-status: rejected",
+        })._relay
+        got = relay(extra_headers=self._head(status=None))
+        assert got.startswith(b"HTTP/1.1 429"), got[:60]
+        assert b"anthropic-ratelimit" not in got.lower(), got
+
+    @pytest.mark.parametrize("kw, cannot_latch", [
+        ({}, True),
+        ({"overage": "allowed_warning"}, True),
+        ({"claim": None}, True),
+        ({"claim": "overage"}, True),
+        ({"claim": "Seven_Day_Overage_Included"}, True),  # raw, case-sensitive
+        ({"status": "allowed"}, False),
+        ({"status": "Rejected"}, False),
+        ({"status": None}, False),
+        ({"overage": "rejected"}, False),
+        ({"overage": "Allowed"}, False),
+        ({"overage": None}, False),
+        ({"claim": "seven_day_overage_included"}, False),
+    ])
+    def test_the_clients_latch_guard_truth_table(self, kw, cannot_latch):
+        from cswap_pin.proxy import _overage_in_use_cannot_latch
+
+        lines = [b"HTTP/1.1 200 OK", *self._head(**kw).split(b"\r\n")]
+        assert _overage_in_use_cannot_latch(lines) is cannot_latch
+
+    def test_names_fold_case_values_strip_and_a_duplicate_fails_closed(self):
+        from cswap_pin.proxy import _overage_in_use_cannot_latch as f
+
+        lines = [b"HTTP/1.1 200 OK",
+                 b"Anthropic-RateLimit-Unified-Status:  rejected ",
+                 b"ANTHROPIC-RATELIMIT-UNIFIED-OVERAGE-STATUS:allowed",
+                 b"anthropic-ratelimit-unified-representative-claim: five_hour"]
+        assert f(lines) is True
+        # a second copy of any guard header may be the one the client reads
+        for dup in (b"anthropic-ratelimit-unified-status: rejected",
+                    b"anthropic-ratelimit-unified-overage-status: allowed",
+                    b"anthropic-ratelimit-unified-representative-claim: "
+                    b"seven_day_overage_included"):
+            assert f(lines + [dup]) is False, dup
